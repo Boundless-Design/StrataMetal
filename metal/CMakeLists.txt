@@ -31,6 +31,7 @@
 #   ./build-metal/strata-metal-qsa-layer --selftest
 #   ./build-metal/strata-metal-token --selftest
 #   ./build-metal/strata-metal-stack --selftest
+#   ./build-metal/strata-metal-pack --selftest
 #
 # The device binary names the GPU and says which published model sizes fit its working set.
 # The others check a BF16 matrix-vector product, the DeltaNet kernels, paged QSA attention,
@@ -39,8 +40,8 @@
 # MoE combine, the 2-bit product over a Q8_0 activation, one shared expert, the
 # QSA gate, the indexer append, the indexer cell scores, the top-k selection, the
 # paged KV append and gather, the partial NEOX rotation, one QSA attention
-# block, one synthetic token through that block, and four layers on the pack
-# schedule. None of them runs the model.
+# block, one synthetic token through that block, four layers on the pack
+# schedule, and the pack index loaded into those kernels. None of them runs the model.
 cmake_minimum_required(VERSION 3.24)
 project(strata_metal VERSION 0.1.39 LANGUAGES CXX OBJCXX)
 if(NOT APPLE)
@@ -91,7 +92,8 @@ add_library(strata_metal_runtime STATIC
   src/rope.mm
   src/qsa_layer.cpp
   src/token.cpp
-  src/stack.cpp)
+  src/stack.cpp
+  src/pack.cpp)
 target_include_directories(strata_metal_runtime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${STRATA_ROOT}/include)
@@ -226,6 +228,11 @@ add_executable(strata-metal-stack src/stack_parity.cpp)
 target_link_libraries(strata-metal-stack PRIVATE strata_metal_runtime)
 strata_metal_scheme(strata-metal-stack)
 set_property(TARGET strata-metal-stack PROPERTY XCODE_SCHEME_ARGUMENTS "--selftest")
+
+add_executable(strata-metal-pack src/pack_parity.cpp)
+target_link_libraries(strata-metal-pack PRIVATE strata_metal_runtime)
+strata_metal_scheme(strata-metal-pack)
+set_property(TARGET strata-metal-pack PROPERTY XCODE_SCHEME_ARGUMENTS "--selftest")
 
 # Files to read in the generated Xcode project. Nothing here is compiled.
 add_custom_target(Handoff SOURCES

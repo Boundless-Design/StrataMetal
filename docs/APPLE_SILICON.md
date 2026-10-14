@@ -23,6 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
+The pack index is read into those kernels. It does not draw a token.
 
 ## One memory pool
 
@@ -435,8 +436,31 @@ Tokens 3, 5, and 7 filled three cells. Clearing the KV pool before token 9 at th
 30.47% apart on the attention output. A negative token was refused. A negative cell was refused. No
 layers, a zero interval, and a GDN width that does not match were refused.
 
+`strata-metal-pack` reads the same 19-field index the engine loads. Each plane is its own shared
+buffer. No new shader. Measured with `strata-metal-pack --selftest` on the same Mac, the same day.
+The high 16 bits of a dirty bf16 were exact: 0x3f800001 stayed 0x3f80. A value whose rounding
+conversion is 0x3f82 stayed 0x3f81. fp16 1.0 widened to 1. A subnormal scale widened exactly, and
+it did not flush to zero. Verbatim codes and offsets stayed in their own buffers. A raw 16-bit
+bf16 was copied. A raw 16-bit f16 was copied. An f32 of 65520 promoted to f16 became 0x7C00, not
+the high half 0x477f. A loaded bf16 matrix matched a direct upload, 0 differ. A loaded 4-bit
+S-form, with fp16 scales widened and an offset copied, matched a direct upload through the Q8_K
+product, 0 differ. An 18-field row was refused. A plane sum of 8/8 B against an index of 10/10 B
+was refused. A promoted tensor of 2 elements, 4 B in and 4 B out, was refused. A missing bin was
+refused. A short read was refused. A row that holds the tensor only in its GGUF form was refused.
+A complete GDN layer and a complete full-attention layer kept 2 sentinel bytes. The GDN layer had
+no QSA tensor. The full-attention layer had no GDN tensor. A zero interval was refused. A layer
+outside 0..3 was refused. Missing `blk.0.attn_qkv.weight` was refused. Missing
+`blk.3.attn_q.weight` was refused. A ne0 of 9 where the kernels require 8 was refused. The
+shared-expert gate stored as f32 was 32 B, and the kernels read that tensor as 16 B. The bound
+layers use the reduced GDN shape, state 128 and 4 value heads, and one QSA shape the decode kernel
+accepts, 24 heads and head dim 256. A 4-bit GDN plane bound, bias -8, with an offset on the gate.
+A 4-bit QSA plane bound, and the rope table was left empty. Full attention was not bound as GDN.
+A GDN layer was not bound as QSA. The shared expert, the routed expert span, and the embedding
+stayed unbound. A 2-bit plane on a Q8_K projection was refused.
+
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
-weights. The model does not run. There is no token rate.
+weights. The pack check reads an index into those kernels. The model does not run. There is no
+token rate.
 The QSA decode kernel is its own check. The indexer, the indexer cell scores, the top-k, the paged
 KV append, the partial NEOX rotation, and the QSA gate pass as their own checks, and the decode
 kernel does not call them. `strata-metal-qsa-layer` calls those, plus the weighted norm and the
@@ -444,11 +468,14 @@ decode kernel. `strata-metal-token` calls the embedding row, the gated residual,
 block, the router, the routed experts, the shared expert, the combine, the output projection, and
 the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
-The expert-half add is still a kernel only. Still to write, in this order, each one checked before
-the next depends on it:
+`strata-metal-pack` calls the bf16 product and the Q8_K projection on bytes it loaded. It does not
+draw a token. The expert-half add is still a kernel only. Still to write, in this order, each one
+checked before the next depends on it:
 
-1. A loaded model, then the MTP draft layer, then the Python server in `serve/`, which can stay as
-   it is once it has an engine binary to start.
+1. The planes this loader does not bind: the embedding gather, the shared expert's real S-form, a
+   routed expert blob, and a 2-bit attention matrix. Then a pack can feed the stack. Then the MTP
+   draft layer, then the Python server in `serve/`, which can stay as it is once it has an engine
+   binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
@@ -504,6 +531,7 @@ cmake --build build-metal
 ./build-metal/strata-metal-qsa-layer --selftest
 ./build-metal/strata-metal-token --selftest
 ./build-metal/strata-metal-stack --selftest
+./build-metal/strata-metal-pack --selftest
 ```
 
 The same targets, opened for capture:
