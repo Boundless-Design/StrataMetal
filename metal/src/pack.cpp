@@ -856,4 +856,38 @@ void run_routed_expert(const PackTable& table, const std::string& pack_dir, cons
     iq_expert(blob, x_q8, shape, 1, y);
 }
 
+void run_attn_q(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x,
+                Bytes& y) {
+    require_schedule(g, layer);
+    if (!strata::core::is_qsa_layer(g, layer))
+        throw MetalError("layer " + std::to_string(layer) + " is not full attention");
+    const std::string name = layer_name(layer, "attn_q.weight");
+    const PackTensor* w = table.find(name);
+    if (!w) throw MetalError(name + " is missing");
+    if (g.n_embd <= 0 || g.n_head <= 0 || g.head_dim <= 0) throw MetalError("attn_q: empty shape");
+    const int64_t n_out = 2 * g.n_head * g.head_dim;
+    if (n_out <= 0) throw MetalError("attn_q: empty shape");
+    if (w->ne0 != g.n_embd)
+        throw MetalError(w->name + " ne0 is " + std::to_string(w->ne0) + ", the query requires " +
+                         std::to_string(g.n_embd));
+    if (w->ne1 != n_out)
+        throw MetalError(w->name + " ne1 is " + std::to_string(w->ne1) + ", the query requires " +
+                         std::to_string(n_out));
+    if (w->code_bits != 2)
+        throw MetalError(w->name + ": code_bits " + std::to_string(w->code_bits) + " is not an S2 form");
+    if (w->has_offset || w->offset) throw MetalError(w->name + ": an S2 form must have no offset plane");
+    if (w->group_elems != 64 || w->code_bias != -1) {
+        throw MetalError(w->name + ": an S2 form must be group 64 with bias -1, this one is group " +
+                         std::to_string(w->group_elems) + " with bias " + std::to_string(w->code_bias));
+    }
+    if (w->codebook_iq4nl) throw MetalError(w->name + ": an S2 form is affine");
+    if (!w->codes || !w->scales) throw MetalError(w->name + ": codes or scales are missing");
+    if (x.size() < (uint64_t) g.n_embd * 4) throw MetalError("attn_q: the activation is short");
+    if (y.size() < (uint64_t) n_out * 4) throw MetalError("attn_q: the output is short");
+    // The kernel refuses an n_in that is not a multiple of 64 before it reads the planes.
+    Bytes act(q8_0_bytes(g.n_embd));
+    quantize_q8_0(x, g.n_embd, act);
+    s2_gemv_q8(act, *w->codes, *w->scales, y, g.n_embd, n_out, 32);
+}
+
 }  // namespace strata::metal

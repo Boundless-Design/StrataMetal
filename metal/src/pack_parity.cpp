@@ -1585,6 +1585,192 @@ void run_experts() {
            native_v3(1, blob_n, kIq4Xs, kIq4Nl, blob_n), {});
 }
 
+SOpt attn_s2() {
+    SOpt q;
+    q.bits = 2;
+    q.bias = -1;
+    q.group = 64;
+    q.has_offset = 0;
+    q.codebook = 0;
+    q.act_kind = 0;
+    q.code0 = 0xA5;
+    return q;
+}
+
+Bytes attn_x(int64_t n) {
+    Bytes x((uint64_t) n * 4);
+    auto* p = static_cast<float*>(x.data());
+    for (int64_t i = 0; i < n; ++i) p[i] = (float) ((i * 17) % 29) * 0.05f - 0.4f;
+    if (n >= 4) {
+        p[0] = 1.f;
+        p[1] = 0.5f;
+        p[2] = 0.25f;
+        p[3] = -0.125f;
+    }
+    return x;
+}
+
+void run_attn() {
+    const auto g = bind_geom();
+    const int64_t n_embd = g.n_embd;
+    const int64_t n_out = 2 * g.n_head * g.head_dim;
+    Tmp dir;
+    {
+        Built b;
+        add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, attn_s2());
+        write_pack(dir, b);
+    }
+    PackTable table = PackTable::load(dir.path.string());
+    const PackTensor* q = table.find(tn(3, "attn_q.weight"));
+    float scale = 0.f;
+    const bool fields = q && q->codes && q->scales && !q->offset && q->code_bits == 2 && q->code_bias == -1 &&
+                        q->group_elems == 64 && !q->has_offset && !q->codebook_iq4nl && q->act_kind == 0 &&
+                        q->ne0 == n_embd && q->ne1 == n_out && q->file_id == 0;
+    if (fields) std::memcpy(&scale, q->scales->data(), 4);
+    const bool widened = scale == 1.f;
+    std::string detail = "fields";
+    bool matched = false;
+    if (fields && widened) {
+        Bytes x = attn_x(n_embd);
+        const int guard = 1;
+        Bytes got((uint64_t) (n_out + guard) * 4);
+        Bytes ref((uint64_t) (n_out + guard) * 4);
+        Bytes bad((uint64_t) (n_out + guard) * 4);
+        std::fill_n(static_cast<float*>(got.data()), (size_t) (n_out + guard), 7.f);
+        std::fill_n(static_cast<float*>(ref.data()), (size_t) (n_out + guard), 7.f);
+        std::fill_n(static_cast<float*>(bad.data()), (size_t) (n_out + guard), 7.f);
+        run_attn_q(table, g, 3, x, got);
+        Bytes act(q8_0_bytes(n_embd));
+        quantize_q8_0(x, n_embd, act);
+        s2_gemv_q8(act, *q->codes, *q->scales, ref, n_embd, n_out, 32);
+        Bytes flipped(q->codes->size());
+        std::memcpy(flipped.data(), q->codes->data(), q->codes->size());
+        static_cast<uint8_t*>(flipped.data())[0] ^= 0xFFu;
+        s2_gemv_q8(act, flipped, *q->scales, bad, n_embd, n_out, 32);
+        const float* gp = static_cast<const float*>(got.data());
+        const int diff = differ_floats(gp, static_cast<const float*>(ref.data()), (int) n_out);
+        const int flipped_diff = differ_floats(gp, static_cast<const float*>(bad.data()), (int) n_out);
+        const bool guard_held = gp[n_out] == 7.f && static_cast<const float*>(ref.data())[n_out] == 7.f &&
+                                static_cast<const float*>(bad.data())[n_out] == 7.f;
+        const bool codes_held = static_cast<const uint8_t*>(q->codes->data())[0] == 0xA5;
+        matched = diff == 0 && flipped_diff > 0 && !still_seven(gp, (int) n_out) && guard_held && codes_held;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%d differ, flipped code differed on %d of %lld", diff, flipped_diff,
+                      (long long) n_out);
+        detail = buf;
+    }
+    verdict("a 2-bit query matches the S2 product", fields && widened && matched, detail);
+
+    auto refuse = [&](const char* name, const char* needle, strata::core::ModelGeometry geom, int64_t layer,
+                      const std::function<void(Built&)>& build) {
+        Tmp d;
+        Built b;
+        build(b);
+        write_pack(d, b);
+        PackTable t = PackTable::load(d.path.string());
+        const int64_t xn = geom.n_embd > 0 ? geom.n_embd : 1;
+        Bytes x = attn_x(xn);
+        int64_t yn = 8;
+        if (geom.n_head > 0 && geom.head_dim > 0) yn = 2 * geom.n_head * geom.head_dim + 1;
+        Bytes out((uint64_t) yn * 4);
+        std::fill_n(static_cast<float*>(out.data()), (size_t) yn, 7.f);
+        std::string got;
+        const bool thrown = threw(needle, [&] { run_attn_q(t, geom, layer, x, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), (int) yn);
+        verdict(name, thrown && held, got);
+    };
+
+    refuse("a query on a GDN layer is refused", "not full attention", g, 0, [](Built& b) { add_pad(b); });
+    refuse("a missing query is refused", "is missing", g, 3, [](Built& b) { add_pad(b); });
+    {
+        auto z = g;
+        z.qsa_interval = 0;
+        refuse("a zero query interval is refused", "qsa_interval must be positive", z, 3,
+               [](Built& b) { add_pad(b); });
+    }
+    refuse(
+        "a 4-bit query is not this call", "not an S2", g, 3,
+        [&](Built& b) {
+            SOpt q;
+            q.bits = 4;
+            q.bias = -8;
+            q.group = 32;
+            q.act_kind = 1;
+            add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, q);
+        });
+    refuse(
+        "a 2-bit query with an offset is refused", "no offset plane", g, 3,
+        [&](Built& b) {
+            SOpt q = attn_s2();
+            q.has_offset = 1;
+            add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, q);
+        });
+    refuse(
+        "a 2-bit query with bias -8 is refused", "bias -1", g, 3,
+        [&](Built& b) {
+            SOpt q = attn_s2();
+            q.bias = -8;
+            add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, q);
+        });
+    refuse(
+        "a 2-bit query with group 32 is refused", "group 64", g, 3,
+        [&](Built& b) {
+            SOpt q = attn_s2();
+            q.group = 32;
+            add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, q);
+        });
+    refuse(
+        "an IQ4NL query is refused", "affine", g, 3,
+        [&](Built& b) {
+            SOpt q = attn_s2();
+            q.codebook = 1;
+            add_sform(b, tn(3, "attn_q.weight"), n_embd, n_out, q);
+        });
+    refuse(
+        "a query whose ne1 is the K width is refused", "ne1 is 512", g, 3,
+        [&](Built& b) { add_sform(b, tn(3, "attn_q.weight"), n_embd, g.n_head_kv * g.head_dim, attn_s2()); });
+    {
+        auto narrow = g;
+        narrow.n_embd = 32;
+        narrow.n_head = 1;
+        narrow.head_dim = 64;
+        const int64_t rows = 2 * narrow.n_head * narrow.head_dim;
+        refuse(
+            "a query whose n_in is 32 is refused", "not a multiple of 64", narrow, 3,
+            [&](Built& b) {
+                SOpt q = attn_s2();
+                q.group = 32;
+                add_sform(b, tn(3, "attn_q.weight"), narrow.n_embd, rows, q);
+                b.rows.back().group = 64;
+            });
+    }
+    {
+        auto empty = g;
+        empty.n_head = 0;
+        refuse("an empty query shape is refused", "empty shape", empty, 3,
+               [&](Built& b) { add_sform(b, tn(3, "attn_q.weight"), n_embd, 64, attn_s2()); });
+    }
+
+    {
+        Bytes x(4);
+        Bytes out((uint64_t) (n_out + 1) * 4);
+        std::fill_n(static_cast<float*>(out.data()), (size_t) (n_out + 1), 7.f);
+        std::string got;
+        const bool thrown = threw("activation is short", [&] { run_attn_q(table, g, 3, x, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), (int) n_out + 1);
+        verdict("a short query activation is refused", thrown && held, got);
+    }
+    {
+        Bytes x = attn_x(n_embd);
+        Bytes out(4);
+        std::fill_n(static_cast<float*>(out.data()), 1, 7.f);
+        std::string got;
+        const bool thrown = threw("output is short", [&] { run_attn_q(table, g, 3, x, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), 1);
+        verdict("a short query output is refused", thrown && held, got);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1595,7 +1781,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
-        "one routed expert\n\n");
+        "one routed expert, one 2-bit query\n\n");
     try {
         run_conversions();
         run_refusals();
@@ -1604,6 +1790,7 @@ int main(int argc, char** argv) {
         run_embed();
         run_shexp();
         run_experts();
+        run_attn();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;

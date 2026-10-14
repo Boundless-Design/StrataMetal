@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, and one routed expert blob. It does not draw a token.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, and one 2-bit query. It does not draw a token.
 
 ## One memory pool
 
@@ -489,6 +489,19 @@ the formats make 13312, was refused. A gate type of 29 was refused. An IQ4_NL ga
 because that type is a down quant. A pack with no experts.bin was refused, and a GGUF shard was
 not opened. The output stayed 7 on each refusal. The layer bind still leaves the routed expert
 span unbound. Running that expert does not draw a token.
+A 2-bit query on layer 3 matched the 2-bit product on the loaded planes, 0 differ. n_embd was
+256, with 24 heads and head dim 256, so the projection wrote 12288 values. The weight was group
+64, bias -1, with no offset, and the codebook was affine. The loaded activation kind was 0. The
+fp16 scales widened to 1. Flipping the first code byte differed on 1 of 12288 outputs. The output
+was not left at 7. The word after those 12288 outputs stayed 7. A query on layer 0 was refused:
+that layer is not full attention. A missing query on the full-attention layer was refused. A zero
+interval was refused. A 4-bit query was refused. An offset was refused. Bias -8 was refused.
+Group 32 was refused. An IQ4NL codebook was refused. A ne1 of 512 was refused; the query requires
+12288. An n_in of 32 was refused. An empty shape was refused. A short activation was refused, and
+a short output was refused. The output stayed 7 on each refusal. This call is the 2-bit product
+on the query projection. The attention block is not called. The 2-bit shared_expert function is
+not this call. The Q8_K bind still refuses a 2-bit plane. The layer bind does not return this
+query. Running it does not draw a token.
 
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels. The model does not run. There is no
@@ -501,13 +514,12 @@ block, the router, the routed experts, the shared expert, the combine, the outpu
 the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
-expert, and one routed expert on bytes it loaded. It does not draw a token. The expert-half add is
-still a kernel only. The 2-bit shared expert function is still its own check. Still to write, in
-this order, each one checked before the next depends on it:
+expert, one routed expert, and one 2-bit query on bytes it loaded. It does not draw a token. The
+expert-half add is still a kernel only. The 2-bit shared expert function is still its own check.
+Still to write, in this order, each one checked before the next depends on it:
 
-1. The plane this loader does not bind: a 2-bit attention matrix. Then a pack can feed the stack.
-   Then the MTP draft layer, then the Python server in `serve/`, which can stay as it is once it
-   has an engine binary to start.
+1. A pack can feed the stack. Then the MTP draft layer, then the Python server in `serve/`, which
+   can stay as it is once it has an engine binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

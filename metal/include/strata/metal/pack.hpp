@@ -15,8 +15,9 @@
 // The embedding is gathered only as an S2, S4, or S8 row. The shared expert's three
 // projections each go to the kernel that accepts that form. The 2-bit shared_expert
 // function is not called. A 3-D routed-expert span is not passed to the IQ expert.
-// One concatenated blob from experts.bin is. A 2-bit plane is not bound onto a Q8_K
-// projection. This does not run the model. There is no token rate.
+// One concatenated blob from experts.bin is. A 2-bit query projection is the S2
+// product, and qsa_layer is not called for it. A 2-bit plane is not bound onto a
+// Q8_K projection. This does not run the model. There is no token rate.
 #pragma once
 
 #include "strata/metal/gdn_layer.hpp"
@@ -61,8 +62,8 @@ struct PackTensor {
 
 // What one layer's kernels can read. The mixer that does not run is left empty.
 // cos_tab and sin_tab stay null: the rope table is not in the pack.
-// The routed experts are not here. The embedding and the shared expert are run on
-// their own. The embedding is only an S2, S4, or S8 row.
+// The routed experts are not here. The embedding, the shared expert, and the 2-bit
+// query projection are run on their own. The embedding is only an S2, S4, or S8 row.
 struct PackLayer {
     bool qsa_layer = false;
     TokenGr attn;
@@ -106,7 +107,7 @@ GdnLayerWeights bind_gdn_layer(const PackTable& table, const strata::core::Model
 QsaLayerWeights bind_qsa_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // Gated residual, router, and the mixer for this layer. The table must outlive the pointers.
-// The embedding and the shared expert are not among those planes.
+// The embedding, the shared expert, and the 2-bit query are not among those planes.
 PackLayer bind_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // One row of token_embd.weight. The row length is g.n_embd and the token selects the row.
@@ -130,5 +131,12 @@ void run_shared_expert(const PackTable& table, const strata::core::ModelGeometry
 // The residual is not written. This does not draw a token.
 void run_routed_expert(const PackTable& table, const std::string& pack_dir, const strata::core::ModelGeometry& g,
                        int64_t layer, int64_t expert, const Bytes& x_q8, Bytes& y);
+
+// The query projection on a full-attention layer, when attn_q.weight is 2-bit.
+// That form is group 64, bias -1, affine, and no offset. The activation is Q8_0.
+// A 4-bit or 8-bit query is not this call. The Q8_K bind still refuses a 2-bit
+// plane. qsa_layer is not called. x holds n_embd floats. y holds at least
+// 2 * n_head * head_dim floats. The residual is not written.
+void run_attn_q(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x, Bytes& y);
 
 }  // namespace strata::metal
