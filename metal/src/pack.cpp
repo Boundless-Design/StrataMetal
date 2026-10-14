@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -344,6 +345,81 @@ void project_shexp(ShexpAct act, const PackTensor& t, const Bytes& x80, const By
     } else {
         s_gemv_q8_0_split(x80, *t.codes, *t.scales, off, y, n_in, n_out, form);
     }
+}
+
+struct NativeLine {
+    int64_t layer = 0;
+    int gu = 0;
+    int d = 0;
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+};
+
+struct NativePick {
+    int gu_type = 0;
+    int d_type = 0;
+    uint64_t file_off = 0;
+    uint64_t blob_bytes = 0;
+    int64_t n_expert = 0;
+};
+
+// The GGUF offsets and any shard name sit past the five fields this loader reads.
+// false means native_experts.txt is not in the pack. A bad line throws.
+bool pick_native_expert(const std::string& pack_dir, int64_t layer, int64_t expert, NativePick& out) {
+    const std::string path = pack_dir + "/native_experts.txt";
+    File in(std::fopen(path.c_str(), "rb"));
+    if (!in) return false;
+    int version = 0;
+    int64_t n_expert = 0;
+    std::vector<NativeLine> lines;
+    char buf[1024];
+    while (std::fgets(buf, sizeof buf, in.get())) {
+        size_t len = std::strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = '\0';
+        if (len == 0) continue;
+        if (buf[0] == '#') {
+            static const char tag[] = "# strata native experts v";
+            if (std::strncmp(buf, tag, sizeof tag - 1) == 0) version = std::atoi(buf + (sizeof tag - 1));
+            const char* at = std::strstr(buf, "(n_expert ");
+            if (at) n_expert = std::atoll(at + 10);
+            continue;
+        }
+        long long found = -1;
+        int gu = 0, d = 0;
+        unsigned long long off = 0, blob = 0;
+        if (std::sscanf(buf, "%lld %d %d %llu %llu", &found, &gu, &d, &off, &blob) != 5 || found < 0)
+            throw MetalError(std::string("native_experts.txt: a malformed line: ") + buf);
+        for (const NativeLine& prev : lines) {
+            if (prev.layer == (int64_t) found)
+                throw MetalError("native_experts.txt: layer " + std::to_string(found) + " is repeated");
+        }
+        lines.push_back(NativeLine{(int64_t) found, gu, d, (uint64_t) off, (uint64_t) blob});
+    }
+    if (version > 4)
+        throw MetalError("native_experts.txt is v" + std::to_string(version) + "; this loader reads up to v4");
+    if (n_expert <= 0) throw MetalError("native_experts.txt does not say n_expert");
+    if (expert < 0 || expert >= n_expert)
+        throw MetalError("expert " + std::to_string(expert) + " is outside 0.." + std::to_string(n_expert - 1));
+    const NativeLine* row = nullptr;
+    for (const NativeLine& line : lines)
+        if (line.layer == layer) row = &line;
+    if (!row)
+        throw MetalError("native_experts.txt: layer " + std::to_string(layer) + " is missing or not contiguous");
+    uint64_t at = 0;
+    for (int64_t l = 0; l <= layer; ++l) {
+        const NativeLine* step = nullptr;
+        for (const NativeLine& line : lines)
+            if (line.layer == l) step = &line;
+        if (!step || step->offset != at)
+            throw MetalError("native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous");
+        at += step->bytes * (uint64_t) n_expert;
+    }
+    out.gu_type = row->gu;
+    out.d_type = row->d;
+    out.file_off = row->offset + (uint64_t) expert * row->bytes;
+    out.blob_bytes = row->bytes;
+    out.n_expert = n_expert;
+    return true;
 }
 
 }  // namespace
@@ -744,6 +820,40 @@ void run_shared_expert(const PackTable& table, const strata::core::ModelGeometry
     bf16_gemv(x_bf16, *ginp.values, scalar, g.n_embd, 1);
     const Bytes* sc[] = {&out, &scalar};
     launch_se("se_sigmoid_scale", sc, 2, (int) g.n_embd);
+}
+
+void run_routed_expert(const PackTable& table, const std::string& pack_dir, const strata::core::ModelGeometry& g,
+                       int64_t layer, int64_t expert, const Bytes& x_q8, Bytes& y) {
+    if (layer < 0 || layer >= g.n_layers)
+        throw MetalError("layer " + std::to_string(layer) + " is outside 0.." + std::to_string(g.n_layers - 1));
+    if (g.n_embd <= 0 || g.n_ff <= 0) throw MetalError("routed expert: empty shape");
+    if (x_q8.size() < iq_q8_1_bytes(g.n_embd)) throw MetalError("routed expert: the activation is short");
+    if (y.size() < (uint64_t) g.n_embd * 4) throw MetalError("routed expert: the output is short");
+
+    NativePick pick;
+    if (!pick_native_expert(pack_dir, layer, expert, pick)) {
+        // The index name is the 3-D role span. It is not the concatenated blob, even when
+        // the row is loaded. Its bytes are not passed to the expert kernel.
+        const std::string role = layer_name(layer, "ffn_gate_exps.weight");
+        const PackTensor* row = table.find(role);
+        const uint64_t n = (row && row->values) ? row->values->size() : 0;
+        if (n != 0) {
+            throw MetalError(role + " is " + std::to_string(n) +
+                             " bytes and is a 3-D role span, not the concatenated expert blob");
+        }
+        throw MetalError(role + " is a 3-D role span, not the concatenated expert blob");
+    }
+    IqExpert shape{pick.gu_type, pick.d_type, g.n_embd, g.n_ff};
+    const size_t want = iq_expert_bytes(shape);
+    if (pick.blob_bytes != want) {
+        throw MetalError("native_experts.txt: layer " + std::to_string(layer) + " blob is " +
+                         std::to_string(pick.blob_bytes) + " B but its formats make " + std::to_string(want));
+    }
+    File bin(std::fopen((pack_dir + "/experts.bin").c_str(), "rb"));
+    if (!bin) throw MetalError("experts.bin is missing; a GGUF shard is not this loader");
+    Bytes blob(pick.blob_bytes);
+    read_at(bin.get(), pick.file_off, blob.data(), (size_t) pick.blob_bytes, "experts.bin");
+    iq_expert(blob, x_q8, shape, 1, y);
 }
 
 }  // namespace strata::metal

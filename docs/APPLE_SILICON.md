@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row and one shared expert. It does not draw a token.
+The pack index is read into those kernels, including one embedding row, one shared expert, and one routed expert blob. It does not draw a token.
 
 ## One memory pool
 
@@ -477,6 +477,18 @@ was 8, where that expert requires 32, was refused. A 2-bit gate with bias -8 was
 down weight whose n_in was 640 was refused. A group of 24 was refused. An f32 gate weight was
 refused. The output stayed 7 on each refusal. The 2-bit shared_expert function is not this call.
 Running that expert does not draw a token.
+A routed expert with n_embd 256 and n_ff 32 matched a copy of the same blob through the expert kernel,
+0 differ, on expert 0 and on expert 1. The blob is 13312 bytes. The gate and up rows are IQ4_XS.
+The down rows are IQ4_NL. The file named 2 experts. The geometry's expert count stayed 512, and
+expert 2 was refused as outside 0..1. The two experts differed on 256 of 256 outputs. The output
+was not left at 7. The word after the 256 outputs stayed 7. A row named blk.0.ffn_gate_exps.weight,
+the same size as the blob, stayed as it was loaded. Running the expert kernel on that row differed
+on 256 of 256 outputs. That row is a 3-D role span and was not passed to the expert kernel. A
+32-byte row of that name was refused: it is not the concatenated blob. A blob of 32 bytes, where
+the formats make 13312, was refused. A gate type of 29 was refused. An IQ4_NL gate was refused,
+because that type is a down quant. A pack with no experts.bin was refused, and a GGUF shard was
+not opened. The output stayed 7 on each refusal. The layer bind still leaves the routed expert
+span unbound. Running that expert does not draw a token.
 
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels. The model does not run. There is no
@@ -488,14 +500,14 @@ decode kernel. `strata-metal-token` calls the embedding row, the gated residual,
 block, the router, the routed experts, the shared expert, the combine, the output projection, and
 the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
-`strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, and one shared
-expert on bytes it loaded. It does not draw a token. The expert-half add is still a kernel only.
-The 2-bit shared expert function is still its own check. Still to write, in this order, each one
-checked before the next depends on it:
+`strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
+expert, and one routed expert on bytes it loaded. It does not draw a token. The expert-half add is
+still a kernel only. The 2-bit shared expert function is still its own check. Still to write, in
+this order, each one checked before the next depends on it:
 
-1. The planes this loader does not bind: a routed expert blob, and a 2-bit attention matrix. Then
-   a pack can feed the stack. Then the MTP draft layer, then the Python server in `serve/`, which
-   can stay as it is once it has an engine binary to start.
+1. The plane this loader does not bind: a 2-bit attention matrix. Then a pack can feed the stack.
+   Then the MTP draft layer, then the Python server in `serve/`, which can stay as it is once it
+   has an engine binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

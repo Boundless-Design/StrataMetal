@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -1410,6 +1411,180 @@ void run_shexp() {
            32, 32);
 }
 
+void put_f16_le(uint8_t* p, uint16_t h) {
+    p[0] = (uint8_t) h;
+    p[1] = (uint8_t) (h >> 8);
+}
+
+std::vector<uint8_t> iq_rows(int type, int rows, int n_in, uint32_t seed) {
+    const size_t rb = iq_row_bytes(type, n_in);
+    const size_t bs = iq_block_bytes(type);
+    if (bs < 2) throw MetalError("fixture block");
+    std::mt19937 rng(seed);
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& b : w) b = (uint8_t) byte(rng);
+    std::uniform_int_distribution<int> ex(10, 14);
+    std::uniform_int_distribution<int> man(0, 1023);
+    std::uniform_int_distribution<int> sgn(0, 3);
+    for (size_t o = 0; o < w.size(); o += bs) {
+        const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
+        put_f16_le(w.data() + o, h);
+    }
+    return w;
+}
+
+std::vector<uint8_t> expert_blob(const IqExpert& e, uint32_t seed) {
+    auto blob = iq_rows(e.gu_type, (int) (2 * e.n_ff), (int) e.n_embd, seed);
+    auto down = iq_rows(e.d_type, (int) e.n_embd, (int) e.n_ff, seed + 17);
+    blob.insert(blob.end(), down.begin(), down.end());
+    if (blob.size() != iq_expert_bytes(e)) throw MetalError("fixture blob size");
+    return blob;
+}
+
+void add_role_span(Built& b, const std::vector<uint8_t>& bytes) {
+    Row row;
+    row.name = "blk.0.ffn_gate_exps.weight";
+    row.file = 3;
+    row.kind = 0;
+    row.ne0 = (int64_t) bytes.size();
+    row.ne1 = 1;
+    row.dst_bytes = bytes.size();
+    add_src(b, row, bytes);
+}
+
+void add_pad(Built& b) { add_f32(b, "pad", 1, 1, 0x11, -1); }
+
+std::string native_v3(int64_t n_expert, uint64_t total, int gu, int d, uint64_t blob) {
+    char buf[640];
+    std::snprintf(buf, sizeof buf,
+                  "# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                  "[shard] (n_expert %lld, total %llu)\n"
+                  "0 %d %d 0 %llu 0 0 0\n",
+                  (long long) n_expert, (unsigned long long) total, gu, d, (unsigned long long) blob);
+    return buf;
+}
+
+void run_experts() {
+    const int64_t n_embd = 256;
+    const int64_t n_ff = 32;
+    const int file_experts = 2;
+    IqExpert shape{kIq4Xs, kIq4Nl, n_embd, n_ff};
+    const size_t blob_n = iq_expert_bytes(shape);
+    const std::vector<uint8_t> blob0 = expert_blob(shape, 11);
+    const std::vector<uint8_t> blob1 = expert_blob(shape, 29);
+    const std::vector<uint8_t> trap = expert_blob(shape, 47);
+    if (blob0 == blob1 || blob0 == trap || blob1 == trap) throw MetalError("fixture blobs collided");
+
+    strata::core::ModelGeometry g;
+    g.n_embd = n_embd;
+    g.n_ff = n_ff;
+    g.n_layers = 1;
+
+    Tmp dir;
+    {
+        Built built;
+        add_role_span(built, trap);
+        write_pack(dir, built);
+    }
+    std::vector<uint8_t> file;
+    file.insert(file.end(), blob0.begin(), blob0.end());
+    file.insert(file.end(), blob1.begin(), blob1.end());
+    write_bytes(dir.path / "experts.bin", file.data(), file.size());
+    const std::string native = native_v3(file_experts, (uint64_t) file_experts * blob_n, kIq4Xs, kIq4Nl, blob_n);
+    write_bytes(dir.path / "native_experts.txt", native.data(), native.size());
+
+    PackTable table = PackTable::load(dir.path.string());
+    const PackTensor* role = table.find("blk.0.ffn_gate_exps.weight");
+    const bool role_loaded = role && role->values && role->file_id == 3 && role->values->size() == trap.size() &&
+                             std::memcmp(role->values->data(), trap.data(), trap.size()) == 0;
+
+    Bytes x((uint64_t) n_embd * 4);
+    auto* xp = static_cast<float*>(x.data());
+    for (int64_t i = 0; i < n_embd; ++i) xp[i] = (float) ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes xq(iq_q8_1_bytes(n_embd));
+    iq_quantize_q8_1(x, n_embd, xq);
+
+    const int guard = 1;
+    auto filled = [&]() {
+        Bytes y((uint64_t) (n_embd + guard) * 4);
+        std::fill_n(static_cast<float*>(y.data()), (size_t) (n_embd + guard), 7.f);
+        return y;
+    };
+    auto oracle = [&](const std::vector<uint8_t>& src, Bytes& y) {
+        Bytes copied(src.size());
+        std::memcpy(copied.data(), src.data(), src.size());
+        iq_expert(copied, xq, shape, 1, y);
+    };
+    Bytes got0 = filled();
+    Bytes got1 = filled();
+    Bytes ref0 = filled();
+    Bytes ref1 = filled();
+    Bytes via_role = filled();
+    run_routed_expert(table, dir.path.string(), g, 0, 0, xq, got0);
+    run_routed_expert(table, dir.path.string(), g, 0, 1, xq, got1);
+    oracle(blob0, ref0);
+    oracle(blob1, ref1);
+    oracle(trap, via_role);
+    const float* p0 = static_cast<const float*>(got0.data());
+    const float* p1 = static_cast<const float*>(got1.data());
+    const int d0 = differ_floats(p0, static_cast<const float*>(ref0.data()), (int) n_embd);
+    const int d1 = differ_floats(p1, static_cast<const float*>(ref1.data()), (int) n_embd);
+    const int between = differ_floats(p0, p1, (int) n_embd);
+    const int role_diff = differ_floats(p0, static_cast<const float*>(via_role.data()), (int) n_embd);
+    const bool guard_held = p0[n_embd] == 7.f && p1[n_embd] == 7.f &&
+                            static_cast<const float*>(ref0.data())[n_embd] == 7.f &&
+                            static_cast<const float*>(ref1.data())[n_embd] == 7.f;
+    const bool live = !still_seven(p0, (int) n_embd) && !still_seven(p1, (int) n_embd);
+    const bool role_untouched = role && role->values &&
+                                std::memcmp(role->values->data(), trap.data(), trap.size()) == 0;
+    const bool matched = role_loaded && d0 == 0 && d1 == 0 && between > 0 && role_diff > 0 && guard_held && live &&
+                         role_untouched && g.n_expert == 512;
+    char detail[192];
+    std::snprintf(detail, sizeof detail, "blob %zu, %d and %d differ, experts differed on %d, role row differed on %d",
+                  blob_n, d0, d1, between, role_diff);
+    verdict("a routed expert blob matches the copied bytes", matched, detail);
+
+    {
+        Bytes out = filled();
+        std::string got;
+        const bool thrown =
+            threw("outside", [&] { run_routed_expert(table, dir.path.string(), g, 0, file_experts, xq, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), (int) n_embd + guard);
+        verdict("an expert past the file count is refused", thrown && held, got);
+    }
+
+    auto refuse = [&](const char* name, const char* needle, const std::function<void(Built&)>& index,
+                      const std::string& text, const std::vector<uint8_t>& experts_bin) {
+        Tmp d;
+        Built b;
+        index(b);
+        write_pack(d, b);
+        if (!text.empty()) write_bytes(d.path / "native_experts.txt", text.data(), text.size());
+        if (!experts_bin.empty()) write_bytes(d.path / "experts.bin", experts_bin.data(), experts_bin.size());
+        PackTable t = PackTable::load(d.path.string());
+        Bytes out = filled();
+        std::string got;
+        const bool thrown = threw(needle, [&] { run_routed_expert(t, d.path.string(), g, 0, 0, xq, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), (int) n_embd + guard);
+        verdict(name, thrown && held, got);
+    };
+    refuse("a 3-D role span is not the expert blob", "not the concatenated",
+           [](Built& b) {
+               std::vector<uint8_t> row(32, 0xEE);
+               add_role_span(b, row);
+           },
+           "", {});
+    refuse("a short expert blob is refused", "but its formats make", [](Built& b) { add_pad(b); },
+           native_v3(1, 32, kIq4Xs, kIq4Nl, 32), {});
+    refuse("an unknown expert type is refused", "not a Coder expert type", [](Built& b) { add_pad(b); },
+           native_v3(1, 32, 29, kIq4Nl, 32), {});
+    refuse("a down quant used as the gate is refused", "gate type is a down quant", [](Built& b) { add_pad(b); },
+           native_v3(1, 32, kIq4Nl, kIq4Nl, 32), {});
+    refuse("a missing experts.bin is refused", "GGUF shard", [](Built& b) { add_pad(b); },
+           native_v3(1, blob_n, kIq4Xs, kIq4Nl, blob_n), {});
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1418,7 +1593,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-pack [--selftest]\n");
         return 2;
     }
-    std::printf("pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert\n\n");
+    std::printf(
+        "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
+        "one routed expert\n\n");
     try {
         run_conversions();
         run_refusals();
@@ -1426,6 +1603,7 @@ int main(int argc, char** argv) {
         run_bind();
         run_embed();
         run_shexp();
+        run_experts();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;

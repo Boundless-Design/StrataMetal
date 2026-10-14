@@ -14,9 +14,9 @@
 //
 // The embedding is gathered only as an S2, S4, or S8 row. The shared expert's three
 // projections each go to the kernel that accepts that form. The 2-bit shared_expert
-// function is not called. A routed expert span is not passed to the IQ expert. A
-// 2-bit plane is not bound onto a Q8_K projection. This does not run the model.
-// There is no token rate.
+// function is not called. A 3-D routed-expert span is not passed to the IQ expert.
+// One concatenated blob from experts.bin is. A 2-bit plane is not bound onto a Q8_K
+// projection. This does not run the model. There is no token rate.
 #pragma once
 
 #include "strata/metal/gdn_layer.hpp"
@@ -122,5 +122,13 @@ void gather_token_embd(const PackTable& table, const strata::core::ModelGeometry
 // not read. x holds n_embd floats. out holds at least n_embd floats.
 void run_shared_expert(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x,
                        Bytes& out);
+
+// One routed expert. experts.bin holds [gate rows | up rows | down rows] for each expert.
+// native_experts.txt says the type, the file offset, and the blob size. The count in that
+// file bounds the expert index. blk.L.ffn_*_exps.weight is a 3-D role span and is not read.
+// A GGUF shard is not opened. x_q8 is one q8_1 row of n_embd. y holds at least n_embd floats.
+// The residual is not written. This does not draw a token.
+void run_routed_expert(const PackTable& table, const std::string& pack_dir, const strata::core::ModelGeometry& g,
+                       int64_t layer, int64_t expert, const Bytes& x_q8, Bytes& y);
 
 }  // namespace strata::metal
