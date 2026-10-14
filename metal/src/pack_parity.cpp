@@ -6,6 +6,8 @@
 #include "strata/metal/bf16_gemv.hpp"
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
+#include "strata/metal/launch.hpp"
+#include "strata/metal/s2_gemv.hpp"
 #include "strata/metal/sgemv.hpp"
 
 #include <algorithm>
@@ -162,6 +164,56 @@ void add_quant(Built& b, const std::string& name, int64_t ne0, int64_t ne1, int 
     row.offset_bytes = off_bytes;
     row.scales_fp16 = 1;
     row.act_kind = 1;
+    row.dst_bytes = codes_bytes + scale_dst + off_bytes;
+    add_src(b, std::move(row), src);
+}
+
+struct SOpt {
+    int bits = 4;
+    int bias = -8;
+    int group = 32;
+    int has_offset = 0;
+    int codebook = 0;
+    int act_kind = 1;
+    uint8_t code0 = 0x21;
+};
+
+void add_sform(Built& b, const std::string& name, int64_t ne0, int64_t ne1, const SOpt& o) {
+    if (o.bits != 2 && o.bits != 4 && o.bits != 8) throw strata::metal::MetalError("bad code bits in the fixture");
+    if (o.group <= 0 || ne0 % o.group != 0 || ne0 % (8 / o.bits) != 0)
+        throw strata::metal::MetalError("fixture shape does not match the group");
+    const int per = 8 / o.bits;
+    const uint64_t codes_bytes = (uint64_t) ne1 * (uint64_t) (ne0 / per);
+    const uint64_t groups = (uint64_t) ne1 * (uint64_t) (ne0 / o.group);
+    const uint64_t scale_src = groups * 2;
+    const uint64_t scale_dst = groups * 4;
+    const uint64_t off_bytes = o.has_offset ? groups * 4 : 0;
+    std::vector<uint8_t> src(codes_bytes + scale_src + off_bytes);
+    for (uint64_t i = 0; i < codes_bytes; ++i) src[i] = (uint8_t) (0x31 + (i * 17));
+    if (codes_bytes) src[0] = o.code0;
+    for (uint64_t i = 0; i < groups; ++i) {
+        const uint16_t h = 0x3c00;
+        std::memcpy(src.data() + codes_bytes + i * 2, &h, 2);
+    }
+    for (uint64_t i = 0; i < groups && o.has_offset; ++i) {
+        const float off = 0.25f;
+        std::memcpy(src.data() + codes_bytes + scale_src + i * 4, &off, 4);
+    }
+    Row row;
+    row.name = name;
+    row.kind = 0;
+    row.ne0 = ne0;
+    row.ne1 = ne1;
+    row.code_bits = o.bits;
+    row.code_bias = o.bias;
+    row.group = o.group;
+    row.codebook = o.codebook;
+    row.has_offset = o.has_offset;
+    row.codes_bytes = codes_bytes;
+    row.scales_bytes = scale_dst;
+    row.offset_bytes = off_bytes;
+    row.scales_fp16 = 1;
+    row.act_kind = o.act_kind;
     row.dst_bytes = codes_bytes + scale_dst + off_bytes;
     add_src(b, std::move(row), src);
 }
@@ -1099,6 +1151,265 @@ void run_embed() {
     }
 }
 
+strata::core::ModelGeometry shexp_geom(int64_t n_embd, int64_t n_ff) {
+    strata::core::ModelGeometry g;
+    g.n_embd = n_embd;
+    g.n_ff = n_ff;
+    g.n_layers = 1;
+    return g;
+}
+
+void add_shexp_up_down(Built& b, int64_t n_embd, int64_t n_ff, int down_act) {
+    SOpt up;
+    up.bits = 4;
+    up.bias = -8;
+    up.group = 32;
+    up.has_offset = 1;
+    up.act_kind = 0;
+    up.code0 = 0x5A;
+    SOpt down;
+    down.bits = 4;
+    down.bias = -8;
+    down.group = 32;
+    down.has_offset = 1;
+    down.codebook = down_act == 1 ? 0 : 1;
+    down.act_kind = down_act;
+    down.code0 = 0x3C;
+    add_sform(b, tn(0, "ffn_up_shexp.weight"), n_embd, n_ff, up);
+    add_sform(b, tn(0, "ffn_down_shexp.weight"), n_ff, n_embd, down);
+    add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), n_embd, 1, 0x3f800001u);
+}
+
+Bytes shexp_x(int64_t n) {
+    Bytes x((uint64_t) n * 4);
+    auto* p = static_cast<float*>(x.data());
+    for (int64_t i = 0; i < n; ++i) p[i] = (float) ((i * 17) % 29) * 0.02f - 0.2f;
+    return x;
+}
+
+void run_shexp() {
+    const int64_t n_embd = 256;
+    const int64_t n_ff = 640;
+    const auto g = shexp_geom(n_embd, n_ff);
+    Tmp dir;
+    {
+        Built b;
+        SOpt gate;
+        gate.bits = 2;
+        gate.bias = -1;
+        gate.group = 64;
+        gate.has_offset = 0;
+        gate.act_kind = 0;
+        gate.code0 = 0xA5;
+        SOpt up;
+        up.bits = 4;
+        up.bias = -8;
+        up.group = 32;
+        up.has_offset = 1;
+        up.act_kind = 1;
+        up.code0 = 0x5A;
+        SOpt down;
+        down.bits = 4;
+        down.bias = -8;
+        down.group = 32;
+        down.has_offset = 1;
+        down.codebook = 1;
+        down.act_kind = 0;
+        down.code0 = 0x3C;
+        add_sform(b, tn(0, "ffn_gate_shexp.weight"), n_embd, n_ff, gate);
+        add_sform(b, tn(0, "ffn_up_shexp.weight"), n_embd, n_ff, up);
+        add_sform(b, tn(0, "ffn_down_shexp.weight"), n_ff, n_embd, down);
+        add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), n_embd, 1, 0x3f800001u);
+        write_pack(dir, b);
+    }
+    PackTable table = PackTable::load(dir.path.string());
+    const PackTensor* gate = table.find(tn(0, "ffn_gate_shexp.weight"));
+    const PackTensor* up = table.find(tn(0, "ffn_up_shexp.weight"));
+    const PackTensor* down = table.find(tn(0, "ffn_down_shexp.weight"));
+    const PackTensor* ginp = table.find(tn(0, "ffn_gate_inp_shexp.weight"));
+    const bool fields = gate && up && down && ginp && gate->code_bits == 2 && gate->code_bias == -1 &&
+                        gate->group_elems == 64 && !gate->has_offset && !gate->codebook_iq4nl && gate->act_kind == 0 &&
+                        gate->file_id == 0 && up->code_bits == 4 && up->code_bias == -8 && up->group_elems == 32 &&
+                        up->has_offset && up->act_kind == 1 && !up->codebook_iq4nl && down->code_bits == 4 &&
+                        down->codebook_iq4nl && down->act_kind == 0 && down->has_offset && down->group_elems == 32 &&
+                        gate->scales && up->offset && down->offset && ginp->kind == strata::core::WeightKind::Bf16InF32 &&
+                        ginp->values;
+    float scale = 0.f, offset = 0.f;
+    uint16_t inp = 0;
+    if (fields) {
+        std::memcpy(&scale, gate->scales->data(), 4);
+        std::memcpy(&offset, down->offset->data(), 4);
+        std::memcpy(&inp, ginp->values->data(), 2);
+    }
+    const bool widened = scale == 1.f && offset == 0.25f && inp == 0x3f80;
+    std::string detail = "fields";
+    bool matched = false;
+    int affine_diff = 0;
+    if (fields && widened) {
+        struct SeN {
+            int n;
+            int pad0;
+            int pad1;
+            int pad2;
+        };
+        static_assert(sizeof(SeN) == 16, "SeN must match the shader");
+        auto launch_se = [](const char* fn, const Bytes* const* bufs, int nbuf, int n) {
+            const SeN dim{n, 0, 0, 0};
+            const uint32_t groups = (uint32_t) ((n + 255) / 256);
+            launch(fn, bufs, nbuf, &dim, sizeof dim, Grid{groups, 1, 1, 256, 1, 1});
+        };
+        Bytes x = shexp_x(n_embd);
+        auto once = [&](bool affine, Bytes& y) {
+            Bytes x_bf16((uint64_t) n_embd * 2);
+            Bytes x80(q8_0_bytes(n_embd));
+            Bytes xk(q8k_bytes(n_embd));
+            quantize_q8_0(x, n_embd, x80);
+            quantize_q8_k(x, n_embd, xk);
+            f32_to_bf16_bulk(x, x_bf16, n_embd);
+            Bytes gate_y((uint64_t) n_ff * 4);
+            Bytes up_y((uint64_t) n_ff * 4);
+            s2_gemv_q8(x80, *gate->codes, *gate->scales, gate_y, n_embd, n_ff, 32);
+            SForm up_form;
+            up_form.code_bits = up->code_bits;
+            up_form.code_bias = up->code_bias;
+            up_form.group_elems = up->group_elems;
+            up_form.has_offset = up->has_offset;
+            s_gemv_q8k_split(xk, *up->codes, *up->scales, up->offset.get(), up_y, n_embd, n_ff, up_form);
+            const Bytes* sw[] = {&gate_y, &up_y, &gate_y};
+            launch_se("se_swiglu", sw, 3, (int) n_ff);
+            Bytes h(q8_0_bytes(n_ff));
+            quantize_q8_0(gate_y, n_ff, h);
+            SForm down_form;
+            down_form.code_bits = down->code_bits;
+            down_form.code_bias = down->code_bias;
+            down_form.group_elems = down->group_elems;
+            down_form.codebook = affine ? Codebook::Affine : Codebook::Iq4Nl;
+            down_form.has_offset = down->has_offset;
+            s_gemv_q8_0_split(h, *down->codes, *down->scales, down->offset.get(), y, n_ff, n_embd, down_form);
+            Bytes scalar(4);
+            bf16_gemv(x_bf16, *ginp->values, scalar, n_embd, 1);
+            const Bytes* sc[] = {&y, &scalar};
+            launch_se("se_sigmoid_scale", sc, 2, (int) n_embd);
+        };
+        const int guard = 1;
+        Bytes got((uint64_t) (n_embd + guard) * 4);
+        Bytes ref((uint64_t) (n_embd + guard) * 4);
+        Bytes aff((uint64_t) (n_embd + guard) * 4);
+        std::fill_n(static_cast<float*>(got.data()), (size_t) (n_embd + guard), 7.f);
+        std::fill_n(static_cast<float*>(ref.data()), (size_t) (n_embd + guard), 7.f);
+        std::fill_n(static_cast<float*>(aff.data()), (size_t) (n_embd + guard), 7.f);
+        run_shared_expert(table, g, 0, x, got);
+        once(false, ref);
+        once(true, aff);
+        const float* gp = static_cast<const float*>(got.data());
+        const int diff = differ_floats(gp, static_cast<const float*>(ref.data()), (int) n_embd);
+        affine_diff = differ_floats(gp, static_cast<const float*>(aff.data()), (int) n_embd);
+        const bool guard_held = gp[n_embd] == 7.f && static_cast<const float*>(ref.data())[n_embd] == 7.f;
+        matched = diff == 0 && affine_diff > 0 && !still_seven(gp, (int) n_embd) && guard_held;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%d differ, affine down differed on %d", diff, affine_diff);
+        detail = buf;
+    }
+    verdict("a mixed shared expert matches the three products", fields && widened && matched, detail);
+
+    auto refuse = [&](const char* name, const char* needle, const std::function<void(Built&)>& build, int64_t ne,
+                      int64_t nf) {
+        Tmp d;
+        Built b;
+        build(b);
+        write_pack(d, b);
+        PackTable t = PackTable::load(d.path.string());
+        const auto geom = shexp_geom(ne, nf);
+        Bytes x = shexp_x(ne);
+        Bytes out((uint64_t) (ne + 1) * 4);
+        std::fill_n(static_cast<float*>(out.data()), (size_t) (ne + 1), 7.f);
+        std::string got;
+        const bool thrown = threw(needle, [&] { run_shared_expert(t, geom, 0, x, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), (int) ne + 1);
+        verdict(name, thrown && held, got);
+    };
+
+    refuse("a missing shared-expert weight is refused", "ffn_up_shexp.weight is missing",
+           [](Built& b) {
+               SOpt gate;
+               gate.bits = 2;
+               gate.bias = -1;
+               gate.group = 64;
+               gate.act_kind = 0;
+               add_sform(b, tn(0, "ffn_gate_shexp.weight"), 64, 64, gate);
+               SOpt down;
+               down.act_kind = 0;
+               add_sform(b, tn(0, "ffn_down_shexp.weight"), 64, 64, down);
+               add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), 64, 1, 0x3f800001u);
+           },
+           64, 64);
+    refuse("a shared-expert gate stored as f32 is refused", "reads it as bf16",
+           [](Built& b) {
+               add_f32(b, tn(0, "ffn_gate_shexp.weight"), 32, 32, 0x11, -1);
+               add_f32(b, tn(0, "ffn_up_shexp.weight"), 32, 32, 0x11, -1);
+               add_f32(b, tn(0, "ffn_down_shexp.weight"), 32, 32, 0x11, -1);
+               add_f32(b, tn(0, "ffn_gate_inp_shexp.weight"), 32, 1, 0x11, -1);
+           },
+           32, 32);
+    refuse("a shared-expert row of the wrong length is refused", "ne0 is 8",
+           [](Built& b) {
+               add_f32(b, tn(0, "ffn_gate_shexp.weight"), 8, 32, 0x11, -1);
+               add_f32(b, tn(0, "ffn_up_shexp.weight"), 32, 32, 0x11, -1);
+               add_f32(b, tn(0, "ffn_down_shexp.weight"), 32, 32, 0x11, -1);
+               add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), 32, 1, 0x3f800001u);
+           },
+           32, 32);
+    refuse("a 2-bit shared expert with the wrong bias is refused", "bias -1",
+           [](Built& b) {
+               SOpt gate;
+               gate.bits = 2;
+               gate.bias = -8;
+               gate.group = 64;
+               gate.act_kind = 0;
+               add_sform(b, tn(0, "ffn_gate_shexp.weight"), 64, 64, gate);
+               add_shexp_up_down(b, 64, 64, 0);
+           },
+           64, 64);
+    refuse("a Q8_K down weight is refused", "not a multiple of 256",
+           [](Built& b) {
+               SOpt gate;
+               gate.bits = 2;
+               gate.bias = -1;
+               gate.group = 64;
+               gate.act_kind = 0;
+               add_sform(b, tn(0, "ffn_gate_shexp.weight"), 256, 640, gate);
+               SOpt up;
+               up.act_kind = 0;
+               add_sform(b, tn(0, "ffn_up_shexp.weight"), 256, 640, up);
+               SOpt down;
+               down.act_kind = 1;
+               add_sform(b, tn(0, "ffn_down_shexp.weight"), 640, 256, down);
+               add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), 256, 1, 0x3f800001u);
+           },
+           256, 640);
+    refuse("a shared-expert group of 24 is refused", "group_elems 24",
+           [](Built& b) {
+               SOpt bad;
+               bad.group = 24;
+               bad.act_kind = 0;
+               add_sform(b, tn(0, "ffn_gate_shexp.weight"), 48, 48, bad);
+               add_sform(b, tn(0, "ffn_up_shexp.weight"), 48, 48, bad);
+               add_sform(b, tn(0, "ffn_down_shexp.weight"), 48, 48, bad);
+               add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), 48, 1, 0x3f800001u);
+           },
+           48, 48);
+    refuse("an f32 shared-expert weight is refused", "not an S2/S4/S8",
+           [](Built& b) {
+               add_f32(b, tn(0, "ffn_gate_shexp.weight"), 32, 32, 0x11, -1);
+               SOpt up;
+               up.act_kind = 0;
+               add_sform(b, tn(0, "ffn_up_shexp.weight"), 32, 32, up);
+               add_sform(b, tn(0, "ffn_down_shexp.weight"), 32, 32, up);
+               add_bf16(b, tn(0, "ffn_gate_inp_shexp.weight"), 32, 1, 0x3f800001u);
+           },
+           32, 32);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1107,13 +1418,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-pack [--selftest]\n");
         return 2;
     }
-    std::printf("pack: index conversions, one product on loaded bytes, name checks, one embedding row\n\n");
+    std::printf("pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert\n\n");
     try {
         run_conversions();
         run_refusals();
         run_shapes();
         run_bind();
         run_embed();
+        run_shexp();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;

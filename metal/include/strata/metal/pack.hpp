@@ -12,10 +12,11 @@
 // layer % interval == interval - 1. Rope tables, the page table, and the recurrence
 // are built at runtime. They are not in the pack.
 //
-// A loaded shared-expert tensor is not passed to the 2-bit shared expert. A routed
-// expert span is not passed to the IQ expert. A 2-bit plane is not bound onto a Q8_K
-// projection. The embedding is gathered only as an S2, S4, or S8 row. This does not
-// run the model. There is no token rate.
+// The embedding is gathered only as an S2, S4, or S8 row. The shared expert's three
+// projections each go to the kernel that accepts that form. The 2-bit shared_expert
+// function is not called. A routed expert span is not passed to the IQ expert. A
+// 2-bit plane is not bound onto a Q8_K projection. This does not run the model.
+// There is no token rate.
 #pragma once
 
 #include "strata/metal/gdn_layer.hpp"
@@ -60,8 +61,8 @@ struct PackTensor {
 
 // What one layer's kernels can read. The mixer that does not run is left empty.
 // cos_tab and sin_tab stay null: the rope table is not in the pack.
-// The shared expert and the routed experts are not here. The embedding is gathered
-// on its own, and only when it is an S2, S4, or S8 row.
+// The routed experts are not here. The embedding and the shared expert are run on
+// their own. The embedding is only an S2, S4, or S8 row.
 struct PackLayer {
     bool qsa_layer = false;
     TokenGr attn;
@@ -105,12 +106,21 @@ GdnLayerWeights bind_gdn_layer(const PackTable& table, const strata::core::Model
 QsaLayerWeights bind_qsa_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // Gated residual, router, and the mixer for this layer. The table must outlive the pointers.
-// The embedding is not one of those planes.
+// The embedding and the shared expert are not among those planes.
 PackLayer bind_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // One row of token_embd.weight. The row length is g.n_embd and the token selects the row.
 // S2, S4, and S8 only. An IQ4NL codebook is refused. A bf16 table is refused. The residual
 // is not written, and output.weight is not read.
 void gather_token_embd(const PackTable& table, const strata::core::ModelGeometry& g, int64_t token, Bytes& out);
+
+// h = silu(x @ gate) * (x @ up), then h @ down, then times sigmoid(x · gate_inp).
+// A 2-bit plane must be group 64, bias -1, and affine, with no offset. A 4-bit or 8-bit
+// plane with activation kind 1 uses the Q8_K product, and that product needs n_in to be
+// a multiple of 256. Anything else uses the Q8_0 product, whose n_in is a multiple of 32.
+// The down weight's n_in is n_ff. The residual is not written, and the routed experts are
+// not read. x holds n_embd floats. out holds at least n_embd floats.
+void run_shared_expert(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x,
+                       Bytes& out);
 
 }  // namespace strata::metal

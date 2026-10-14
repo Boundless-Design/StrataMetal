@@ -2,8 +2,11 @@
 #include "strata/metal/pack.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/metal/bf16_gemv.hpp"
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
+#include "strata/metal/launch.hpp"
+#include "strata/metal/s2_gemv.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -257,6 +260,90 @@ TokenGr bind_gr_half(const PackTable& table, int64_t layer, const char* stem) {
     g.norm = need_values(row_of(table, layer, norm.c_str()), strata::core::WeightKind::F32, 4,
                          "the gated residual reads f32");
     return g;
+}
+
+struct SeN {
+    int n;
+    int pad0;
+    int pad1;
+    int pad2;
+};
+static_assert(sizeof(SeN) == 16, "SeN must match the shader");
+
+void launch_se(const char* fn, const Bytes* const* bufs, int nbuf, int n) {
+    const SeN dim{n, 0, 0, 0};
+    const uint32_t groups = (uint32_t) ((n + 255) / 256);
+    launch(fn, bufs, nbuf, &dim, sizeof dim, Grid{groups, 1, 1, 256, 1, 1});
+}
+
+enum class ShexpAct { TwoBit, Q8K, Q80 };
+
+const PackTensor& shexp_row(const PackTable& table, int64_t layer, const char* suffix) {
+    const std::string name = layer_name(layer, suffix);
+    const PackTensor* r = table.find(name);
+    if (!r) throw MetalError(name + " is missing");
+    return *r;
+}
+
+void need_ne(const PackTensor& t, int64_t ne0, int64_t ne1) {
+    if (t.ne0 != ne0)
+        throw MetalError(t.name + " ne0 is " + std::to_string(t.ne0) + ", the shared expert requires " +
+                         std::to_string(ne0));
+    if (t.ne1 != ne1)
+        throw MetalError(t.name + " ne1 is " + std::to_string(t.ne1) + ", the shared expert requires " +
+                         std::to_string(ne1));
+}
+
+void need_planes(const PackTensor& t, int64_t n_in, int64_t n_out) {
+    const SForm form = form_of(t);
+    const uint64_t codes = sgemv_code_bytes(form, n_in, n_out);
+    const uint64_t groups = sgemv_group_bytes(form, n_in, n_out);
+    if (!t.codes || t.codes->size() < codes) throw MetalError(t.name + ": codes are short");
+    if (!t.scales || t.scales->size() < groups) throw MetalError(t.name + ": scales are short");
+    if (t.has_offset != (t.offset_bytes != 0))
+        throw MetalError(t.name + ": has_offset does not match the offset plane");
+    if (t.has_offset && (!t.offset || t.offset->size() < groups)) throw MetalError(t.name + ": offset is short");
+}
+
+ShexpAct classify_shexp(const PackTensor& t, int64_t n_in, const char* role) {
+    if (t.code_bits == 2) {
+        if (t.group_elems != 64 || t.code_bias != -1 || t.has_offset || t.codebook_iq4nl)
+            throw MetalError(t.name + ": the 2-bit product reads group 64, bias -1, no offset, and an affine codebook");
+        if (n_in % 64 != 0) throw MetalError(t.name + ": n_in is not a multiple of 64");
+        need_planes(t, n_in, t.ne1);
+        return ShexpAct::TwoBit;
+    }
+    if (t.code_bits != 4 && t.code_bits != 8)
+        throw MetalError(t.name + ": code_bits " + std::to_string(t.code_bits) + " is not an S2/S4/S8 form");
+    if (!group_ok(t.group_elems))
+        throw MetalError(t.name + ": group_elems " + std::to_string(t.group_elems) +
+                         " is not a power of two and a multiple of 16");
+    if (t.ne0 % t.group_elems != 0) throw MetalError(t.name + ": n_in is not a multiple of group_elems");
+    if (t.act_kind == 1) {
+        if (n_in % 256 != 0)
+            throw MetalError(t.name + ": the " + role + " weight wants Q8_K but n_in " + std::to_string(n_in) +
+                             " is not a multiple of 256");
+        need_planes(t, n_in, t.ne1);
+        return ShexpAct::Q8K;
+    }
+    if (t.act_kind != 0)
+        throw MetalError(t.name + ": activation kind " + std::to_string(t.act_kind) + " is not Q8_0 or Q8_K");
+    if (n_in % 32 != 0) throw MetalError(t.name + ": n_in is not a multiple of 32");
+    need_planes(t, n_in, t.ne1);
+    return ShexpAct::Q80;
+}
+
+void project_shexp(ShexpAct act, const PackTensor& t, const Bytes& x80, const Bytes* xq8k, Bytes& y, int64_t n_in,
+                   int64_t n_out) {
+    const SForm form = form_of(t);
+    const Bytes* off = t.has_offset ? t.offset.get() : nullptr;
+    if (act == ShexpAct::TwoBit) {
+        s2_gemv_q8(x80, *t.codes, *t.scales, y, n_in, n_out, 32);
+    } else if (act == ShexpAct::Q8K) {
+        s_gemv_q8k_split(*xq8k, *t.codes, *t.scales, off, y, n_in, n_out, form);
+    } else {
+        s_gemv_q8_0_split(x80, *t.codes, *t.scales, off, y, n_in, n_out, form);
+    }
 }
 
 }  // namespace
@@ -587,6 +674,76 @@ void gather_token_embd(const PackTable& table, const strata::core::ModelGeometry
     if (!planes) throw MetalError("embed_row: embedding planes do not match the loaded tensor shape");
     embedding_gather(*w->codes, *w->scales, w->has_offset ? w->offset.get() : nullptr, w->ne0, w->code_bits,
                      w->code_bias, w->group_elems, token, out, 0);
+}
+
+void run_shared_expert(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x,
+                       Bytes& out) {
+    if (layer < 0 || layer >= g.n_layers)
+        throw MetalError("layer " + std::to_string(layer) + " is outside 0.." + std::to_string(g.n_layers - 1));
+    if (g.n_embd <= 0 || g.n_ff <= 0) throw MetalError("shared expert: empty shape");
+    if (x.size() < (uint64_t) g.n_embd * 4) throw MetalError("shared expert: the activation is short");
+    if (out.size() < (uint64_t) g.n_embd * 4) throw MetalError("shared expert: the output is short");
+
+    const PackTensor& gate = shexp_row(table, layer, "ffn_gate_shexp.weight");
+    const PackTensor& up = shexp_row(table, layer, "ffn_up_shexp.weight");
+    const PackTensor& down = shexp_row(table, layer, "ffn_down_shexp.weight");
+    const PackTensor& ginp = shexp_row(table, layer, "ffn_gate_inp_shexp.weight");
+    need_ne(gate, g.n_embd, g.n_ff);
+    need_ne(up, g.n_embd, g.n_ff);
+    need_ne(down, g.n_ff, g.n_embd);
+    if (ginp.elements != g.n_embd)
+        throw MetalError(ginp.name + " elements is " + std::to_string(ginp.elements) +
+                         ", the shared expert requires " + std::to_string(g.n_embd));
+    if (ginp.kind != strata::core::WeightKind::Bf16InF32 || ginp.code_bits != 0 || !ginp.values ||
+        ginp.values->size() < (uint64_t) g.n_embd * 2) {
+        const uint64_t got = ginp.values ? ginp.values->size() : 0;
+        throw MetalError(ginp.name + " is engine form " + std::to_string((int) ginp.kind) + " (" +
+                         std::to_string(got) + " B); the scalar gate reads it as bf16, so it must be form 1 (" +
+                         std::to_string((uint64_t) g.n_embd * 2) + " B)");
+    }
+
+    const ShexpAct gate_act = classify_shexp(gate, g.n_embd, "gate");
+    const ShexpAct up_act = classify_shexp(up, g.n_embd, "up");
+    const ShexpAct down_act = classify_shexp(down, g.n_ff, "down");
+    const bool x80 = gate_act != ShexpAct::Q8K || up_act != ShexpAct::Q8K;
+    const bool xk = gate_act == ShexpAct::Q8K || up_act == ShexpAct::Q8K;
+    const bool h80 = down_act != ShexpAct::Q8K;
+
+    Bytes x_bf16((uint64_t) g.n_embd * 2);
+    std::unique_ptr<Bytes> x_q8_0;
+    std::unique_ptr<Bytes> x_q8k;
+    if (x80) {
+        x_q8_0 = std::make_unique<Bytes>(q8_0_bytes(g.n_embd));
+        quantize_q8_0(x, g.n_embd, *x_q8_0);
+    }
+    if (xk) {
+        x_q8k = std::make_unique<Bytes>(q8k_bytes(g.n_embd));
+        quantize_q8_k(x, g.n_embd, *x_q8k);
+    }
+    f32_to_bf16_bulk(x, x_bf16, g.n_embd);
+
+    Bytes gate_y((uint64_t) g.n_ff * 4);
+    Bytes up_y((uint64_t) g.n_ff * 4);
+    const Bytes& act80 = x80 ? *x_q8_0 : *x_q8k;
+    project_shexp(gate_act, gate, act80, x_q8k.get(), gate_y, g.n_embd, g.n_ff);
+    project_shexp(up_act, up, act80, x_q8k.get(), up_y, g.n_embd, g.n_ff);
+    const Bytes* sw[] = {&gate_y, &up_y, &gate_y};
+    launch_se("se_swiglu", sw, 3, (int) g.n_ff);
+
+    std::unique_ptr<Bytes> h_q8;
+    if (h80) {
+        h_q8 = std::make_unique<Bytes>(q8_0_bytes(g.n_ff));
+        quantize_q8_0(gate_y, g.n_ff, *h_q8);
+    } else {
+        h_q8 = std::make_unique<Bytes>(q8k_bytes(g.n_ff));
+        quantize_q8_k(gate_y, g.n_ff, *h_q8);
+    }
+    project_shexp(down_act, down, *h_q8, h_q8.get(), out, g.n_ff, g.n_embd);
+
+    Bytes scalar(4);
+    bf16_gemv(x_bf16, *ginp.values, scalar, g.n_embd, 1);
+    const Bytes* sc[] = {&out, &scalar};
+    launch_se("se_sigmoid_scale", sc, 2, (int) g.n_embd);
 }
 
 }  // namespace strata::metal

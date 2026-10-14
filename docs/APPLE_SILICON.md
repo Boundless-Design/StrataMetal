@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row. It does not draw a token.
+The pack index is read into those kernels, including one embedding row and one shared expert. It does not draw a token.
 
 ## One memory pool
 
@@ -466,6 +466,17 @@ stayed 7. An IQ4NL embedding was refused, and the output stayed 7. A row length 
 n_embd was refused. Token 3 on a table of 3 rows was refused, and token -1 was refused, and the
 output stayed 7. A group of 24 on a row of 32 was refused. Planes that covered one row of a
 two-row table were refused, and the output stayed 7. Gathering that row does not draw a token.
+A shared expert with n_embd 256 and n_ff 640 matched the three products on the loaded planes, 0
+differ. The gate was 2-bit, group 64, bias -1, with no offset. The up projection was 4-bit Q8_K,
+group 32, bias -8, with an offset. The down projection was 4-bit IQ4NL, group 32, with an offset,
+and its activation was Q8_0. Reading that down weight as an affine codebook differed on 256 of 256
+outputs. The fp16 scales widened to 1. The down offset was 0.25. The scalar gate's high 16 bits
+were 0x3f80. The word after the output stayed 7. A missing up weight was refused. On a row of 32,
+a scalar gate stored as f32 was 128 B, and the kernel reads it as 64 B of bf16. A gate whose ne0
+was 8, where that expert requires 32, was refused. A 2-bit gate with bias -8 was refused. A Q8_K
+down weight whose n_in was 640 was refused. A group of 24 was refused. An f32 gate weight was
+refused. The output stayed 7 on each refusal. The 2-bit shared_expert function is not this call.
+Running that expert does not draw a token.
 
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels. The model does not run. There is no
@@ -477,13 +488,14 @@ decode kernel. `strata-metal-token` calls the embedding row, the gated residual,
 block, the router, the routed experts, the shared expert, the combine, the output projection, and
 the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
-`strata-metal-pack` calls the bf16 product, the Q8_K projection, and one embedding row on bytes it
-loaded. It does not draw a token. The expert-half add is still a kernel only. Still to write, in
-this order, each one checked before the next depends on it:
+`strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, and one shared
+expert on bytes it loaded. It does not draw a token. The expert-half add is still a kernel only.
+The 2-bit shared expert function is still its own check. Still to write, in this order, each one
+checked before the next depends on it:
 
-1. The planes this loader does not bind: the shared expert's real S-form, a routed expert blob,
-   and a 2-bit attention matrix. Then a pack can feed the stack. Then the MTP draft layer, then
-   the Python server in `serve/`, which can stay as it is once it has an engine binary to start.
+1. The planes this loader does not bind: a routed expert blob, and a 2-bit attention matrix. Then
+   a pack can feed the stack. Then the MTP draft layer, then the Python server in `serve/`, which
+   can stay as it is once it has an engine binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
