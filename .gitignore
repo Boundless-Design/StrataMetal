@@ -1,0 +1,5 @@
+.DS_Store
+build-qsa/
+build-metal/
+build-metal-xcode/
+xcode/
