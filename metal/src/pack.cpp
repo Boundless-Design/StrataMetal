@@ -3,6 +3,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/device.hpp"
+#include "strata/metal/elementwise.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -554,6 +555,38 @@ PackLayer bind_layer(const PackTable& table, const strata::core::ModelGeometry& 
         out.gdn = bind_gdn_layer(table, g, layer);
     }
     return out;
+}
+
+void gather_token_embd(const PackTable& table, const strata::core::ModelGeometry& g, int64_t token, Bytes& out) {
+    const PackTensor* w = table.find("token_embd.weight");
+    if (!w) throw MetalError("token_embd.weight is missing");
+    if (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)
+        throw MetalError("embed_row: token_embd.weight is not an S2/S4/S8 tensor");
+    if (w->codebook_iq4nl) throw MetalError("embed_row: an IQ4NL embedding is not supported");
+    const int per_byte = 8 / w->code_bits;
+    if (!w->codes || !w->scales || w->ne0 <= 0 || w->ne1 <= 0 || w->ne0 != g.n_embd || w->group_elems <= 0 ||
+        w->ne0 % w->group_elems != 0 || w->ne0 % per_byte != 0) {
+        throw MetalError("embed_row: invalid embedding pointers, dimensions or group size");
+    }
+    if (token < 0 || token >= w->ne1) {
+        throw MetalError("embed_row: token " + std::to_string(token) + " is outside 0.." +
+                         std::to_string(w->ne1 - 1));
+    }
+    const uint64_t row_codes = (uint64_t) (w->ne0 / per_byte);
+    const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+    const uint64_t rows = (uint64_t) w->ne1;
+    const bool planes = w->codes_bytes != 0 && w->scales_bytes != 0 && w->codes->size() == w->codes_bytes &&
+                        w->scales->size() == w->scales_bytes && w->codes_bytes % row_codes == 0 &&
+                        w->codes_bytes / row_codes == rows && w->codes_bytes % alignof(float) == 0 &&
+                        w->scales_bytes % sizeof(float) == 0 &&
+                        (w->scales_bytes / sizeof(float)) % row_groups == 0 &&
+                        (w->scales_bytes / sizeof(float)) / row_groups == rows &&
+                        w->has_offset == (w->offset_bytes != 0) &&
+                        (!w->has_offset || (w->offset && w->offset->size() == w->offset_bytes &&
+                                            w->offset_bytes == w->scales_bytes));
+    if (!planes) throw MetalError("embed_row: embedding planes do not match the loaded tensor shape");
+    embedding_gather(*w->codes, *w->scales, w->has_offset ? w->offset.get() : nullptr, w->ne0, w->code_bits,
+                     w->code_bias, w->group_elems, token, out, 0);
 }
 
 }  // namespace strata::metal

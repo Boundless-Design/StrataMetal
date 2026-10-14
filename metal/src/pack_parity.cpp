@@ -5,6 +5,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/bf16_gemv.hpp"
 #include "strata/metal/device.hpp"
+#include "strata/metal/elementwise.hpp"
 #include "strata/metal/sgemv.hpp"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -353,6 +355,22 @@ void add_bind_layer(Built& b, const strata::core::ModelGeometry& g, int layer, b
         add_f32(b, tn(layer, "indexer.q_norm.weight"), g.idx_key_dim, 1, 0x11, -1);
         add_f32(b, tn(layer, "indexer.k_norm.weight"), g.idx_key_dim, 1, 0x11, -1);
     }
+}
+
+// The last row must be the tail of file 0. The embedding file is file 1.
+void move_tail_to_embd(Built& b) {
+    Row& row = b.rows.back();
+    const uint64_t off = row.src_off;
+    std::vector<uint8_t> bytes(b.bin[0].begin() + (std::ptrdiff_t) off, b.bin[0].end());
+    b.bin[0].resize((size_t) off);
+    row.file = 1;
+    row.src_off = b.bin[1].size();
+    b.bin[1].insert(b.bin[1].end(), bytes.begin(), bytes.end());
+}
+
+void add_embd(Built& b, int64_t ne0, int64_t ne1, int bits, int bias, int has_offset, uint8_t code0) {
+    add_quant(b, "token_embd.weight", ne0, ne1, bits, bias, has_offset, code0);
+    move_tail_to_embd(b);
 }
 
 void add_side_files(Built& b) {
@@ -887,6 +905,200 @@ void run_bind() {
     verdict("a 2-bit Q8_K plane is refused", names && gref && qref, names ? gerr : nerr);
 }
 
+bool one_embd_row(int bits, int bias, int has_offset, std::string& detail) {
+    const int64_t n = 32;
+    const int64_t vocab = 3;
+    const int64_t token = 1;
+    Tmp dir;
+    Built b;
+    add_embd(b, n, vocab, bits, bias, has_offset, 0xA5);
+    write_pack(dir, b);
+    PackTable table = PackTable::load(dir.path.string());
+    const PackTensor* w = table.find("token_embd.weight");
+    if (!w || !w->codes || !w->scales || w->file_id != 1 || w->code_bits != bits || w->group_elems != 32) {
+        detail = std::to_string(bits) + "-bit row did not load";
+        return false;
+    }
+    const float* loaded_scales = static_cast<const float*>(w->scales->data());
+    if (loaded_scales[token] != 1.f) {
+        detail = std::to_string(bits) + "-bit scale did not widen to 1";
+        return false;
+    }
+    std::unique_ptr<Bytes> off_copy;
+    if (has_offset) {
+        if (!w->offset) {
+            detail = std::to_string(bits) + "-bit offset missing";
+            return false;
+        }
+        const float* loaded_off = static_cast<const float*>(w->offset->data());
+        if (loaded_off[token] != 0.25f) {
+            detail = std::to_string(bits) + "-bit offset was not 0.25";
+            return false;
+        }
+        off_copy = std::make_unique<Bytes>(w->offset->size());
+        std::memcpy(off_copy->data(), w->offset->data(), w->offset->size());
+    }
+    Bytes codes(w->codes->size());
+    Bytes scales(w->scales->size());
+    std::memcpy(codes.data(), w->codes->data(), w->codes->size());
+    std::memcpy(scales.data(), w->scales->data(), w->scales->size());
+    if (codes.data() == w->codes->data()) {
+        detail = std::to_string(bits) + "-bit copy aliased the pack";
+        return false;
+    }
+    const int guard = 1;
+    Bytes got((uint64_t) (n + guard) * 4);
+    Bytes ref((uint64_t) (n + guard) * 4);
+    Bytes row0((uint64_t) (n + guard) * 4);
+    std::fill_n(static_cast<float*>(got.data()), (size_t) (n + guard), 7.f);
+    std::fill_n(static_cast<float*>(ref.data()), (size_t) (n + guard), 7.f);
+    std::fill_n(static_cast<float*>(row0.data()), (size_t) (n + guard), 7.f);
+    strata::core::ModelGeometry g;
+    g.n_embd = n;
+    gather_token_embd(table, g, token, got);
+    embedding_gather(codes, scales, off_copy ? off_copy.get() : nullptr, n, bits, bias, w->group_elems, token, ref,
+                     0);
+    gather_token_embd(table, g, 0, row0);
+    const float* gp = static_cast<const float*>(got.data());
+    const float* rp = static_cast<const float*>(ref.data());
+    const int diff = differ_floats(gp, rp, (int) n);
+    const int apart = differ_floats(gp, static_cast<const float*>(row0.data()), (int) n);
+    const bool guard_held = gp[n] == 7.f && rp[n] == 7.f;
+    if (diff != 0 || apart == 0 || still_seven(gp, (int) n) || !guard_held) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "%d-bit %d differ, rows apart %d, guard %d", bits, diff, apart,
+                      guard_held ? 1 : 0);
+        detail = buf;
+        return false;
+    }
+    return true;
+}
+
+void run_embed() {
+    std::string d2, d4, d8;
+    const bool s2 = one_embd_row(2, -1, 0, d2);
+    const bool s4 = one_embd_row(4, -8, 1, d4);
+    const bool s8 = one_embd_row(8, -16, 0, d8);
+    std::string detail = "0 differ, scale widened to 1";
+    if (!s2) detail = d2;
+    else if (!s4) detail = d4;
+    else if (!s8) detail = d8;
+    verdict("an S2, S4, and S8 embedding row matches", s2 && s4 && s8, detail);
+
+    strata::core::ModelGeometry g;
+    g.n_embd = 32;
+    {
+        Tmp dir;
+        Built b;
+        add_f32(b, "other.weight", 4, 1, 0x11, -1);
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out(16);
+        std::string got;
+        const bool refused = threw("is missing", [&] { gather_token_embd(table, g, 0, out); }, got);
+        verdict("a missing embedding is refused", refused, got);
+    }
+    {
+        Tmp dir;
+        Built b;
+        add_bf16(b, "token_embd.weight", 32, 3, 0x3f800001u);
+        move_tail_to_embd(b);
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out((uint64_t) 33 * 4);
+        std::fill_n(static_cast<float*>(out.data()), 33, 7.f);
+        std::string got;
+        const bool refused = threw("not an S2/S4/S8", [&] { gather_token_embd(table, g, 1, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), 33);
+        verdict("a bf16 embedding is refused", refused && held, got);
+    }
+    {
+        Tmp dir;
+        Built b;
+        add_embd(b, 32, 3, 4, -8, 1, 0xA5);
+        b.rows.back().codebook = 1;
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out((uint64_t) 33 * 4);
+        std::fill_n(static_cast<float*>(out.data()), 33, 7.f);
+        std::string got;
+        const bool refused = threw("IQ4NL", [&] { gather_token_embd(table, g, 1, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), 33);
+        verdict("an IQ4NL embedding is refused", refused && held, got);
+    }
+    {
+        Tmp dir;
+        Built b;
+        add_embd(b, 32, 3, 4, -8, 0, 0xA5);
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out(16);
+        strata::core::ModelGeometry wide = g;
+        wide.n_embd = 64;
+        std::string got;
+        const bool refused =
+            threw("dimensions or group size", [&] { gather_token_embd(table, wide, 1, out); }, got);
+        verdict("a row length other than n_embd is refused", refused, got);
+    }
+    {
+        Tmp dir;
+        Built b;
+        add_embd(b, 32, 3, 4, -8, 0, 0xA5);
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out((uint64_t) 33 * 4);
+        std::fill_n(static_cast<float*>(out.data()), 33, 7.f);
+        std::string past, neg;
+        const bool hi = threw("outside", [&] { gather_token_embd(table, g, 3, out); }, past);
+        const bool lo = threw("outside", [&] { gather_token_embd(table, g, -1, out); }, neg);
+        const bool held = still_seven(static_cast<const float*>(out.data()), 33);
+        verdict("a token outside the table is refused", hi && lo && held, hi ? (lo ? past : neg) : past);
+    }
+    {
+        Tmp dir;
+        Built b;
+        add_embd(b, 32, 3, 4, -8, 0, 0xA5);
+        b.rows.back().group = 24;
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out(16);
+        std::string got;
+        const bool refused =
+            threw("dimensions or group size", [&] { gather_token_embd(table, g, 1, out); }, got);
+        verdict("a group that does not divide the row is refused", refused, got);
+    }
+    {
+        Tmp dir;
+        Built b;
+        std::vector<uint8_t> src(18, 0x11);
+        const uint16_t h = 0x3c00;
+        std::memcpy(src.data() + 16, &h, 2);
+        Row row;
+        row.name = "token_embd.weight";
+        row.file = 1;
+        row.kind = 0;
+        row.ne0 = 32;
+        row.ne1 = 2;
+        row.code_bits = 4;
+        row.code_bias = -8;
+        row.group = 32;
+        row.codes_bytes = 16;
+        row.scales_bytes = 4;
+        row.scales_fp16 = 1;
+        row.act_kind = 1;
+        row.dst_bytes = 20;
+        add_src(b, row, src);
+        write_pack(dir, b);
+        PackTable table = PackTable::load(dir.path.string());
+        Bytes out((uint64_t) 33 * 4);
+        std::fill_n(static_cast<float*>(out.data()), 33, 7.f);
+        std::string got;
+        const bool refused = threw("planes do not match", [&] { gather_token_embd(table, g, 0, out); }, got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), 33);
+        verdict("embedding planes that miss the shape are refused", refused && held, got);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -895,12 +1107,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-pack [--selftest]\n");
         return 2;
     }
-    std::printf("pack: index conversions, one product on loaded bytes, name checks\n\n");
+    std::printf("pack: index conversions, one product on loaded bytes, name checks, one embedding row\n\n");
     try {
         run_conversions();
         run_refusals();
         run_shapes();
         run_bind();
+        run_embed();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;
