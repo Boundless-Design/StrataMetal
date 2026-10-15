@@ -7671,6 +7671,7 @@ QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t
         else if (key_type == kIq4Xs) xs_ref(kw, qb, n_embd, kv, kval.data());
         else throw MetalError("qsa host key type");
         if (value_type == kQ5_K) k_ref(vw, qb, n_embd, kv, true, vval.data());
+        else if (value_type == kQ4_K) k_ref(vw, qb, n_embd, kv, false, vval.data());
         else if (value_type == kQ3_K) q3_ref(vw, qb, n_embd, kv, vval.data());
         else if (value_type == kIq4Xs) xs_ref(vw, qb, n_embd, kv, vval.data());
         else throw MetalError("qsa host value type");
@@ -9105,8 +9106,8 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
 //
 // Layer 1 still runs through run_layer1_gdn and run_layer1_ffn, which feed it. Each layer here is: the attention
 // half (a GDN step, or the QSA products, block and write), then the routed ten alone, then routed + shared, whose
-// output is the next layer's input. STRATA_WALK_LAST sets the last layer walked (default 18, the depth the
-// hand-written functions reached); the walk stops early at the first layer whose attention half did not write.
+// output is the next layer's input. STRATA_WALK_LAST sets the last layer walked (default 19). The walk stops
+// early at the first layer whose attention half did not write.
 void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g) {
     std::string why;
     const std::unique_ptr<ModelTensors> m = ModelTensors::open_default(&why);
@@ -9114,7 +9115,7 @@ void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g
         std::printf("\nlayer walk skipped: %s (set STRATA_MODEL_GGUF)\n", why.c_str());
         return;
     }
-    int last = 18;
+    int last = 19;
     if (const char* env = std::getenv("STRATA_WALK_LAST"); env && env[0]) last = std::atoi(env);
     const int n_layers = m->n_layers() > 0 ? m->n_layers() : (int) g.n_layers;
     if (last > n_layers - 1) last = n_layers - 1;
