@@ -3857,6 +3857,41 @@ void run_shared_rows(const PackTable& table, const strata::core::ModelGeometry& 
     verdict("a changed down code moves the shared expert", rows && flipped, flip_detail);
 }
 
+// The vocabulary rows live in embd.bin. The embedding is Q3_K and the output weight is Q5_K.
+// The layer-0 pass does not read them. gather_token_embd still refuses code_bits 0.
+// Comparing every row is the product. This is not a token.
+void run_vocab_rows(const PackTable& table, const strata::core::ModelGeometry& g) {
+    std::printf("\ntoken embedding and output weight from the extracted pack\n");
+    const int n_embd = (int) g.n_embd;
+    const int n_vocab = 248320;
+    auto plane = [&](const char* name, uint64_t nbytes) -> const PackTensor* {
+        const PackTensor* t = table.find(name);
+        if (!t || !t->values || t->code_bits != 0 || t->ne0 != n_embd || t->ne1 != n_vocab ||
+            t->values->size() != nbytes)
+            return nullptr;
+        return t;
+    };
+    const PackTensor* emb = plane("token_embd.weight", 273152000);
+    const PackTensor* outw = plane("output.weight", 437043200);
+    check_rows("the token embedding rows match", "a changed embedding code moves one row",
+               emb ? static_cast<const uint8_t*>(emb->values->data()) : nullptr, emb ? emb->values->size() : 0,
+               n_embd, n_vocab, kQ3_K, 32, q3_ref, q3_scalar);
+    check_k("the output weight rows match", "a changed output-weight code moves one row",
+            outw ? static_cast<const uint8_t*>(outw->values->data()) : nullptr, outw ? outw->values->size() : 0,
+            n_embd, n_vocab, true, 48);
+
+    std::string got = "bytes";
+    bool refused = false;
+    bool held = false;
+    if (emb) {
+        Bytes y((uint64_t) (n_embd + 1) * 4);
+        std::fill_n(static_cast<float*>(y.data()), (size_t) (n_embd + 1), 7.f);
+        refused = threw("S2/S4/S8", [&] { gather_token_embd(table, g, 0, y); }, got);
+        held = still_seven(static_cast<const float*>(y.data()), n_embd + 1);
+    }
+    verdict("the embedding gather refuses these rows", refused && held, got);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -4671,6 +4706,7 @@ void run_q2_layer() {
     verdict("a changed query code moves the layer-0 pass", pass_bytes && pass_flipped, pass_flip_detail);
 
     run_shared_rows(table, g);
+    run_vocab_rows(table, g);
 }
 
 }  // namespace
@@ -4685,7 +4721,7 @@ int main(int argc, char** argv) {
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
-        "one layer-0 pass, one shared expert\n\n");
+        "one layer-0 pass, one shared expert, one Q3_K embedding, one output weight\n\n");
     try {
         run_conversions();
         run_refusals();
