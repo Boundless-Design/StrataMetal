@@ -341,6 +341,9 @@ struct Live {
     int k = 2;
     int n_ff = 64;
     int n_ff_shared = 64;
+    // Each shared down scale is base + 0.1 * (0..49). The small fixture uses 8 so that term shows
+    // up in the sum. A wider shared expert keeps the same draw and a smaller base.
+    float shared_down_base = 8.0f;
     int n_vocab = 32;
     int n_head = 24;
     int n_head_kv = 2;
@@ -472,7 +475,7 @@ void build_live(Live& L) {
     std::vector<float> usc(gsc.size()), dsc((size_t) L.n_embd * (size_t) (L.n_ff_shared / 64));
     for (float& s : gsc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
     for (float& s : usc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
-    for (float& s : dsc) s = 8.0f + 0.1f * (float) (L.rng() % 50);
+    for (float& s : dsc) s = L.shared_down_base + 0.1f * (float) (L.rng() % 50);
     std::vector<uint16_t> ginv((size_t) L.n_embd);
     for (uint16_t& v : ginv) v = strata::kernels::bf16_from_f32(0.05f * L.gauss(L.rng));
     L.gc.reset(new Bytes(upload(gc.data(), gc.size())));
@@ -1088,6 +1091,23 @@ void check_expert_token() {
     check_live_token(L, "expert");
 }
 
+// The same token at the model shared-expert hidden size. Vocabulary and top-k stay put.
+void check_shared_token() {
+    std::printf("\nmodel shared  n_embd 2560  n_ff_shared 640  n_expert 512\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    L.hc_lr = 320;
+    L.n_ff = 640;
+    L.n_expert = 512;
+    L.n_ff_shared = 640;
+    // Hidden 640 with down scales from 8 left the attention write 4.07% apart. A base of 1
+    // keeps that term in the sum without covering the write.
+    L.shared_down_base = 1.0f;
+    build_live(L);
+    check_live_token(L, "shared");
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -1110,7 +1130,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "token: one block, one greedy sample, one draft step, one model-width token, one model-rank token, "
-        "one model-hidden token, one model-expert token, synthetic weights\n\n");
+        "one model-hidden token, one model-expert token, one model-shared token, synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1493,6 +1513,7 @@ int main(int argc, char** argv) {
         check_rank_token();
         check_hidden_token();
         check_expert_token();
+        check_shared_token();
 
         check_serve(argv[0]);
 

@@ -26,7 +26,7 @@ one greedy token at the model embedding, n_embd 2560, indexer dim 128, and 64 ro
 rank 32, 8 experts, hidden 64, vocabulary 32, and top-k 2. It also draws one greedy token at the
 model residual rank, hc_lr 320, on that same embedding. It also draws one greedy token there with
 routed hidden 640, 8 experts, and shared hidden 64. It also draws one greedy token there with
-512 experts. Four synthetic
+512 experts, and one there with shared hidden 640. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
 The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
@@ -480,6 +480,18 @@ Skipping the attention write was 107.96% apart on the logits. 16 words past the 
 Shared-expert hidden size, vocabulary, and top-k stayed on the small fixture. The weights are
 synthetic. No GGUF was loaded. This is not a loaded model. There is no token rate.
 
+The same run draws one greedy token at the model shared-expert hidden size. n_embd 2560, hc_lr 320,
+4 streams, indexer dim 128, 64 rotated values, 24 heads, 2 kv heads, head dim 256, 4 indexer heads,
+block 4, top-k 2, page size 2, 4 cells. 512 experts, routed hidden 640, shared hidden 640,
+vocabulary 32. The routed experts stay IQ4_XS gate and up with a Q2_0 down. The shared expert stays
+2-bit. Its down scales run from 1.0 to 5.9. Scales from 8 left the attention write 4.07% apart, so
+this check uses the smaller base. The norm weights past those 64 rotated values are 0 on the head
+and on the indexer row. The first token is 3. The logits differed from the same kernel sequence on
+0 of 32 values, relative error 0. The routed ids matched, 0 differ. The sampled id was 30, the
+argmax. Skipping the attention write was 25.92% apart on the logits. 16 words past the logits
+stayed put. Vocabulary and top-k stayed on the small fixture. The weights are synthetic. No GGUF
+was loaded. This is not a loaded model. There is no token rate.
+
 The same check draws one draft step. The caller's residual is left as it was. The next token is
 gathered, normalized, and projected. The whole residual is normalized as one row, and each stream
 of that row is projected by the same hidden weight. The layer residual is the sum, with the
@@ -630,7 +642,8 @@ check draws one greedy token at hc_lr 320 on that embedding. The sampled id was 
 hidden size, and top-k stayed at 8, 64, and 2. The same check draws one greedy token with routed
 hidden 640 on that rank. The sampled id was 15. Shared hidden stayed 64. The same check draws
 one greedy token there with 512 experts. The sampled id was 28. Shared hidden and top-k stayed at
-64 and 2. The same binary answers
+64 and 2. The same check draws one greedy token with shared hidden 640. The sampled id was 30.
+Vocabulary and top-k stayed at 32 and 2. The same binary answers
 the serve lines on that fixture. The check started the binary. The Python server was not started.
 The model does not run.
 There is no token rate.
@@ -652,7 +665,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. One greedy token at the model shared-expert hidden size. n_embd stays 2560, hc_lr stays 320, indexer dim stays 128 with 64 rotated values, routed hidden stays 640, expert count stays 512, and the shared-expert hidden size becomes 640. Vocabulary and top-k stay at 32 and 2. That is not a loaded model. This loop does not read a GGUF.
+1. One greedy token at the model vocabulary, 248320. n_embd stays 2560, hc_lr stays 320, indexer dim stays 128 with 64 rotated values, routed hidden stays 640, shared hidden stays 640, expert count stays 512, and top-k stays 2. That is not a loaded model. This loop does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
