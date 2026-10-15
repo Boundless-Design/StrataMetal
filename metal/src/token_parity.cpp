@@ -975,15 +975,8 @@ void check_serve(const char* exe) {
     }
 }
 
-// One greedy token at the model embedding. Its own seed. Rank, expert count, hidden size, and
-// vocabulary stay on the small fixture. The draft and the serve loop do not run at this width.
-void check_wide_token() {
-    std::printf("\nmodel width  n_embd 2560  idx_dim 128\n");
-    Live L;
-    L.n_embd = 2560;
-    L.idx_dim = 128;
-    build_live(L);
-
+// `tag` is the verdict prefix. The draft and the serve loop do not run here.
+void check_live_token(Live& L, const char* tag) {
     Owned prod = make_live_owned(L);
     Owned spec = make_live_owned(L);
     Owned trap = make_live_owned(L);
@@ -1032,17 +1025,42 @@ void check_wide_token() {
         if (a[e] != b[e]) ++id_bad;
     char wb[64];
     std::snprintf(wb, sizeof wb, "rel %.3e, %d differ", worst, logit_bad);
-    verdict("the wide logits match the kernel sequence", logit_bad == 0, wb);
-    verdict("the wide routed ids match the kernel sequence", id_bad == 0, std::to_string(id_bad) + " differ");
-    verdict("the wide greedy id is the argmax", id == want_id, "id " + std::to_string(id));
-    verdict("16 words past the wide logits stayed put", guard_bad == 0, std::to_string(guard_bad) + " changed");
+    const std::string prefix = std::string("the ") + tag + " ";
+    verdict((prefix + "logits match the kernel sequence").c_str(), logit_bad == 0, wb);
+    verdict((prefix + "routed ids match the kernel sequence").c_str(), id_bad == 0,
+            std::to_string(id_bad) + " differ");
+    verdict((prefix + "greedy id is the argmax").c_str(), id == want_id, "id " + std::to_string(id));
+    verdict((std::string("16 words past the ") + tag + " logits stayed put").c_str(), guard_bad == 0,
+            std::to_string(guard_bad) + " changed");
 
     std::vector<float> good(want, want + n_vocab);
     zero_owned(trap);
     fill_guard(sc_trap.logits);
     run_spec(L.g, L.w, st_trap, sc_trap, token0, 0, 0, Trap::SkipAttnWrite);
     const double apart = rel_l1(good.data(), static_cast<const float*>(sc_trap.logits.data()), n_vocab);
-    verdict("skipping the wide attention write is observable", apart > 0.05, pct(apart));
+    verdict((std::string("skipping the ") + tag + " attention write is observable").c_str(), apart > 0.05, pct(apart));
+}
+
+// One greedy token at the model embedding. Its own seed. Rank, expert count, hidden size, and
+// vocabulary stay on the small fixture.
+void check_wide_token() {
+    std::printf("\nmodel width  n_embd 2560  idx_dim 128\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    build_live(L);
+    check_live_token(L, "wide");
+}
+
+// The same token at the model residual rank. Expert count, hidden size, and vocabulary stay put.
+void check_rank_token() {
+    std::printf("\nmodel rank  n_embd 2560  hc_lr 320\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    L.hc_lr = 320;
+    build_live(L);
+    check_live_token(L, "rank");
 }
 
 }  // namespace
@@ -1065,7 +1083,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-token [--selftest|--serve]\n");
         return 2;
     }
-    std::printf("token: one block, one greedy sample, one draft step, one model-width token, synthetic weights\n\n");
+    std::printf(
+        "token: one block, one greedy sample, one draft step, one model-width token, one model-rank token, "
+        "synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1445,6 +1465,7 @@ int main(int argc, char** argv) {
                 "");
 
         check_wide_token();
+        check_rank_token();
 
         check_serve(argv[0]);
 
