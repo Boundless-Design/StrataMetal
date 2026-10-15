@@ -1,7 +1,9 @@
 // Gated delta-net, the non-projection half. Same arithmetic as src/kernels/cuda/gdn.cu.
 // State is (S, h_v, S) with j fastest. One thread owns one (h, j) column.
-// Apple GPUs have no fp64. l2 and the output norm accumulate the sum of squares as a
+// Apple GPUs have no fp64. l2, the output norm, and the step's two dots accumulate as a
 // double-single so the reduction stays next to the f64 reference the CUDA kernel uses.
+// A float sum of the step dot is a few ulps off that reference, and the output q8 row
+// rounds the other way. The products are exact: fma recovers the low half.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -38,6 +40,22 @@ inline DS warp_sum_ds(DS acc, uint lane) {
     return acc;
 }
 
+inline DS ds_zero() {
+    DS r;
+    r.hi = 0.0f;
+    r.lo = 0.0f;
+    return r;
+}
+
+// Exact product, then a double-single add. fma returns the part the float product rounded off.
+inline DS ds_add_prod(DS acc, float a, float b) {
+    const float p = a * b;
+    const float e = fma(a, b, -p);
+    return ds_add(ds_add(acc, p), e);
+}
+
+inline float ds_float(DS a) { return a.hi + a.lo; }
+
 kernel void gdn_step(device float* state [[buffer(0)]],
                      device const float* q [[buffer(1)]],
                      device const float* k [[buffer(2)]],
@@ -73,20 +91,20 @@ kernel void gdn_step(device float* state [[buffer(0)]],
     device float* col = state + (size_t)h * (size_t)S + (size_t)j;
     const size_t stride = (size_t)dim.h_v * (size_t)S;
 
-    float sk = 0.0f;
+    DS sk = ds_zero();
     for (int i = 0; i < S; ++i) {
         const float s = col[(size_t)i * stride] * dec;
         col[(size_t)i * stride] = s;
-        sk += s * ks[i];
+        sk = ds_add_prod(sk, s, ks[i]);
     }
-    const float d = (v[(size_t)h * (size_t)S + (size_t)j] - sk) * b;
-    float dot = 0.0f;
+    const float d = (v[(size_t)h * (size_t)S + (size_t)j] - ds_float(sk)) * b;
+    DS dot = ds_zero();
     for (int i = 0; i < S; ++i) {
         const float s = col[(size_t)i * stride] + ks[i] * d;
         col[(size_t)i * stride] = s;
-        dot += s * qs[i];
+        dot = ds_add_prod(dot, s, qs[i]);
     }
-    o[(size_t)h * (size_t)S + (size_t)j] = dot;
+    o[(size_t)h * (size_t)S + (size_t)j] = ds_float(dot);
 }
 
 kernel void gdn_conv(device float* cs [[buffer(0)]],
