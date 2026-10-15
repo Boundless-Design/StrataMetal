@@ -6869,8 +6869,26 @@ void run_carried_pair(const PackTable& table, const strata::core::ModelGeometry&
     verdict("dropping the shared expert moves that second token", bytes && cp_dropped, cp_drop_detail);
 }
 
+// One named layer tensor. A missing name, or a byte count other than the one this check was measured
+// against, is a MetalError, so the verdict fails instead of reading a different plane.
+Bytes read_named(const strata::metal::ModelTensors& m, int layer, const char* suffix, uint64_t n) {
+    try {
+        const strata::metal::LayerTensor& t = m.at(layer, suffix);
+        if (t.bytes != n) throw MetalError(t.name + " is " + std::to_string(t.bytes) + " bytes");
+        const std::vector<uint8_t> raw = m.read(t);
+        Bytes b(n);
+        std::memcpy(b.data(), raw.data(), raw.size());
+        return b;
+    } catch (const MetalError&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw MetalError(e.what());
+    }
+}
+
 // Layer 1's GDN step on token 1's layer-0 residual. The six blk.1.ple_* tensors are not added.
 // Layer 1 is the only layer that carries them, and that update sits in front of this read.
+// The planes are blk.1.* by name. The walk's GDN step prints a different detail line, so this check stays.
 void run_layer1_gdn(const strata::core::ModelGeometry& g) {
     layer1_attn_residual.clear();
     std::printf("\nlayer 1 GDN step on token 1, PLE not applied\n");
@@ -6878,11 +6896,10 @@ void run_layer1_gdn(const strata::core::ModelGeometry& g) {
     const int hc = (int) g.hc;
     const int hc_lr = (int) g.hc_lr;
     const int hc_dim = hc * n_embd;
-    const uint64_t k_data = 11024672;
-    const std::filesystem::path shard = strata::metal::default_model_shard();
+    const auto model = strata::metal::ModelTensors::open_default();
     const bool bytes = (int) carried_token1_residual.size() == hc_dim && g.ssm_state_size == 128 &&
                        g.ssm_k_heads == 16 && g.ssm_v_heads == 48 && g.ssm_d_conv == 4 &&
-                       g.ssm_conv_channels == 10240 && std::filesystem::is_regular_file(shard);
+                       g.ssm_conv_channels == 10240 && model != nullptr;
     bool step_ok = false, repeat_ok = false, moved_ok = false, flipped_ok = false;
     std::string step_detail = "bytes";
     std::string repeat_detail = "bytes";
@@ -6890,25 +6907,20 @@ void run_layer1_gdn(const strata::core::ModelGeometry& g) {
     std::string flip_detail = "bytes";
     if (bytes) {
         try {
-            auto load = [&](uint64_t off, uint64_t n) {
-                const auto raw = read_at_path(shard, k_data + off, (size_t) n);
-                Bytes b(n);
-                std::memcpy(b.data(), raw.data(), (size_t) n);
-                return b;
-            };
-            Bytes qkv = load(1505518976, 13926400);
-            Bytes gate = load(1497163136, 8355840);
-            Bytes ssm = load(2279044352, 8847360);
-            Bytes conv_w = load(2278879808, 163840);
-            Bytes alpha_w = load(2278388288, 245760);
-            Bytes beta_w = load(2278634048, 245760);
-            Bytes ssm_a = load(2278388096, 192);
-            Bytes dt_w = load(2279043648, 192);
-            Bytes ssm_norm = load(2279043840, 512);
-            Bytes attn_down = load(2231243136, 6553600);
-            Bytes attn_up = load(2237919616, 6553600);
-            Bytes attn_inj = load(2237796736, 81920);
-            Bytes attn_norm = load(2237878656, 40960);
+            auto load = [&](const char* suffix, uint64_t n) { return read_named(*model, 1, suffix, n); };
+            Bytes qkv = load("attn_qkv.weight", 13926400);
+            Bytes gate = load("attn_gate.weight", 8355840);
+            Bytes ssm = load("ssm_out.weight", 8847360);
+            Bytes conv_w = load("ssm_conv1d.weight", 163840);
+            Bytes alpha_w = load("ssm_alpha.weight", 245760);
+            Bytes beta_w = load("ssm_beta.weight", 245760);
+            Bytes ssm_a = load("ssm_a", 192);
+            Bytes dt_w = load("ssm_dt.bias", 192);
+            Bytes ssm_norm = load("ssm_norm.weight", 512);
+            Bytes attn_down = load("hc_attn_down.weight", 6553600);
+            Bytes attn_up = load("hc_attn_up.weight", 6553600);
+            Bytes attn_inj = load("hc_attn_inject.weight", 81920);
+            Bytes attn_norm = load("hc_attn_norm.weight", 40960);
             GdnIqWeights w;
             w.qkv = GdnIqPlane{kIq4Xs, &qkv};
             w.attn_gate = GdnIqPlane{kIq4Xs, &gate};
