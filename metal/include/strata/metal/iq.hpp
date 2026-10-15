@@ -41,6 +41,9 @@ void iq_quantize_q8_1(const Bytes& x, int64_t n, Bytes& y);
 void iq_mmvq(int ggml_type, const Bytes& w, int64_t byte_off, const Bytes& x_q8, int64_t n_in, int64_t n_out,
              int64_t n_col, Bytes& y);
 
+// SiLU(gate) * up, stored as q8_1. n is a positive multiple of 32.
+void iq_swiglu_q8(const Bytes& gate, const Bytes& up, int64_t n, Bytes& y);
+
 // Blob: [gate rows | up rows | down rows], each row `iq_row_bytes` of that side.
 // x_q8 is n_tok rows of n_embd. y is n_tok rows of n_embd, floats.
 struct IqExpert {

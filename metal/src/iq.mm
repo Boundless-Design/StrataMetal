@@ -182,10 +182,19 @@ void iq_expert(const Bytes& blob, const Bytes& x_q8, const IqExpert& e, int64_t 
     Bytes hq((uint64_t) n_tok * iq_q8_1_bytes(e.n_ff));
     iq_mmvq(e.gu_type, blob, 0, x_q8, e.n_embd, e.n_ff, n_tok, gate);
     iq_mmvq(e.gu_type, blob, up_off, x_q8, e.n_embd, e.n_ff, n_tok, up);
-    const int n = fit("swiglu", n_tok * e.n_ff);
-    const Bytes* bufs[] = {&gate, &up, &hq};
-    launch("iq_swiglu_q8", bufs, 3, &n, sizeof n, Grid{(uint32_t) (n / 32), 1, 1, 32, 1, 1});
+    iq_swiglu_q8(gate, up, n_tok * e.n_ff, hq);
     iq_mmvq(e.d_type, blob, down_off, hq, e.n_ff, e.n_embd, n_tok, y);
+}
+
+void iq_swiglu_q8(const Bytes& gate, const Bytes& up, int64_t n, Bytes& y) {
+    if (n == 0) return;
+    if (n < 0 || n % 32 != 0) throw MetalError("iq_swiglu_q8: length must be a positive multiple of 32");
+    need("swiglu gate", gate, (uint64_t) n * 4);
+    need("swiglu up", up, (uint64_t) n * 4);
+    need("swiglu y", y, iq_q8_1_bytes(n));
+    const int count = fit("iq_swiglu_q8", n);
+    const Bytes* bufs[] = {&gate, &up, &y};
+    launch("iq_swiglu_q8", bufs, 3, &count, sizeof count, Grid{(uint32_t) (count / 32), 1, 1, 32, 1, 1});
 }
 
 }  // namespace strata::metal
