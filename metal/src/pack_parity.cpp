@@ -3212,6 +3212,80 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
     return out;
 }
 
+float round_bf16(float f) { return strata::kernels::f32_from_bf16(strata::kernels::bf16_from_f32(f)); }
+
+float bf16_dot(const float* x, const uint16_t* row, int n) {
+    double acc = 0;
+    for (int i = 0; i < n; ++i) acc += (double) x[i] * (double) strata::kernels::f32_from_bf16(row[i]);
+    return (float) acc;
+}
+
+// The attention half of one layer-0 token. gr_read, the ggml GDN step, gr_write.
+// Activations round to bf16. The norm weight is used as stored. S-form planes are not read.
+struct AttnHalf {
+    std::vector<float> mixed;
+    std::vector<float> block;
+    std::vector<float> out;
+};
+
+AttnHalf layer0_attn_host(const float* R, const float* norm_w, const uint16_t* down_w, const uint16_t* up_w,
+                          const uint16_t* inject_w, const uint8_t* qkv_w, const uint8_t* gate_w, const uint8_t* out_w,
+                          const uint16_t* alpha_w, const uint16_t* beta_w, const float* conv_w, const float* ssm_norm,
+                          const float* dt, const float* ssm_a, int n_embd, int hc, int hc_lr, int S, int h_k, int h_v,
+                          int d_conv) {
+    const int hc_dim = hc * n_embd;
+    std::vector<float> xn((size_t) hc_dim);
+    for (int c = 0; c < hc; ++c) {
+        double ms = 0;
+        for (int d = 0; d < n_embd; ++d) {
+            const double v = R[(size_t) c * n_embd + d];
+            ms += v * v;
+        }
+        ms /= (double) n_embd;
+        const float rs = (float) (1.0 / std::sqrt(ms + 1e-6));
+        for (int d = 0; d < n_embd; ++d) {
+            const size_t i = (size_t) c * n_embd + d;
+            xn[i] = R[i] * rs * norm_w[i];
+        }
+    }
+    std::vector<float> act((size_t) hc_dim);
+    for (int i = 0; i < hc_dim; ++i) act[(size_t) i] = round_bf16(xn[(size_t) i]);
+
+    std::vector<float> lo((size_t) hc_lr);
+    for (int k = 0; k < hc_lr; ++k) {
+        const float p = bf16_dot(act.data(), down_w + (size_t) k * hc_dim, hc_dim);
+        lo[(size_t) k] = gdn_silu(p / (float) hc);
+    }
+    std::vector<float> lq((size_t) hc_lr);
+    for (int k = 0; k < hc_lr; ++k) lq[(size_t) k] = round_bf16(lo[(size_t) k]);
+
+    std::vector<float> gated((size_t) hc_dim);
+    AttnHalf half;
+    half.mixed.assign((size_t) n_embd, 0.f);
+    for (int d = 0; d < n_embd; ++d) {
+        float m = 0.f;
+        for (int c = 0; c < hc; ++c) {
+            const int i = c * n_embd + d;
+            const float g = bf16_dot(lq.data(), up_w + (size_t) i * hc_lr, hc_lr);
+            gated[(size_t) i] = xn[(size_t) i] * gdn_sigmoid(g);
+            m += gated[(size_t) i];
+        }
+        half.mixed[(size_t) d] = m / (float) hc;
+    }
+    std::vector<float> inject((size_t) hc);
+    for (int c = 0; c < hc; ++c) inject[(size_t) c] = bf16_dot(act.data(), inject_w + (size_t) c * hc_dim, hc_dim);
+
+    half.block = gdn_iq_host(half.mixed.data(), qkv_w, gate_w, out_w, alpha_w, beta_w, conv_w, ssm_norm, dt, ssm_a,
+                             n_embd, S, h_k, h_v, d_conv);
+    half.out.assign((size_t) hc_dim, 0.f);
+    for (int c = 0; c < hc; ++c) {
+        const float scale = 2.0f * gdn_sigmoid(inject[(size_t) c] / (float) hc);
+        for (int d = 0; d < n_embd; ++d)
+            half.out[(size_t) c * n_embd + d] = R[(size_t) c * n_embd + d] + half.block[(size_t) d] * scale;
+    }
+    return half;
+}
+
 // Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
 // The loader does not open the GGUF. A missing directory skips this section.
 void run_q2_layer() {
@@ -3547,6 +3621,154 @@ void run_q2_layer() {
     verdict("that GDN step repeats", step_bytes && step_repeat, repeat_detail);
     verdict("a zero activation moves that GDN step", step_bytes && step_moved, move_detail);
     verdict("a changed query code moves that GDN step", step_bytes && step_flipped, flip_detail);
+
+    // The S-form layer is not this path. These projections are ggml blocks. The attention
+    // half around the step is the bf16 residual, which already has a kernel.
+    const PackTensor* down_w = table.find("blk.0.hc_attn_down.weight");
+    const PackTensor* up_w = table.find("blk.0.hc_attn_up.weight");
+    const PackTensor* inj_w = table.find("blk.0.hc_attn_inject.weight");
+    const PackTensor* norm_h = table.find("blk.0.hc_attn_norm.weight");
+    const int hc = 4;
+    const int hc_lr = 320;
+    const int hc_dim = hc * n_embd;
+    const bool half_bytes =
+        step_bytes && down_w && down_w->values && down_w->values->size() == (uint64_t) hc_lr * hc_dim * 2 && up_w &&
+        up_w->values && up_w->values->size() == (uint64_t) hc_dim * hc_lr * 2 && inj_w && inj_w->values &&
+        inj_w->values->size() == (uint64_t) hc * hc_dim * 2 && norm_h && norm_h->values &&
+        norm_h->values->size() == (uint64_t) hc_dim * 4;
+    bool half_ok = false;
+    bool half_repeat = false;
+    bool half_moved = false;
+    bool half_flipped = false;
+    std::string half_detail = "bytes";
+    std::string half_repeat_detail = "bytes";
+    std::string half_move_detail = "bytes";
+    std::string half_flip_detail = "bytes";
+    if (half_bytes) {
+        try {
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = norm_w->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            auto fresh = [&](Bytes& state, Bytes& conv) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+            };
+            Bytes state(state_n * 4), conv(conv_n * 4), state_b(state_n * 4), conv_b(conv_n * 4);
+            Bytes state_z(state_n * 4), conv_z(conv_n * 4), state_f(state_n * 4), conv_f(conv_n * 4);
+            fresh(state, conv);
+            fresh(state_b, conv_b);
+            fresh(state_z, conv_z);
+            fresh(state_f, conv_f);
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int i = 0; i < hc_dim; ++i) Rp[i] = ((i * 17) % 29) * 0.02f - 0.2f;
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            const int guard_n = hc_dim + guard;
+            Bytes y((uint64_t) guard_n * 4), y2((uint64_t) guard_n * 4), yz((uint64_t) guard_n * 4);
+            Bytes yf((uint64_t) guard_n * 4);
+            std::fill_n(static_cast<float*>(y.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(y2.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(yz.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(yf.data()), (size_t) guard_n, 7.f);
+            Bytes mixed((uint64_t) n_embd * 4), block((uint64_t) n_embd * 4), inject((uint64_t) hc * 4);
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto run_half = [&](Bytes& st_b, Bytes& cv_b, const Bytes& residual, const GdnIqWeights& ww, Bytes& out) {
+                GdnLayerState st{&st_b, &cv_b};
+                gr_read(gs, residual, *norm_h->values, *down_w->values, *up_w->values, inj_w->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                gdn_layer_iq(lg, ww, st, sc, mixed, block);
+                gr_write(gs, residual, block, inject, out);
+            };
+            run_half(state, conv, R, w, y);
+            const AttnHalf host = layer0_attn_host(
+                Rp, static_cast<const float*>(norm_h->values->data()),
+                static_cast<const uint16_t*>(down_w->values->data()),
+                static_cast<const uint16_t*>(up_w->values->data()),
+                static_cast<const uint16_t*>(inj_w->values->data()),
+                static_cast<const uint8_t*>(qkv->values->data()), static_cast<const uint8_t*>(gate->values->data()),
+                static_cast<const uint8_t*>(ssm->values->data()),
+                static_cast<const uint16_t*>(alpha_w->values->data()),
+                static_cast<const uint16_t*>(beta_w->values->data()),
+                static_cast<const float*>(conv_w->values->data()), static_cast<const float*>(norm_w->values->data()),
+                static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                n_embd, hc, hc_lr, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+            std::vector<float> got_mixed((size_t) n_embd), got_block((size_t) n_embd);
+            std::memcpy(got_mixed.data(), mixed.data(), got_mixed.size() * 4);
+            std::memcpy(got_block.data(), block.data(), got_block.size() * 4);
+            run_half(state_b, conv_b, R, w, y2);
+            run_half(state_z, conv_z, zero_r, w, yz);
+
+            const float* cw = static_cast<const float*>(conv_w->values->data());
+            int channel = 0;
+            float best_tap = 0.f;
+            for (int c = 0; c < (int) (lg.S * lg.h_k); ++c) {
+                const float tap = std::fabs(cw[(size_t) c * lg.d_conv + (lg.d_conv - 1)]);
+                if (tap > best_tap) {
+                    best_tap = tap;
+                    channel = c;
+                }
+            }
+            const int flip_at = channel * (int) iq_row_bytes(kIq4Xs, n_embd) + 8;
+            Bytes flipped(qkv->values->size());
+            std::memcpy(flipped.data(), qkv->values->data(), flipped.size());
+            static_cast<uint8_t*>(flipped.data())[flip_at] ^= 1u;
+            GdnIqWeights wf = w;
+            wf.qkv.weights = &flipped;
+            run_half(state_f, conv_f, R, wf, yf);
+
+            const float* yp = static_cast<const float*>(y.data());
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const float* yfp = static_cast<const float*>(yf.data());
+            const bool guard_held = yp[hc_dim] == 7.f && y2p[hc_dim] == 7.f && yzp[hc_dim] == 7.f && yfp[hc_dim] == 7.f;
+            const bool live = all_finite(yp, hc_dim) && all_finite(y2p, hc_dim) && all_finite(yzp, hc_dim) &&
+                              all_finite(yfp, hc_dim) && all_finite(host.mixed.data(), n_embd) &&
+                              all_finite(host.block.data(), n_embd) && all_finite(host.out.data(), hc_dim) &&
+                              all_finite(got_mixed.data(), n_embd) && all_finite(got_block.data(), n_embd) &&
+                              !still_seven(yp, hc_dim);
+            const double read_rel = rel_l1(host.mixed.data(), got_mixed.data(), n_embd);
+            const double step_rel = rel_l1(host.block.data(), got_block.data(), n_embd);
+            const double write_rel = rel_l1(host.out.data(), yp, hc_dim);
+            const int again = differ_floats(yp, y2p, hc_dim);
+            const int apart = differ_floats(yp, yzp, hc_dim);
+            const int flipped_n = differ_floats(yp, yfp, hc_dim);
+            const double apart_rel = rel_l1(yp, yzp, hc_dim);
+            half_ok = live && guard_held && read_rel <= 1e-4 && step_rel <= 1e-4 && write_rel <= 1e-4;
+            half_repeat = live && guard_held && again == 0;
+            half_moved = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            half_flipped = live && guard_held && flipped_n > 0;
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "read %.3e, step %.3e, write %.3e", read_rel, step_rel, write_rel);
+            half_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            half_repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, hc_dim, apart_rel * 100.0);
+            half_move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, channel %d", flipped_n, hc_dim, channel);
+            half_flip_detail = buf;
+        } catch (const MetalError& e) {
+            half_detail = e.what();
+            half_repeat_detail = e.what();
+            half_move_detail = e.what();
+            half_flip_detail = e.what();
+        }
+    }
+    verdict("the layer-0 attention half matches", half_bytes && half_ok, half_detail);
+    verdict("that attention half repeats", half_bytes && half_repeat, half_repeat_detail);
+    verdict("a zero residual moves that half", half_bytes && half_moved, half_move_detail);
+    verdict("a changed query code moves that half", half_bytes && half_flipped, half_flip_detail);
 }
 
 }  // namespace
@@ -3560,7 +3782,7 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output, one GDN step\n\n");
+        "one Q4_K gate, one Q5_K output, one GDN step, one attention half\n\n");
     try {
         run_conversions();
         run_refusals();

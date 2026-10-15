@@ -29,7 +29,7 @@ routed hidden 640, 8 experts, and shared hidden 64. It also draws one greedy tok
 512 experts, one there with shared hidden 640, and one at vocabulary 248320. It also draws
 sixteen greedy cells at that vocabulary, top-k 2 against top-k 2048. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. The same check writes one synthetic layer at n_embd 2560, 512 experts, and loads it back. When the Q2_0 extract is present, it also loads layer 0 of that file: the query plane is IQ4_XS, the gate is Q4_K, the output is Q5_K, those three products matched, and one GDN step on them matched at relative error 1.460e-07. One expert's rows are Q2_0. That is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. The same check writes one synthetic layer at n_embd 2560, 512 experts, and loads it back. When the Q2_0 extract is present, it also loads layer 0 of that file: the query plane is IQ4_XS, the gate is Q4_K, the output is Q5_K, those three products matched, one GDN step on them matched at relative error 1.460e-07, and the attention half around that step matched at read 9.033e-08, step 3.205e-05, and write 6.919e-06. One expert's rows are Q2_0. That is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
 ## One memory pool
 
@@ -692,7 +692,15 @@ is q8_1. From a zero state the output matched the host chain, relative error 1.4
 values. A second draw differed on 0, and the guard word stayed. A zero activation differed on 2560
 of 2560 outputs, 100.00% apart. One code bit on query channel 588, the query row with the largest
 last convolution tap, differed on 2560 of 2560 outputs. The Q8_K binder still refuses the three
-planes, so the S-form layer does not run them. The router,
+planes, so the S-form layer does not run them. The attention half is the gated residual
+around that step. It calls the residual read, that step, and the residual write on
+`blk.0.hc_attn_down.weight`, `blk.0.hc_attn_up.weight`, `blk.0.hc_attn_inject.weight`, and
+`blk.0.hc_attn_norm.weight`. The norm weight is used as stored. The read matched at relative
+error 9.033e-08 on 2560 values. The step, from that mixed vector, matched at relative error
+3.205e-05 on 2560 values. The write matched at relative error 6.919e-06 on 10240 values. A
+second draw differed on 0, and the guard word stayed. A zero residual differed on 10240 of
+10240 values, 100.00% apart. One code bit on query channel 588 differed on 10120 of 10240
+values. The feed-forward half is not this check. The router,
 `blk.0.ffn_gate_inp.weight`, is bf16, 2560 by 512. The product matched at relative error 6.683e-08.
 A zero activation was 0 on all 512 outputs and differed on 512 of 512 from the patterned activation. Expert 0 is Q2_0 on the gate, the up, and the down,
 460,800 bytes each. The three products matched the integer reference, relative error 0. Flipping one
@@ -708,7 +716,10 @@ the binder still refuses it. The gate product matched at relative error 1.747e-0
 The output product matched at relative error 1.786e-07, 2560 rows. One GDN step on those three
 matched at relative error 1.460e-07, on 2560 outputs. A second draw differed on 0. A zero
 activation differed on 2560 of 2560, 100.00% apart. One code bit on query channel 588 differed
-on 2560 of 2560. Expert 0's three Q2_0 products match, and a Q2_0 gate is refused. The token
+on 2560 of 2560. The attention half around that step matched at read 9.033e-08, step 3.205e-05,
+and write 6.919e-06. A second draw differed on 0. A zero residual differed on 10240 of 10240,
+100.00% apart. One code bit on query channel 588 differed on 10120 of 10240. Expert 0's three
+Q2_0 products match, and a Q2_0 gate is refused. The token
 check also draws one synthetic greedy draft from a caller residual and the next token. The same check draws one greedy token at n_embd 2560, indexer dim 128,
 64 rotated values, and top-k 2. Rank stayed 32, with 8 experts, hidden 64, and vocabulary 32. The same
 check draws one greedy token at hc_lr 320 on that embedding. The sampled id was 30. Expert count,
@@ -736,13 +747,13 @@ every layer, the GDN layer on the first three, and the QSA block on the last. It
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
 expert, one routed expert, and one 2-bit query on bytes it loaded. It also feeds one stack token
 from those planes. It also writes one synthetic layer at n_embd 2560 and, when the extract is
-present, loads layer 0 of the Q2_0 file. The stack query is the Q8_K plane. The stack's shared
+present, loads layer 0 of the Q2_0 file, including the attention half around the GDN step. The stack query is the Q8_K plane. The stack's shared
 expert is the 2-bit function. output.weight on that path is Q8_K. The rope table is not in the
 pack. One synthetic greedy token. There is no token rate. The expert-half add is still a kernel only. The 2-bit
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. The residual around the measured layer-0 GDN step. The extract holds the bf16 hc weights for that layer. The gated residual already passes on synthetic weights and is not called on these bytes. The shared-expert rows in the extract are not this step. The Q8_K binder still refuses the three GDN planes, so the S-form layer does not run them. The expert wrapper still refuses a Q2_0 gate. That is one expert of 1,382,400 bytes, not 512 resident experts, and not 48 layers. Expert streaming is not in this tree. There is no token rate.
+1. The feed-forward half of layer 0. The attention half around the measured GDN step is measured. The router product on `blk.0.ffn_gate_inp.weight` is already measured at relative error 6.683e-08. The shared-expert rows in the extract are not called. The expert wrapper still refuses a Q2_0 gate. The three GDN planes are ggml blocks. The Q8_K binder still refuses them, so the S-form layer does not run them. That is one expert of 1,382,400 bytes, not 512 resident experts, and not 48 layers. Expert streaming is not in this tree. There is no token rate.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
