@@ -890,4 +890,165 @@ void run_attn_q(const PackTable& table, const strata::core::ModelGeometry& g, in
     s2_gemv_q8(act, *w->codes, *w->scales, y, g.n_embd, n_out, 32);
 }
 
+bool stack_geometry_matches(const strata::core::ModelGeometry& g, const StackGeom& stack) {
+    if (g.n_layers < 1 || stack.n_layers < 1 || g.qsa_interval < 1 || stack.qsa_interval < 1) return false;
+    if (g.n_embd < 1 || g.n_expert < 1 || g.n_ff < 1 || g.hc < 1 || g.hc_lr < 1) return false;
+    if (stack.n_layers != g.n_layers || stack.qsa_interval != g.qsa_interval) return false;
+    if (stack.token.n_embd != g.n_embd || stack.token.hc != g.hc || stack.token.hc_lr != g.hc_lr) return false;
+    if (stack.token.n_expert != g.n_expert || stack.token.n_ff_shared != g.n_ff) return false;
+    if (stack.token.expert.n_embd != g.n_embd || stack.token.expert.n_ff != g.n_ff) return false;
+    if (stack.token.qsa.n_embd != g.n_embd) return false;
+    const strata::kernels::QsaShapes& q = stack.token.qsa.qsa;
+    if (q.n_head != g.n_head || q.n_head_kv != g.n_head_kv || q.head_dim != g.head_dim) return false;
+    if (q.idx_n_head != g.idx_q_heads || q.idx_dim != g.idx_key_dim) return false;
+    if (stack.gdn.n_embd != g.n_embd || stack.gdn.S != g.ssm_state_size || stack.gdn.h_k != g.ssm_k_heads ||
+        stack.gdn.h_v != g.ssm_v_heads || stack.gdn.d_conv != g.ssm_d_conv) {
+        return false;
+    }
+    if (stack.gdn.S <= 0 || stack.gdn.h_v <= 0 || stack.gdn.h_k <= 0) return false;
+    const int64_t mixed = 2 * stack.gdn.h_k + stack.gdn.h_v;
+    if (mixed <= 0) return false;
+    if (g.ssm_value_dim % stack.gdn.h_v != 0 || g.ssm_value_dim / stack.gdn.h_v != stack.gdn.S) return false;
+    if (g.ssm_conv_channels % stack.gdn.S != 0 || g.ssm_conv_channels / stack.gdn.S != mixed) return false;
+    return true;
+}
+
+void bind_stack_embedding(const PackTable& table, const StackGeom& stack, StackWeights& w) {
+    const PackTensor* emb = table.find("token_embd.weight");
+    if (!emb) throw MetalError("token_embd.weight is missing");
+    if (emb->codebook_iq4nl) throw MetalError("token_embd.weight: an IQ4NL embedding is not the stack embedding");
+    const TokenGeom& tg = stack.token;
+    if (emb->code_bits != tg.emb_code_bits || emb->code_bias != tg.emb_code_bias || emb->group_elems != tg.emb_group ||
+        emb->ne0 != tg.n_embd || emb->ne1 != tg.n_vocab) {
+        throw MetalError("token_embd.weight does not match the stack embedding");
+    }
+    if (emb->code_bits != 2 && emb->code_bits != 4 && emb->code_bits != 8)
+        throw MetalError("token_embd.weight is not an S2/S4/S8 tensor");
+    if (!emb->codes || !emb->scales) throw MetalError("token_embd.weight: codes or scales are missing");
+    if (emb->has_offset && !emb->offset) throw MetalError("token_embd.weight: offset is required");
+    w.emb_codes = emb->codes.get();
+    w.emb_scales = emb->scales.get();
+    w.emb_offsets = emb->has_offset ? emb->offset.get() : nullptr;
+}
+
+void bind_stack_head(const PackTable& table, const strata::core::ModelGeometry& g, const StackGeom& stack,
+                     StackWeights& w) {
+    const PackTensor* norm = table.find("output_hc_norm.weight");
+    const PackTensor* down = table.find("output_hc_down.weight");
+    const PackTensor* up = table.find("output_hc_up.weight");
+    if (!norm || !down || !up) throw MetalError("lm_head: an output_hc_* weight is missing");
+    if (norm->kind != strata::core::WeightKind::F32 || down->kind != strata::core::WeightKind::Bf16InF32 ||
+        up->kind != strata::core::WeightKind::Bf16InF32 || norm->code_bits != 0 || down->code_bits != 0 ||
+        up->code_bits != 0) {
+        throw MetalError("lm_head: the output_hc_* weights have the wrong engine forms");
+    }
+    const int64_t hc_dim = g.hc * g.n_embd;
+    if (norm->elements != hc_dim || down->ne0 != hc_dim || down->ne1 != g.hc_lr || up->ne0 != g.hc_lr ||
+        up->ne1 != hc_dim) {
+        throw MetalError("lm_head: the output_hc_* weights have the wrong shape");
+    }
+    w.head.norm = need_values(*norm, strata::core::WeightKind::F32, 4, "the gated residual reads f32");
+    w.head.down = need_values(*down, strata::core::WeightKind::Bf16InF32, 2, "the gated residual reads bf16");
+    w.head.up = need_values(*up, strata::core::WeightKind::Bf16InF32, 2, "the gated residual reads bf16");
+    w.head.inject = nullptr;
+
+    const PackTensor* out = table.find("output.weight");
+    if (!out) throw MetalError("output.weight is missing");
+    if (out->ne0 != g.n_embd || out->ne1 != stack.token.n_vocab)
+        throw MetalError("output.weight does not match the stack");
+    const GdnPlane plane = bind_q8k_plane(*out);
+    w.out.form = plane.form;
+    w.out.codes = plane.codes;
+    w.out.scales = plane.scales;
+    w.out.offset = plane.offset;
+}
+
+void bind_stack_shexp(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer,
+                      StackLayerWeights& w) {
+    auto one = [&](const char* suffix, int64_t n_in, int64_t n_out, const Bytes*& codes, const Bytes*& scales) {
+        const PackTensor& t = shexp_row(table, layer, suffix);
+        if (t.ne0 != n_in || t.ne1 != n_out || t.code_bits != 2 || t.group_elems != 64 || t.code_bias != -1 ||
+            t.has_offset || t.codebook_iq4nl || n_in % 64 != 0) {
+            throw MetalError(t.name + ": the stack's shared expert is 2-bit, group 64, bias -1, no offset, and affine");
+        }
+        need_planes(t, n_in, t.ne1);
+        codes = t.codes.get();
+        scales = t.scales.get();
+    };
+    one("ffn_gate_shexp.weight", g.n_embd, g.n_ff, w.sh_gate_codes, w.sh_gate_scales);
+    one("ffn_up_shexp.weight", g.n_embd, g.n_ff, w.sh_up_codes, w.sh_up_scales);
+    one("ffn_down_shexp.weight", g.n_ff, g.n_embd, w.sh_down_codes, w.sh_down_scales);
+    const PackTensor& ginp = shexp_row(table, layer, "ffn_gate_inp_shexp.weight");
+    if (ginp.elements != g.n_embd)
+        throw MetalError(ginp.name + " elements is " + std::to_string(ginp.elements) +
+                         ", the shared expert requires " + std::to_string(g.n_embd));
+    w.sh_gate_inp = need_values(ginp, strata::core::WeightKind::Bf16InF32, 2, "the scalar gate reads it as bf16");
+}
+
+void bind_stack_experts(const std::string& pack_dir, const strata::core::ModelGeometry& g, const StackGeom& stack,
+                        int64_t layer, std::vector<Bytes>& blobs, File& bin) {
+    blobs.reserve((size_t) g.n_expert);
+    const size_t want = iq_expert_bytes(stack.token.expert);
+    for (int64_t expert = 0; expert < g.n_expert; ++expert) {
+        NativePick pick;
+        if (!pick_native_expert(pack_dir, layer, expert, pick))
+            throw MetalError("native_experts.txt is missing; a GGUF shard is not this loader");
+        if (pick.n_expert != g.n_expert || pick.n_expert != stack.token.n_expert)
+            throw MetalError("native_experts.txt n_expert does not match the stack");
+        if (pick.gu_type != stack.token.expert.gu_type || pick.d_type != stack.token.expert.d_type)
+            throw MetalError("native_experts.txt: layer " + std::to_string(layer) +
+                             " types do not match the stack expert");
+        if (pick.blob_bytes != want) {
+            throw MetalError("native_experts.txt: layer " + std::to_string(layer) + " blob is " +
+                             std::to_string(pick.blob_bytes) + " B but its formats make " + std::to_string(want));
+        }
+        if (!bin) {
+            bin.reset(std::fopen((pack_dir + "/experts.bin").c_str(), "rb"));
+            if (!bin) throw MetalError("experts.bin is missing; a GGUF shard is not this loader");
+        }
+        Bytes blob(pick.blob_bytes);
+        read_at(bin.get(), pick.file_off, blob.data(), (size_t) pick.blob_bytes, "experts.bin");
+        blobs.push_back(std::move(blob));
+    }
+}
+
+void bind_pack_stack(const PackTable& table, const std::string& pack_dir, const strata::core::ModelGeometry& g,
+                     const StackGeom& stack, const Bytes* cos_tab, const Bytes* sin_tab, PackStack& out) {
+    out.experts.clear();
+    out.layers.clear();
+    out.weights = StackWeights{};
+    if (!stack_geometry_matches(g, stack)) throw MetalError("the stack geometry does not match the pack");
+
+    bool any_qsa = false;
+    for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+        if (strata::core::is_qsa_layer(g, layer)) any_qsa = true;
+    }
+    if (any_qsa && (cos_tab == nullptr || sin_tab == nullptr))
+        throw MetalError("the rope table is not in the pack");
+
+    bind_stack_embedding(table, stack, out.weights);
+    bind_stack_head(table, g, stack, out.weights);
+
+    out.layers.resize((size_t) g.n_layers);
+    out.experts.resize((size_t) g.n_layers);
+    File bin;
+    for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+        const PackLayer loaded = bind_layer(table, g, layer);
+        StackLayerWeights& w = out.layers[(size_t) layer];
+        w.attn = loaded.attn;
+        w.ffn = loaded.ffn;
+        w.router = loaded.router;
+        w.gdn = loaded.gdn;
+        w.qsa = loaded.qsa;
+        if (loaded.qsa_layer) {
+            w.qsa.cos_tab = cos_tab;
+            w.qsa.sin_tab = sin_tab;
+        }
+        bind_stack_shexp(table, g, layer, w);
+        bind_stack_experts(pack_dir, g, stack, layer, out.experts[(size_t) layer], bin);
+        w.experts = out.experts[(size_t) layer].data();
+    }
+    out.weights.layers = out.layers.data();
+}
+
 }  // namespace strata::metal

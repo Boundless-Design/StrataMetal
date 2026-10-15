@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, and one 2-bit query. It does not draw a token.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. There is no token rate.
 
 ## One memory pool
 
@@ -502,10 +502,31 @@ a short output was refused. The output stayed 7 on each refusal. This call is th
 on the query projection. The attention block is not called. The 2-bit shared_expert function is
 not this call. The Q8_K bind still refuses a 2-bit plane. The layer bind does not return this
 query. Running it does not draw a token.
+A pack fed the stack from the same kind of index. Four layers, vocabulary 32, n_embd 256, 4
+streams, rank 32, 2 experts, top 2. Layers 0, 1, and 2 are GDN, state 128, 2 key heads, 4 value
+heads, convolution 4. Layer 3 is full attention, 24 heads, head dim 256. The query on that layer
+is 4-bit Q8_K. A 2-bit query on this path was refused: code_bits 2 has no Q8_K contract. The
+2-bit query stays the separate product. The shared expert is the 2-bit shared_expert function,
+group 64, bias -1, with no offset, and the codebook is affine. That is the stack's shared expert.
+output.weight is 4-bit Q8_K, because the output projection is. The rope table is not in the pack.
+The caller passed it. One greedy token from a zero state sampled id 1, the argmax. A second draw
+from a fresh zero state matched on 0 of 32 logits. Token 3 differed on 32 of 32 logits. 16 words
+past the logits stayed 7. The embedding codes, the layer-0 qkv codes, the layer-3 query codes,
+the shared-expert gate codes, and the output codes were the loaded planes. Each routed expert is
+its own blob, 22016 bytes. The gate and up rows are IQ4_XS. The down rows are Q2_0. Two experts
+sit on each layer. Expert 0 matched the file bytes. A 32-byte row named blk.0.ffn_gate_exps.weight
+was loaded from extra.bin and was not an expert. A geometry that does not match the pack was
+refused. A missing rope table was refused. A missing embedding was refused. An IQ4NL embedding
+was refused. A missing output mix was refused. A missing output.weight was refused. A 2-bit
+output.weight was refused. A shared expert that is not 2-bit was refused. A missing
+native_experts.txt was refused, and a missing experts.bin was refused. A GGUF shard was not
+opened. The layer bind still leaves the embedding, the shared expert, the routed experts, the
+2-bit query, and the output projection unbound. One synthetic greedy token. There is no token
+rate. This is not a loaded model.
 
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
-weights. The pack check reads an index into those kernels. The model does not run. There is no
-token rate.
+weights. The pack check reads an index into those kernels and draws one synthetic greedy token
+from the loaded planes. The model does not run. There is no token rate.
 The QSA decode kernel is its own check. The indexer, the indexer cell scores, the top-k, the paged
 KV append, the partial NEOX rotation, and the QSA gate pass as their own checks, and the decode
 kernel does not call them. `strata-metal-qsa-layer` calls those, plus the weighted norm and the
@@ -514,12 +535,15 @@ block, the router, the routed experts, the shared expert, the combine, the outpu
 the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
-expert, one routed expert, and one 2-bit query on bytes it loaded. It does not draw a token. The
-expert-half add is still a kernel only. The 2-bit shared expert function is still its own check.
+expert, one routed expert, and one 2-bit query on bytes it loaded. It also feeds one stack token
+from those planes. The stack query is the Q8_K plane. The stack's shared expert is the 2-bit
+function. output.weight on that path is Q8_K. The rope table is not in the pack. One synthetic
+greedy token. There is no token rate. The expert-half add is still a kernel only. The 2-bit
+shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. A pack can feed the stack. Then the MTP draft layer, then the Python server in `serve/`, which
-   can stay as it is once it has an engine binary to start.
+1. The MTP draft layer. Then the Python server in `serve/`, which can stay as it is once it has
+   an engine binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

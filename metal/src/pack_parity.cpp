@@ -1,4 +1,4 @@
-// The pack index, loaded into the kernels that already pass. No token is drawn.
+// The pack index, loaded into the kernels that already pass. One stack token is drawn from a pack.
 #include "strata/metal/pack.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -7,10 +7,12 @@
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
 #include "strata/metal/launch.hpp"
+#include "strata/metal/rope.hpp"
 #include "strata/metal/s2_gemv.hpp"
 #include "strata/metal/sgemv.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -118,6 +120,19 @@ void add_f32(Built& b, const std::string& name, int64_t ne0, int64_t ne1, uint8_
     add_src(b, row, src);
 }
 
+void add_f32_fill(Built& b, const std::string& name, int64_t ne0, int64_t ne1, float value) {
+    const uint64_t elems = (uint64_t) ne0 * (uint64_t) ne1;
+    std::vector<uint8_t> src(elems * 4);
+    for (uint64_t i = 0; i < elems; ++i) std::memcpy(src.data() + i * 4, &value, 4);
+    Row row;
+    row.name = name;
+    row.kind = 2;
+    row.ne0 = ne0;
+    row.ne1 = ne1;
+    row.dst_bytes = elems * 4;
+    add_src(b, row, src);
+}
+
 void add_bf16(Built& b, const std::string& name, int64_t ne0, int64_t ne1, uint32_t word) {
     const uint64_t elems = (uint64_t) ne0 * (uint64_t) ne1;
     std::vector<uint8_t> src(elems * 4);
@@ -132,7 +147,7 @@ void add_bf16(Built& b, const std::string& name, int64_t ne0, int64_t ne1, uint3
 }
 
 void add_quant(Built& b, const std::string& name, int64_t ne0, int64_t ne1, int bits, int bias, int has_offset,
-               uint8_t code0) {
+               uint8_t code0, uint16_t scale = 0x3c00, float offset = 0.25f) {
     if (bits != 2 && bits != 4 && bits != 8) throw strata::metal::MetalError("bad code bits in the fixture");
     const int per = 8 / bits;
     const uint64_t codes_bytes = (uint64_t) ne1 * (uint64_t) (ne0 / per);
@@ -143,14 +158,9 @@ void add_quant(Built& b, const std::string& name, int64_t ne0, int64_t ne1, int 
     std::vector<uint8_t> src(codes_bytes + scale_src + off_bytes);
     for (uint64_t i = 0; i < codes_bytes; ++i) src[i] = (uint8_t) (0x31 + (i * 17));
     if (codes_bytes) src[0] = code0;
-    for (uint64_t i = 0; i < groups; ++i) {
-        const uint16_t h = 0x3c00;
-        std::memcpy(src.data() + codes_bytes + i * 2, &h, 2);
-    }
-    for (uint64_t i = 0; i < groups && has_offset; ++i) {
-        const float o = 0.25f;
-        std::memcpy(src.data() + codes_bytes + scale_src + i * 4, &o, 4);
-    }
+    for (uint64_t i = 0; i < groups; ++i) std::memcpy(src.data() + codes_bytes + i * 2, &scale, 2);
+    for (uint64_t i = 0; i < groups && has_offset; ++i)
+        std::memcpy(src.data() + codes_bytes + scale_src + i * 4, &offset, 4);
     Row row;
     row.name = name;
     row.kind = 0;
@@ -177,6 +187,7 @@ struct SOpt {
     int codebook = 0;
     int act_kind = 1;
     uint8_t code0 = 0x21;
+    uint16_t scale = 0x3c00;
 };
 
 void add_sform(Built& b, const std::string& name, int64_t ne0, int64_t ne1, const SOpt& o) {
@@ -192,10 +203,7 @@ void add_sform(Built& b, const std::string& name, int64_t ne0, int64_t ne1, cons
     std::vector<uint8_t> src(codes_bytes + scale_src + off_bytes);
     for (uint64_t i = 0; i < codes_bytes; ++i) src[i] = (uint8_t) (0x31 + (i * 17));
     if (codes_bytes) src[0] = o.code0;
-    for (uint64_t i = 0; i < groups; ++i) {
-        const uint16_t h = 0x3c00;
-        std::memcpy(src.data() + codes_bytes + i * 2, &h, 2);
-    }
+    for (uint64_t i = 0; i < groups; ++i) std::memcpy(src.data() + codes_bytes + i * 2, &o.scale, 2);
     for (uint64_t i = 0; i < groups && o.has_offset; ++i) {
         const float off = 0.25f;
         std::memcpy(src.data() + codes_bytes + scale_src + i * 4, &off, 4);
@@ -1771,6 +1779,618 @@ void run_attn() {
     }
 }
 
+uint32_t bf_word(float v) { return (uint32_t) strata::kernels::bf16_from_f32(v) << 16; }
+
+struct FeedGeom {
+    strata::core::ModelGeometry model;
+    StackGeom stack;
+};
+
+void mirror_stack(FeedGeom& p, int64_t n_vocab, int n_rot, int64_t max_cells, int64_t idx_block, int64_t idx_top,
+                  int64_t page) {
+    const strata::core::ModelGeometry& g = p.model;
+    StackGeom& s = p.stack;
+    s.n_layers = g.n_layers;
+    s.qsa_interval = g.qsa_interval;
+    s.token.n_embd = g.n_embd;
+    s.token.hc = g.hc;
+    s.token.hc_lr = g.hc_lr;
+    s.token.n_expert = (int) g.n_expert;
+    s.token.k = (int) g.n_expert;
+    s.token.n_ff_shared = g.n_ff;
+    s.token.shared_tpr = 32;
+    s.token.n_vocab = (int) n_vocab;
+    s.token.emb_code_bits = 4;
+    s.token.emb_code_bias = -8;
+    s.token.emb_group = 32;
+    s.token.qsa.n_embd = g.n_embd;
+    s.token.qsa.max_cells = max_cells;
+    s.token.qsa.qsa.n_head = g.n_head;
+    s.token.qsa.qsa.n_head_kv = g.n_head_kv;
+    s.token.qsa.qsa.head_dim = g.head_dim;
+    s.token.qsa.qsa.n_rot = n_rot;
+    s.token.qsa.qsa.idx_n_head = g.idx_q_heads;
+    s.token.qsa.qsa.idx_dim = g.idx_key_dim;
+    s.token.qsa.qsa.idx_block = idx_block;
+    s.token.qsa.qsa.idx_top_k = idx_top;
+    s.token.qsa.qsa.page_size = page;
+    s.token.expert = IqExpert{kIq4Xs, kQ2_0, g.n_embd, g.n_ff};
+    s.gdn = GdnLayerGeom{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+}
+
+FeedGeom live_feed() {
+    FeedGeom p;
+    auto& g = p.model;
+    g.n_embd = 256;
+    g.n_layers = 4;
+    g.qsa_interval = 4;
+    g.ssm_state_size = 128;
+    g.ssm_k_heads = 2;
+    g.ssm_v_heads = 4;
+    g.ssm_d_conv = 4;
+    g.ssm_conv_channels = 1024;
+    g.ssm_value_dim = 512;
+    g.n_head = 24;
+    g.n_head_kv = 2;
+    g.head_dim = 256;
+    g.idx_q_heads = 4;
+    g.idx_key_dim = 64;
+    g.hc = 4;
+    g.hc_lr = 32;
+    g.n_expert = 2;
+    g.n_ff = 64;
+    mirror_stack(p, 32, 64, 4, 4, 2, 2);
+    return p;
+}
+
+FeedGeom tiny_feed(int64_t n_layers, int64_t interval) {
+    FeedGeom p;
+    auto& g = p.model;
+    g.n_embd = 64;
+    g.n_layers = n_layers;
+    g.qsa_interval = interval;
+    g.ssm_state_size = 4;
+    g.ssm_k_heads = 1;
+    g.ssm_v_heads = 2;
+    g.ssm_d_conv = 2;
+    g.ssm_conv_channels = 16;
+    g.ssm_value_dim = 8;
+    g.n_head = 2;
+    g.n_head_kv = 2;
+    g.head_dim = 64;
+    g.idx_q_heads = 1;
+    g.idx_key_dim = 4;
+    g.hc = 2;
+    g.hc_lr = 4;
+    g.n_expert = 2;
+    g.n_ff = 64;
+    mirror_stack(p, 4, 64, 4, 4, 2, 2);
+    return p;
+}
+
+FeedGeom gdn_refuse_feed() {
+    FeedGeom p = live_feed();
+    p.model.n_layers = 1;
+    p.model.hc = 2;
+    p.model.hc_lr = 4;
+    p.model.n_head = 2;
+    mirror_stack(p, 4, 64, 4, 4, 2, 2);
+    return p;
+}
+
+FeedGeom qsa_refuse_feed() {
+    FeedGeom p = gdn_refuse_feed();
+    p.model.qsa_interval = 1;
+    p.model.head_dim = 256;
+    p.model.idx_key_dim = 64;
+    mirror_stack(p, 4, 64, 4, 4, 2, 2);
+    return p;
+}
+
+void add_gr_router(Built& b, const strata::core::ModelGeometry& g, int layer, uint32_t word) {
+    const int64_t hc = g.hc_dim();
+    add_bf16(b, tn(layer, "hc_attn_down.weight"), hc, g.hc_lr, word);
+    add_bf16(b, tn(layer, "hc_attn_up.weight"), g.hc_lr, hc, word);
+    add_bf16(b, tn(layer, "hc_attn_inject.weight"), hc, g.hc, word);
+    add_bf16(b, tn(layer, "hc_ffn_down.weight"), hc, g.hc_lr, word);
+    add_bf16(b, tn(layer, "hc_ffn_up.weight"), g.hc_lr, hc, word);
+    add_bf16(b, tn(layer, "hc_ffn_inject.weight"), hc, g.hc, word);
+    add_bf16(b, tn(layer, "ffn_gate_inp.weight"), g.n_embd, g.n_expert, word);
+    add_f32_fill(b, tn(layer, "hc_attn_norm.weight"), hc, 1, 1.f);
+    add_f32_fill(b, tn(layer, "hc_ffn_norm.weight"), hc, 1, 1.f);
+}
+
+void add_shexp2(Built& b, const strata::core::ModelGeometry& g, int layer, uint16_t scale, uint32_t word) {
+    SOpt s;
+    s.bits = 2;
+    s.bias = -1;
+    s.group = 64;
+    s.has_offset = 0;
+    s.act_kind = 0;
+    s.scale = scale;
+    s.code0 = 0xA5;
+    add_sform(b, tn(layer, "ffn_gate_shexp.weight"), g.n_embd, g.n_ff, s);
+    s.code0 = 0x5A;
+    add_sform(b, tn(layer, "ffn_up_shexp.weight"), g.n_embd, g.n_ff, s);
+    s.code0 = 0x3C;
+    add_sform(b, tn(layer, "ffn_down_shexp.weight"), g.n_ff, g.n_embd, s);
+    add_bf16(b, tn(layer, "ffn_gate_inp_shexp.weight"), g.n_embd, 1, word);
+}
+
+void add_shexp_plain(Built& b, const strata::core::ModelGeometry& g, int layer) {
+    add_f32(b, tn(layer, "ffn_gate_shexp.weight"), g.n_embd, g.n_ff, 0x44, -1);
+    add_f32(b, tn(layer, "ffn_up_shexp.weight"), g.n_embd, g.n_ff, 0x44, -1);
+    add_f32(b, tn(layer, "ffn_down_shexp.weight"), g.n_ff, g.n_embd, 0x44, -1);
+    add_bf16(b, tn(layer, "ffn_gate_inp_shexp.weight"), g.n_embd, 1, 0x3f800000u);
+}
+
+void add_gdn_planes(Built& b, const strata::core::ModelGeometry& g, int layer, uint16_t scale, uint32_t word) {
+    add_quant(b, tn(layer, "attn_qkv.weight"), g.n_embd, g.ssm_conv_channels, 4, -8, 0, 0xA5, scale);
+    add_quant(b, tn(layer, "attn_gate.weight"), g.n_embd, g.ssm_value_dim, 4, -8, 0, 0x22, scale);
+    add_quant(b, tn(layer, "ssm_out.weight"), g.ssm_value_dim, g.n_embd, 8, -16, 0, 0x33, scale);
+    add_f32_fill(b, tn(layer, "ssm_conv1d.weight"), g.ssm_d_conv, g.ssm_conv_channels, 0.01f);
+    add_bf16(b, tn(layer, "ssm_alpha.weight"), g.n_embd, g.ssm_v_heads, word);
+    add_bf16(b, tn(layer, "ssm_beta.weight"), g.n_embd, g.ssm_v_heads, word);
+    add_f32_fill(b, tn(layer, "ssm_a"), g.ssm_v_heads, 1, -0.5f);
+    add_f32_fill(b, tn(layer, "ssm_dt.bias"), g.ssm_v_heads, 1, -2.f);
+    add_f32_fill(b, tn(layer, "ssm_norm.weight"), g.ssm_state_size, 1, 1.f);
+}
+
+void add_qsa_planes(Built& b, const strata::core::ModelGeometry& g, int layer, uint16_t scale, uint32_t word,
+                    bool query_2bit) {
+    const int64_t n_out = 2 * g.n_head * g.head_dim;
+    if (query_2bit) {
+        SOpt q = attn_s2();
+        q.scale = scale;
+        add_sform(b, tn(layer, "attn_q.weight"), g.n_embd, n_out, q);
+    } else {
+        add_quant(b, tn(layer, "attn_q.weight"), g.n_embd, n_out, 4, -8, 0, 0x5A, scale);
+    }
+    add_quant(b, tn(layer, "attn_k.weight"), g.n_embd, g.n_head_kv * g.head_dim, 4, -8, 0, 0x21, scale);
+    add_quant(b, tn(layer, "attn_v.weight"), g.n_embd, g.n_head_kv * g.head_dim, 4, -8, 0, 0x21, scale);
+    add_quant(b, tn(layer, "attn_output.weight"), g.n_head * g.head_dim, g.n_embd, 4, -8, 0, 0x21, scale);
+    add_bf16(b, tn(layer, "indexer.q_proj.weight"), g.n_embd, g.idx_q_heads * g.idx_key_dim, word);
+    add_bf16(b, tn(layer, "indexer.k_proj.weight"), g.n_embd, g.idx_key_dim, word);
+    add_f32_fill(b, tn(layer, "attn_q_norm.weight"), g.head_dim, 1, 1.f);
+    add_f32_fill(b, tn(layer, "attn_k_norm.weight"), g.head_dim, 1, 1.f);
+    add_f32_fill(b, tn(layer, "indexer.q_norm.weight"), g.idx_key_dim, 1, 1.f);
+    add_f32_fill(b, tn(layer, "indexer.k_norm.weight"), g.idx_key_dim, 1, 1.f);
+}
+
+void add_output_hc(Built& b, const strata::core::ModelGeometry& g, uint32_t word) {
+    const int64_t hc = g.hc_dim();
+    add_f32_fill(b, "output_hc_norm.weight", hc, 1, 1.f);
+    add_bf16(b, "output_hc_down.weight", hc, g.hc_lr, word);
+    add_bf16(b, "output_hc_up.weight", g.hc_lr, hc, word);
+}
+
+void add_output_weight(Built& b, int64_t n_embd, int64_t n_vocab, int bits, uint16_t scale) {
+    if (bits == 2) {
+        SOpt o;
+        o.bits = 2;
+        o.bias = -1;
+        o.group = 64;
+        o.act_kind = 0;
+        o.scale = scale;
+        o.code0 = 0xA5;
+        add_sform(b, "output.weight", n_embd, n_vocab, o);
+        return;
+    }
+    add_quant(b, "output.weight", n_embd, n_vocab, bits, -8, 0, 0x21, scale);
+}
+
+void add_stack_embd(Built& b, int64_t ne0, int64_t ne1, uint16_t scale, int codebook, float offset = 0.25f) {
+    if (codebook) {
+        SOpt e;
+        e.bits = 4;
+        e.bias = -8;
+        e.group = 32;
+        e.has_offset = 1;
+        e.codebook = 1;
+        e.act_kind = 1;
+        e.scale = scale;
+        e.code0 = 0xA5;
+        add_sform(b, "token_embd.weight", ne0, ne1, e);
+    } else {
+        add_quant(b, "token_embd.weight", ne0, ne1, 4, -8, 1, 0xA5, scale, offset);
+    }
+    move_tail_to_embd(b);
+}
+
+// Two rows with different shapes. A shared offset, or two copies of one pattern, becomes the
+// same direction once the residual is normalized, and the logits do not move.
+void stamp_embd_rows(Built& b, int64_t n_embd) {
+    const size_t row = (size_t) n_embd / 2;
+    if (b.bin[1].size() < row * 4) throw MetalError("fixture embedding is short");
+    uint8_t* p = b.bin[1].data();
+    std::memset(p, 0x00, row);
+    std::memset(p + 3 * row, 0x88, row);
+    std::memset(p + 3 * row, 0xFF, 16);
+}
+
+std::string native_layers(int layers, int64_t n_expert, int gu, int d, uint64_t blob) {
+    const uint64_t total = (uint64_t) layers * (uint64_t) n_expert * blob;
+    char head[320];
+    std::snprintf(head, sizeof head,
+                  "# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                  "[shard] (n_expert %lld, total %llu)\n",
+                  (long long) n_expert, (unsigned long long) total);
+    std::string text = head;
+    for (int layer = 0; layer < layers; ++layer) {
+        const uint64_t off = (uint64_t) layer * (uint64_t) n_expert * blob;
+        char line[128];
+        std::snprintf(line, sizeof line, "%d %d %d %llu %llu 0 0 0\n", layer, gu, d, (unsigned long long) off,
+                      (unsigned long long) blob);
+        text += line;
+    }
+    return text;
+}
+
+struct StBuf {
+    Bytes gdn_state;
+    Bytes gdn_conv;
+    Bytes k_pool;
+    Bytes v_pool;
+    Bytes idx_tail;
+    Bytes idx_dead;
+    Bytes idx_pooled;
+    Bytes block_pos;
+};
+
+StBuf make_st(const StackGeom& g) {
+    const auto& q = g.token.qsa.qsa;
+    const int64_t pages = (g.token.qsa.max_cells + q.page_size - 1) / q.page_size;
+    const uint64_t pool =
+        (uint64_t) pages * (uint64_t) q.n_head_kv * (uint64_t) q.page_size * (uint64_t) q.head_dim * 2u;
+    const int64_t S = g.gdn.S;
+    const int64_t C = S * (2 * g.gdn.h_k + g.gdn.h_v);
+    return StBuf{Bytes((uint64_t) S * (uint64_t) g.gdn.h_v * (uint64_t) S * 4u),
+                 Bytes((uint64_t) C * (uint64_t) (g.gdn.d_conv - 1) * 4u),
+                 Bytes(pool),
+                 Bytes(pool),
+                 Bytes((uint64_t) (q.idx_block - 1) * (uint64_t) q.idx_dim * 4u),
+                 Bytes((uint64_t) q.idx_dim * 4u),
+                 Bytes((uint64_t) (g.token.qsa.max_cells / q.idx_block + 1) * (uint64_t) q.idx_dim * 4u),
+                 Bytes(4)};
+}
+
+void zero_buf(Bytes& b) { std::memset(b.data(), 0, (size_t) b.size()); }
+
+struct Draw {
+    int id = -1;
+    std::vector<float> logits;
+    bool finite = false;
+    bool guard = false;
+    bool live = false;
+};
+
+Draw draw_token(const StackGeom& g, const PackStack& bound, const Bytes& page, int token) {
+    const int64_t n = g.n_layers;
+    std::vector<StBuf> bufs;
+    bufs.reserve((size_t) n);
+    for (int64_t i = 0; i < n; ++i) bufs.push_back(make_st(g));
+    std::vector<StackLayerState> views;
+    views.reserve((size_t) n);
+    for (int64_t i = 0; i < n; ++i) {
+        zero_buf(bufs[(size_t) i].gdn_state);
+        zero_buf(bufs[(size_t) i].gdn_conv);
+        zero_buf(bufs[(size_t) i].k_pool);
+        zero_buf(bufs[(size_t) i].v_pool);
+        zero_buf(bufs[(size_t) i].idx_tail);
+        zero_buf(bufs[(size_t) i].idx_dead);
+        zero_buf(bufs[(size_t) i].idx_pooled);
+        zero_buf(bufs[(size_t) i].block_pos);
+        StackLayerState s;
+        s.gdn.state = &bufs[(size_t) i].gdn_state;
+        s.gdn.conv_state = &bufs[(size_t) i].gdn_conv;
+        s.qsa.k_pool = &bufs[(size_t) i].k_pool;
+        s.qsa.v_pool = &bufs[(size_t) i].v_pool;
+        s.qsa.page_table = &page;
+        s.qsa.idx_tail = &bufs[(size_t) i].idx_tail;
+        s.qsa.idx_dead = &bufs[(size_t) i].idx_dead;
+        s.qsa.idx_pooled = &bufs[(size_t) i].idx_pooled;
+        s.qsa.idx_block_pos = &bufs[(size_t) i].block_pos;
+        views.push_back(s);
+    }
+    Bytes R((uint64_t) g.token.hc * (uint64_t) g.token.n_embd * 4u);
+    zero_buf(R);
+    StackState st{&R, views.data()};
+    StackScratch sc = make_stack_scratch(g);
+    const int vocab = g.token.n_vocab;
+    const int guard = 16;
+    std::fill_n(static_cast<float*>(sc.tok.logits.data()), (size_t) (vocab + guard), 7.f);
+    SamplerParams sp;
+    sp.greedy = true;
+    sp.temperature = 0.f;
+    Draw d;
+    d.id = generate_stack_token(g, bound.weights, st, sc, token, 0, 0, sp, nullptr, 0);
+    d.logits.assign(static_cast<const float*>(sc.tok.logits.data()),
+                    static_cast<const float*>(sc.tok.logits.data()) + vocab + guard);
+    d.finite = true;
+    for (int i = 0; i < vocab; ++i)
+        if (!std::isfinite(d.logits[(size_t) i])) d.finite = false;
+    d.guard = true;
+    for (int i = 0; i < guard; ++i)
+        if (d.logits[(size_t) vocab + i] != 7.f) d.guard = false;
+    d.live = !still_seven(d.logits.data(), vocab);
+    return d;
+}
+
+int argmax_of(const std::vector<float>& logits, int n) {
+    int best = 0;
+    for (int i = 1; i < n; ++i)
+        if (logits[(size_t) i] > logits[(size_t) best]) best = i;
+    return best;
+}
+
+void run_stack() {
+    const uint16_t scale = strata::kernels::f16_from_f32(0.02f);
+    const uint32_t word = bf_word(0.01f);
+    const FeedGeom live = live_feed();
+    const IqExpert shape = live.stack.token.expert;
+    const size_t blob_n = iq_expert_bytes(shape);
+    const int layers = (int) live.model.n_layers;
+    const int n_expert = (int) live.model.n_expert;
+    std::vector<std::vector<uint8_t>> blobs;
+    std::vector<uint8_t> file;
+    for (int layer = 0; layer < layers; ++layer) {
+        for (int e = 0; e < n_expert; ++e) {
+            blobs.push_back(expert_blob(shape, (uint32_t) (1000 + layer * 16 + e)));
+            file.insert(file.end(), blobs.back().begin(), blobs.back().end());
+        }
+    }
+    std::vector<uint8_t> role(32, 0xEE);
+
+    Tmp dir;
+    {
+        Built b;
+        for (int layer = 0; layer < layers; ++layer) {
+            const bool qsa = strata::core::is_qsa_layer(live.model, layer);
+            add_gr_router(b, live.model, layer, word);
+            if (qsa) add_qsa_planes(b, live.model, layer, scale, word, false);
+            else add_gdn_planes(b, live.model, layer, scale, word);
+            add_shexp2(b, live.model, layer, scale, word);
+        }
+        add_output_hc(b, live.model, word);
+        add_output_weight(b, live.model.n_embd, live.stack.token.n_vocab, 4, scale);
+        add_stack_embd(b, live.model.n_embd, live.stack.token.n_vocab, scale, 0, 0.f);
+        stamp_embd_rows(b, live.model.n_embd);
+        add_role_span(b, role);
+        write_pack(dir, b);
+    }
+    write_bytes(dir.path / "experts.bin", file.data(), file.size());
+    const std::string native = native_layers(layers, n_expert, kIq4Xs, kQ2_0, blob_n);
+    write_bytes(dir.path / "native_experts.txt", native.data(), native.size());
+
+    PackTable table = PackTable::load(dir.path.string());
+    const int pairs = (int) live.stack.token.qsa.qsa.n_rot / 2;
+    const int cells = (int) live.stack.token.qsa.max_cells;
+    std::vector<float> cos_h((size_t) cells * (size_t) pairs), sin_h(cos_h.size());
+    build_rope_table((int) live.stack.token.qsa.qsa.n_rot, 100.0, cells, cos_h.data(), sin_h.data());
+    Bytes cos_tab(cos_h.size() * 4);
+    Bytes sin_tab(sin_h.size() * 4);
+    std::memcpy(cos_tab.data(), cos_h.data(), (size_t) cos_tab.size());
+    std::memcpy(sin_tab.data(), sin_h.data(), (size_t) sin_tab.size());
+    const int pages = (cells + (int) live.stack.token.qsa.qsa.page_size - 1) / (int) live.stack.token.qsa.qsa.page_size;
+    std::vector<int> rev((size_t) pages);
+    for (int i = 0; i < pages; ++i) rev[(size_t) i] = pages - 1 - i;
+    Bytes page((uint64_t) rev.size() * 4u);
+    std::memcpy(page.data(), rev.data(), (size_t) page.size());
+
+    PackStack bound;
+    bind_pack_stack(table, dir.path.string(), live.model, live.stack, &cos_tab, &sin_tab, bound);
+
+    const PackTensor* emb = table.find("token_embd.weight");
+    const PackTensor* qkv = table.find(tn(0, "attn_qkv.weight"));
+    const PackTensor* query = table.find(tn(3, "attn_q.weight"));
+    const PackTensor* shexp = table.find(tn(0, "ffn_gate_shexp.weight"));
+    const PackTensor* outw = table.find("output.weight");
+    const PackTensor* role_row = table.find("blk.0.ffn_gate_exps.weight");
+    bool planes = emb && qkv && query && shexp && outw && role_row && bound.weights.layers &&
+                  bound.weights.emb_codes && bound.weights.out.codes && bound.layers.size() == 4 &&
+                  bound.experts.size() == 4 && bound.experts[0].size() == 2 && bound.experts[3].size() == 2;
+    if (planes) {
+        planes = bound.weights.emb_codes->data() == emb->codes->data() &&
+                 bound.weights.layers[0].gdn.qkv.codes->data() == qkv->codes->data() &&
+                 bound.weights.layers[3].qsa.q.codes->data() == query->codes->data() &&
+                 bound.weights.layers[0].sh_gate_codes->data() == shexp->codes->data() &&
+                 bound.weights.out.codes->data() == outw->codes->data() &&
+                 bound.weights.layers[3].qsa.cos_tab == &cos_tab && bound.weights.layers[3].qsa.sin_tab == &sin_tab &&
+                 bound.weights.layers == bound.layers.data() &&
+                 bound.layers[0].experts == bound.experts[0].data() && query->code_bits == 4 &&
+                 shexp->code_bits == 2 && outw->code_bits == 4 && outw->act_kind == 1 && emb->code_bias == -8 &&
+                 emb->has_offset && role_row->file_id == 3;
+        const Bytes& e0 = bound.experts[0][0];
+        const Bytes& e1 = bound.experts[3][1];
+        const size_t last = blobs.size() - 1;
+        planes = planes && e0.size() == blob_n && e1.size() == blob_n &&
+                 std::memcmp(e0.data(), blobs[0].data(), blob_n) == 0 &&
+                 std::memcmp(e1.data(), blobs[last].data(), blob_n) == 0 &&
+                 std::memcmp(e0.data(), blobs[1].data(), blob_n) != 0 && role_row->values &&
+                 role_row->values->data() != e0.data() && role_row->values->size() == role.size() &&
+                 std::memcmp(role_row->values->data(), role.data(), role.size()) == 0 &&
+                 std::memcmp(e0.data(), role.data(), role.size()) != 0;
+    }
+    char id_detail[96];
+    std::snprintf(id_detail, sizeof id_detail, "blob %zu", blob_n);
+    verdict("the stack reads the pack's own planes", planes, id_detail);
+
+    Draw first;
+    Draw second;
+    Draw other;
+    bool drew = false;
+    std::string draw_err;
+    if (planes) {
+        try {
+            first = draw_token(live.stack, bound, page, 0);
+            second = draw_token(live.stack, bound, page, 0);
+            other = draw_token(live.stack, bound, page, 3);
+            drew = true;
+        } catch (const MetalError& e) {
+            draw_err = e.what();
+        }
+    }
+    const int vocab = live.stack.token.n_vocab;
+    const int again = drew ? differ_floats(first.logits.data(), second.logits.data(), vocab) : -1;
+    const int moved = drew ? differ_floats(first.logits.data(), other.logits.data(), vocab) : -1;
+    const int best = drew ? argmax_of(first.logits, vocab) : -1;
+    const bool token_ok = drew && first.finite && second.finite && other.finite && first.guard && second.guard &&
+                          other.guard && first.live && first.id == best && again == 0 && second.id == first.id &&
+                          moved > 0;
+    char draw_detail[192];
+    if (!draw_err.empty()) {
+        std::snprintf(draw_detail, sizeof draw_detail, "%s", draw_err.c_str());
+    } else {
+        std::snprintf(draw_detail, sizeof draw_detail, "id %d, second %d differ, token 3 differed on %d of %d", first.id,
+                      again, moved, vocab);
+    }
+    verdict("one pack token matches a second draw", token_ok, draw_detail);
+
+    auto refuse = [&](const char* name, const char* needle, FeedGeom fg, const Bytes* cos, const Bytes* sin,
+                      const std::function<void(const Tmp&)>& write) {
+        Tmp d;
+        write(d);
+        std::string got = "it loaded";
+        bool thrown = false;
+        try {
+            PackTable t = PackTable::load(d.path.string());
+            PackStack held;
+            thrown = threw(needle, [&] { bind_pack_stack(t, d.path.string(), fg.model, fg.stack, cos, sin, held); },
+                           got);
+        } catch (const MetalError& e) {
+            got = e.what();
+        }
+        verdict(name, thrown, got);
+    };
+
+    {
+        FeedGeom fg = tiny_feed(1, 4);
+        fg.stack.n_layers = 2;
+        refuse("a stack geometry mismatch is refused", "does not match the pack", fg, nullptr, nullptr,
+               [](const Tmp& d) {
+                   Built b;
+                   add_pad(b);
+                   write_pack(d, b);
+               });
+    }
+    refuse("a missing rope table is refused", "rope table", tiny_feed(1, 1), nullptr, nullptr, [](const Tmp& d) {
+        Built b;
+        add_pad(b);
+        write_pack(d, b);
+    });
+    refuse("a missing embedding is refused", "token_embd.weight is missing", tiny_feed(1, 4), nullptr, nullptr,
+           [](const Tmp& d) {
+               Built b;
+               add_pad(b);
+               write_pack(d, b);
+           });
+    refuse(
+        "an IQ4NL embedding is refused", "IQ4NL", tiny_feed(1, 4), nullptr, nullptr,
+        [&](const Tmp& d) {
+            Built b;
+            add_stack_embd(b, 64, 4, scale, 1);
+            write_pack(d, b);
+        });
+    refuse(
+        "a missing output mix is refused", "output_hc_", tiny_feed(1, 4), nullptr, nullptr,
+        [&](const Tmp& d) {
+            Built b;
+            add_stack_embd(b, 64, 4, scale, 0);
+            write_pack(d, b);
+        });
+    {
+        Tmp d;
+        Built b;
+        const FeedGeom fg = tiny_feed(1, 4);
+        add_output_hc(b, fg.model, 0x3f800000u);
+        add_stack_embd(b, 64, 4, scale, 0);
+        write_pack(d, b);
+        PackTable t = PackTable::load(d.path.string());
+        PackStack held;
+        std::string got;
+        const bool thrown =
+            threw("output.weight is missing",
+                  [&] { bind_pack_stack(t, d.path.string(), fg.model, fg.stack, nullptr, nullptr, held); }, got);
+        verdict("a missing output weight is refused", thrown, got);
+    }
+    {
+        Tmp d;
+        Built b;
+        const FeedGeom fg = tiny_feed(1, 4);
+        add_output_hc(b, fg.model, 0x3f800000u);
+        add_output_weight(b, fg.model.n_embd, fg.stack.token.n_vocab, 2, scale);
+        add_stack_embd(b, 64, 4, scale, 0);
+        write_pack(d, b);
+        PackTable t = PackTable::load(d.path.string());
+        PackStack held;
+        std::string got;
+        const bool thrown = threw("no Q8_K contract",
+                                  [&] { bind_pack_stack(t, d.path.string(), fg.model, fg.stack, nullptr, nullptr, held); },
+                                  got);
+        const bool named = got.find("output.weight") != std::string::npos;
+        verdict("a 2-bit output weight is refused", thrown && named, got);
+    }
+
+    const FeedGeom gdn = gdn_refuse_feed();
+    auto plant_gdn = [&](Built& b, bool shexp_2bit) {
+        add_gr_router(b, gdn.model, 0, word);
+        add_gdn_planes(b, gdn.model, 0, scale, word);
+        if (shexp_2bit) add_shexp2(b, gdn.model, 0, scale, word);
+        else add_shexp_plain(b, gdn.model, 0);
+        add_output_hc(b, gdn.model, word);
+        add_output_weight(b, gdn.model.n_embd, gdn.stack.token.n_vocab, 4, scale);
+        add_stack_embd(b, gdn.model.n_embd, gdn.stack.token.n_vocab, scale, 0);
+    };
+    refuse(
+        "a shared expert that is not 2-bit is refused", "stack's shared expert is 2-bit", gdn, nullptr, nullptr,
+        [&](const Tmp& d) {
+            Built b;
+            plant_gdn(b, false);
+            write_pack(d, b);
+        });
+    refuse(
+        "a missing native expert file is refused", "GGUF shard", gdn, nullptr, nullptr,
+        [&](const Tmp& d) {
+            Built b;
+            plant_gdn(b, true);
+            add_role_span(b, role);
+            write_pack(d, b);
+        });
+    {
+        Tmp d;
+        Built b;
+        plant_gdn(b, true);
+        write_pack(d, b);
+        const std::string one = native_v3(gdn.model.n_expert, (uint64_t) gdn.model.n_expert * blob_n, kIq4Xs, kQ2_0,
+                                           blob_n);
+        write_bytes(d.path / "native_experts.txt", one.data(), one.size());
+        PackTable t = PackTable::load(d.path.string());
+        PackStack held;
+        std::string got;
+        const bool thrown =
+            threw("GGUF shard", [&] { bind_pack_stack(t, d.path.string(), gdn.model, gdn.stack, nullptr, nullptr, held); },
+                  got);
+        const bool named = got.find("experts.bin") != std::string::npos;
+        verdict("a missing experts.bin is refused", thrown && named, got);
+    }
+
+    const FeedGeom qref = qsa_refuse_feed();
+    Bytes rope_stub(16);
+    zero_buf(rope_stub);
+    refuse(
+        "a 2-bit stack query is refused", "no Q8_K contract", qref, &rope_stub, &rope_stub,
+        [&](const Tmp& d) {
+            Built b;
+            add_gr_router(b, qref.model, 0, word);
+            add_qsa_planes(b, qref.model, 0, scale, word, true);
+            add_shexp2(b, qref.model, 0, scale, word);
+            add_output_hc(b, qref.model, word);
+            add_output_weight(b, qref.model.n_embd, qref.stack.token.n_vocab, 4, scale);
+            add_stack_embd(b, qref.model.n_embd, qref.stack.token.n_vocab, scale, 0);
+            write_pack(d, b);
+        });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1781,7 +2401,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
-        "one routed expert, one 2-bit query\n\n");
+        "one routed expert, one 2-bit query, one stack token\n\n");
     try {
         run_conversions();
         run_refusals();
@@ -1791,6 +2411,7 @@ int main(int argc, char** argv) {
         run_shexp();
         run_experts();
         run_attn();
+        run_stack();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;

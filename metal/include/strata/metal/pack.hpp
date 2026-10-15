@@ -12,15 +12,18 @@
 // layer % interval == interval - 1. Rope tables, the page table, and the recurrence
 // are built at runtime. They are not in the pack.
 //
-// The embedding is gathered only as an S2, S4, or S8 row. The shared expert's three
-// projections each go to the kernel that accepts that form. The 2-bit shared_expert
-// function is not called. A 3-D routed-expert span is not passed to the IQ expert.
-// One concatenated blob from experts.bin is. A 2-bit query projection is the S2
-// product, and qsa_layer is not called for it. A 2-bit plane is not bound onto a
-// Q8_K projection. This does not run the model. There is no token rate.
+// The embedding is gathered only as an S2, S4, or S8 row. run_shared_expert sends each
+// projection to the kernel that accepts that form. The stack's shared expert is the
+// 2-bit shared_expert function, and only that form. A 3-D routed-expert span is not
+// passed to the IQ expert. One concatenated blob from experts.bin is. A 2-bit query
+// projection is the S2 product, and qsa_layer is not called for it. When the pack feeds
+// the stack, the query is the Q8_K plane qsa_layer already reads. A 2-bit plane is not
+// bound onto a Q8_K projection. output.weight on that path is Q8_K, because the output
+// projection is. This does not run the model. There is no token rate.
 #pragma once
 
 #include "strata/metal/gdn_layer.hpp"
+#include "strata/metal/stack.hpp"
 #include "strata/metal/token.hpp"
 
 #include "strata/core/layout.hpp"
@@ -28,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::metal {
 
@@ -107,7 +111,8 @@ GdnLayerWeights bind_gdn_layer(const PackTable& table, const strata::core::Model
 QsaLayerWeights bind_qsa_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // Gated residual, router, and the mixer for this layer. The table must outlive the pointers.
-// The embedding, the shared expert, and the 2-bit query are not among those planes.
+// The embedding, the shared expert, the 2-bit query, and the output projection are not
+// among those planes.
 PackLayer bind_layer(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer);
 
 // One row of token_embd.weight. The row length is g.n_embd and the token selects the row.
@@ -138,5 +143,28 @@ void run_routed_expert(const PackTable& table, const std::string& pack_dir, cons
 // plane. qsa_layer is not called. x holds n_embd floats. y holds at least
 // 2 * n_head * head_dim floats. The residual is not written.
 void run_attn_q(const PackTable& table, const strata::core::ModelGeometry& g, int64_t layer, const Bytes& x, Bytes& y);
+
+// One Bytes per routed expert, and the records generate_stack_token reads.
+// The table owns every plane. This owns the expert blobs. The rope tables are the
+// caller's. Copy and move are deleted: the records point into these vectors.
+struct PackStack {
+    PackStack() = default;
+    PackStack(const PackStack&) = delete;
+    PackStack& operator=(const PackStack&) = delete;
+    PackStack(PackStack&&) = delete;
+    PackStack& operator=(PackStack&&) = delete;
+
+    std::vector<std::vector<Bytes>> experts;
+    std::vector<StackLayerWeights> layers;
+    StackWeights weights;
+};
+
+// Weights only. The residual, the page table, and the GDN and KV state stay with the
+// caller. A full-attention layer reads cos_tab and sin_tab. Those tables are not in
+// the pack. The query on that layer is the Q8_K plane. The shared expert is the 2-bit
+// function. output.weight is Q8_K. The table, the rope tables, and `out` must outlive
+// the draw. This does not run the model.
+void bind_pack_stack(const PackTable& table, const std::string& pack_dir, const strata::core::ModelGeometry& g,
+                     const StackGeom& stack, const Bytes* cos_tab, const Bytes* sin_tab, PackStack& out);
 
 }  // namespace strata::metal
