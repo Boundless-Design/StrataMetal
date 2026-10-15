@@ -240,3 +240,100 @@ On this token, seven layers waited only for read-ahead that was already queued, 
 **5. Encode the next window while this one is on the GPU. Expected 0.58 ms per token.**
 
 Building the 49 encoders took 0.577 ms and ended before commit. It is outside the 35.519 ms timestamp and outside the inter-encoder gaps. Overlapping that encode with the previous token removes it from the wall clock. The gap between encoders would stay the same size.
+
+## Arena size
+
+Measurement only, on the same rebuilt `296b59d` binary, with no debug patch. The sweep sets the arena with `STRATA_METAL_ARENA_GB` and leaves the engine source untouched. `--expert-cache 64` is a different cache: 64 profile slots, 0.08 GiB, present at every size below.
+
+### What picks the default
+
+`STRATA_METAL_ARENA_GB` is the override (`window.cpp` reads it into `ArenaMem::arena_gb`; `arena_budget()` in `metal/src/engine/arena_budget.h` returns that many decimal GB, `kGB = 1e9`). With it unset, the arena is the minimum of three terms, and at least 1 GB:
+
+- GPU: Metal working set, minus what the process already holds, minus 1 GB.
+- RAM: memory macOS can give without paging, minus the keep, minus the 0.5 GB n-gram reserve.
+- Footprint: `footprint_cap` minus what the process already holds, minus the same 0.5 GB.
+
+The keep is `STRATA_METAL_KEEP_FREE_GB` when that is set, otherwise `max(7 GB, 15% of RAM)`. This Mac's `hw.memsize` is 38654705664 (38.7 GB in the engine's decimal print). Fifteen percent of that is under 7 GB, so the keep is the 7 GB floor. Every auto-arena log from `bench/UPSTREAM_MAC.md` prints "7.0 GB kept for macOS". `STRATA_METAL_LEAVE_SHARE` applies only once RAM is at least 64 GB (`kBigMac`). This Mac is under that, so the footprint cap is the lesser of the 30.2 GB GPU working set and RAM minus the 7 GB keep. The working set is the lesser. The log line "less 8.5 GB left to macOS" is 38.7 minus that 30.2 GB cap. The term that actually sizes the arena is the RAM term.
+
+On the four speed runs, with the override unset, the plan is available minus 7.0 minus 0.5, and the filled arena lands a few hundredths above the one-decimal plan:
+
+| Run | Available | Plan | Filled |
+| --- | ---: | ---: | ---: |
+| Warm 3 | 16.2 GB | 8.7 GB | 8.73 GB, 6271 slots |
+| Warm 1 | 16.9 GB | 9.4 GB | 9.44 GB, 6778 slots |
+| Cold | 18.2 GB | 10.7 GB | 10.74 GB, 7715 slots |
+| Warm 2 | 19.4 GB | 11.9 GB | 11.92 GB, 8558 slots |
+
+The GPU term on those warm runs is about 20 GB (working set 30.2, minus 9.2 GB already held, minus 1 GB). The footprint term is about 20.5 GB. Both sit above the RAM term, which is why the same machine prints arenas from 8.73 to 11.92 GB as the file cache and free pages move. With `STRATA_METAL_ARENA_GB` set, the fill does not stop early (`arena_grow` returns true) and the size is kept even when the planned footprint is over the cap. The engine then appends a freeze warning. None of the sizes below printed that warning.
+
+The arena is not wired on this Mac. `mlock` runs when `STRATA_METAL_WIRE_ARENA` is set, or when RAM is at least 64 GB. The sweep left the variable unset, and no log printed a wired line. The arena stays pageable anonymous memory.
+
+### Sweep
+
+Same command as the warm speed runs, from `/Users/kamp/Developer/Strata-upstream`, plus the arena variable. Each run is a fresh process: fill, the 307-id p5 prompt (prefill reports 306 tokens), then 200 generated tokens. Decode is one window per token (drafts accepted 0 of 199, 1.00 tokens per round). The file cache was not purged. One process at a time. Pressure was sampled about twice a second from `kern.memorystatus_vm_pressure_level`, `kern.memorystatus_level`, `vm.swapusage`, and `vm_stat` (Swapouts, compressor pages, Compressions). Idle on this Mac is pressure level 1. A run was killed on level 2 or higher, on any growth in swap used, or on any growth in Swapouts. Page size is 16384.
+
+```sh
+/usr/bin/time -l -o TIMEFILE \
+  env STRATA_METAL_STREAM=1 STRATA_METAL_ARENA_GB=N \
+  ./build-metal/strata \
+  --pack "$HOME/Developer/Strata-data/packs/q2_0" \
+  --native "$HOME/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf" \
+  --ple-gguf "$HOME/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf" \
+  --expert-profile "$HOME/Developer/Strata-upstream/data/expert-profile.bin" \
+  --expert-cache 64 --prefill auto --spec 2 --suffix-draft 0 \
+  --max-context 32768 --mmap-experts --kv fp16 \
+  --tokens "$(cat /tmp/upstream-mac/p5.prompt)" --max-new 200
+```
+
+`N` was 8, then 12, then 16. The 16 GB process was killed on the first run. 20 GB was left unstarted.
+
+The engine's "MB read per window" is `bytes_read_ / windows`. `reset_stats()` exists and has no caller, so the counter still holds the arena fill and the prompt chunk. Each completed expert is 1,382,400 bytes, and `reads × 1,382,400` matches the printed megabytes. The after-fill column subtracts `slots × 1,382,400` and divides by 200 generated tokens. That remainder still includes the prompt chunk's completed reads. The prompt line's "streamed in" count is submits, so it is not subtracted. The miss column times expert size is only the experts the miss counter names.
+
+Medians of the three completed runs. 12 GB is the largest size that stayed green.
+
+| Arena | Slots | Decode tok/s | Hits | Misses / window | Engine MB / token | After-fill MB / token | Miss MB / token | Wait ms | Peak footprint | Max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8.00 GB | 5744 | 23.35 | 0.9021 | 38.0 | 249.9 | 210.2 | 52.53 | 15.01 | 16.418 GB | 13.178 GiB |
+| 12.00 GB | 8616 | 30.59 | 0.9508 | 19.3 | 186.0 | 126.4 | 26.68 | 7.76 | 18.249 GB | 15.848 GiB |
+
+The three runs, in order. Footprint and RSS are the `time -l` byte counts.
+
+| Run | tok/s | Hits | Engine MB | After-fill MB | Wait ms | Host ms | Footprint | RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8-1 | 22.29 | 0.9021 | 249.0 | 209.344 | 15.15 | 15.93 | 15206366208 (15.206 GB) | 12766412800 (11.891 GiB) |
+| 8-2 | 24.90 | 0.9021 | 249.9 | 210.208 | 15.01 | 15.78 | 16417750880 (16.418 GB) | 14149255168 (13.178 GiB) |
+| 8-3 | 23.35 | 0.9021 | 251.3 | 211.549 | 14.62 | 15.40 | 16561750192 (16.562 GB) | 14636711936 (13.632 GiB) |
+| 12-1 | 26.00 | 0.9508 | 185.8 | 126.234 | 7.67 | 8.36 | 18248895904 (18.249 GB) | 17006788608 (15.839 GiB) |
+| 12-2 | 30.79 | 0.9509 | 186.0 | 126.427 | 7.89 | 8.58 | 18249108872 (18.249 GB) | 18107367424 (16.864 GiB) |
+| 12-3 | 30.59 | 0.9508 | 186.2 | 126.607 | 7.76 | 8.45 | 18456610336 (18.457 GB) | 17015996416 (15.848 GiB) |
+
+Completed reads: 8 GB 36031, 36156, 36350; 12 GB 26879, 26907, 26933. The printed arenas are exactly 8.00 and 12.00 GB. Planned footprints are 17.7 GB and 21.7 GB, both under the 30.2 GB cap (arena plus 9.2 GB already held plus the 0.5 GB reserve).
+
+Pressure on those six runs: level stayed 1, swap used stayed 1024458752 bytes, Swapouts stayed 1744649. The compressor did move. `kern.memorystatus_level` is the free-page percentage.
+
+| Run | Compressions Δ | Compressor pages, peak Δ | Pages Δ at exit | memorystatus_level |
+| --- | ---: | ---: | ---: | --- |
+| 8-1 | +672459 | +501191 | +2436 | 47–84 |
+| 8-2 | +538717 | +376581 | +58950 | 50–83 |
+| 8-3 | +42219 | +8984 | +1084 | 47–81 |
+| 12-1 | +213474 | +166735 | −528 | 39–81 |
+| 12-2 | +126674 | +100047 | +10529 | 39–81 |
+| 12-3 | +352768 | +281641 | +17297 | 38–81 |
+
+The first 8 GB fill is the high one: 501191 pages is 8.212 GB at 16384 bytes a page, and the level stayed 1 with swap unchanged. The third 8 GB run peaked at 8984 pages. Compressor movement by itself did not trip the stop.
+
+### Where it stopped
+
+16 GB, first run, was killed (`SIGTERM`, exit −15) and not repeated. The engine printed "expert arena 16.00 GB, 11488 slots … in 3.8 s (4.18 GB/s)" and "planned resident footprint 25.7 GB = arena 16.0 + 9.2 held before it + 0.5 … cap 30.2 GB". The footprint is under the cap, and the freeze warning is absent. Stderr ends on the after-fill line ("the process holds 22.2 GB, 3.1 GB resident"). There is no prefill line and no expert-stream line. Stdout is empty and the `time -l` file is empty, so this run has no decode rate, hit rate, byte count, wait, or peak footprint.
+
+The baseline just before the process was pressure level 1, `memorystatus_level` 80, swap used 1024458752 bytes, Swapouts 1744649, compressor pages 203213. Sampling is every 0.5 s, plus the time the sysctls take. Under this fill one interval stretched to 1.79 s: at 4.39 s the level was still 1, `memorystatus_level` was 38, and compressor pages were already +307162, with swap still unchanged. The next sample, at 4.92 s, is the first bad one: level 2, `memorystatus_level` 33, swap used +445183426 bytes, Swapouts +25088, compressor pages +1098602 (17.999 GB). The sample after the kill, 5.95 s from the baseline, is back to level 1 and `memorystatus_level` 79, with swap used +666307133 bytes (1690765885 bytes, the 1612.44M `vm.swapusage` still shows) and Swapouts +41180. Compressor pages fell to 33728 below the baseline. Swap growth stayed after the process was gone. 20 GB was left unstarted.
+
+### What a bigger arena takes off the 32 ms
+
+The traced gap in `bench/UPSTREAM_MAC.md` is 32.027 ms. The untraced ledger above, on a 9.61 GB arena, is the same handshake without the tracer: a 13.179 ms inter-encoder gap inside a 35.519 ms GPU timestamp. Of that gap, 12.119 ms is the SSD wait inside `at_layer`. The host work inside the gap is the lookup, 0.105 ms, and `ahead()`, 0.601 ms. The 0.354 ms `fprintf` was the debug patch. The per-layer encoder boundary, 6.310 ms, sits in the host-observed encoder time, beside the gap. The traced expert line waited 21.40 ms per window; that is the inflated form of the same SSD term, and the 18.848 ms by which 32.027 exceeds 13.179 is that inflation plus the scheduling bubbles already described under "The traced 32 ms".
+
+Arena size moves the SSD wait. From 8 GB to 12 GB the wait median fell from 15.01 ms to 7.76 ms, which is 7.25 ms off the token. The decode median moved from 23.35 tok/s (8563.6 ms for 200 tokens, 42.818 ms each) to 30.59 tok/s (6537.4 ms, 32.687 ms each), 10.131 ms less wall per token. Host time minus the wait stayed put: 0.78, 0.77, and 0.78 ms on the three 8 GB runs, and 0.69 ms on all three 12 GB runs.
+
+Against the gaps capture, the 12 GB wait is 4.36 ms under the 12.119 ms wait. That is the measured size of ranked fix 2, whose "about 4 ms" came from the uncontrolled 11.92 GB run (8.20 ms) beside this capture. The controlled 12.00 GB wait, 7.76 ms, sits next to that 8.20 ms. The step from 8.00 GB is larger than 4 ms because 8 GB waited 15.01 ms, above the 8.73 GB run's 13.41 ms.
+
+At 12 GB, the largest size that stayed green, 7.76 ms of SSD wait is still on the token (19.3 misses per window, 26.68 MB of miss bytes, plus the late reads inside the 126.4 MB after-fill figure). The host synchronization that a larger arena does not move is the 6.310 ms encoder boundary and the 0.69 ms lookup-and-ahead residual. The 16 GB attempt swapped during the fill, before any decode sample, so the remaining 7.76 ms was not measured at a larger arena.
