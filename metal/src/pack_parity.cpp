@@ -7679,10 +7679,13 @@ struct QsaHost {
 // the cells are stored in order. K and V are the fp16 values the pool stores.
 // Defaults are layer 3: Q3_K key, Q5_K value, Q2_0 query, Q4_K output.
 // Layer 15 also passes an IQ4_XS query, a Q5_K key, and a Q5_K output.
+// gpu_gated0 and gpu_gated1 are optional. Each is that position's GPU gate output, n_head * head_dim
+// floats, taken before the output projection. When one is set, the projection quantizes it and the
+// host gate is not requantized. A null pointer keeps the host gate. The key path does not read them.
 QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t* kw, const uint8_t* vw,
                     const uint8_t* ow, const float* qn, const float* kn, const float* cos_tab, const float* sin_tab,
                     int key_type = kQ3_K, int value_type = kQ5_K, int query_type = kQ2_0,
-                    int out_type = kQ4_K) {
+                    int out_type = kQ4_K, const float* gpu_gated0 = nullptr, const float* gpu_gated1 = nullptr) {
     const int n_head = 24;
     const int n_head_kv = 2;
     const int head_dim = 256;
@@ -7734,7 +7737,9 @@ QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t
         qsa_rms_rows(q, qn, n_head, head_dim);
         qsa_rope_rows(q, n_head, head_dim, n_rot, t, cos_tab, sin_tab);
         const std::vector<float> attn = qsa_attend(q, hk, hv, t + 1, n_head, n_head_kv, head_dim);
-        const std::vector<float> gated = qsa_gate(attn, qfull, n_head, head_dim);
+        std::vector<float> gated = qsa_gate(attn, qfull, n_head, head_dim);
+        const float* gpu_gated = t == 0 ? gpu_gated0 : gpu_gated1;
+        if (gpu_gated) std::memcpy(gated.data(), gpu_gated, (size_t) q_n * 4u);
         Bytes gin((uint64_t) q_n * 4u);
         std::memcpy(gin.data(), gated.data(), (size_t) q_n * 4u);
         Bytes gq(iq_q8_1_bytes(q_n));
@@ -8342,7 +8347,15 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
             Bytes R((uint64_t) hc_dim * 4u), zero_r((uint64_t) hc_dim * 4u);
             std::memcpy(R.data(), in.data(), (size_t) hc_dim * 4u);
             std::memset(zero_r.data(), 0, (size_t) zero_r.size());
-            auto run_two = [&](const Bytes& residual, Bytes& out0, Bytes& out1) {
+            const int q_n = (int) sh.n_head * (int) sh.head_dim;
+            std::vector<float> gpu_g0, gpu_g1;
+            auto take_gate = [&](std::vector<float>& dst) {
+                if (q_n != 24 * 256 || sc.gated.size() != (uint64_t) q_n * 4u)
+                    throw MetalError("qsa gated vector has the wrong length");
+                dst.resize((size_t) q_n);
+                std::memcpy(dst.data(), sc.gated.data(), (size_t) q_n * 4u);
+            };
+            auto run_two = [&](const Bytes& residual, Bytes& out0, Bytes& out1, bool keep_gate) {
                 std::memset(k_pool.data(), 0, (size_t) k_pool.size());
                 std::memset(v_pool.data(), 0, (size_t) v_pool.size());
                 std::memset(idx_tail.data(), 0, (size_t) idx_tail.size());
@@ -8362,9 +8375,11 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
                 st.idx_block_pos = &idx_bpos;
                 gr_read(gs, residual, x.hc.norm, x.hc.down, x.hc.up, &x.hc.inj, 1e-6f, false, gr, mixed, inject);
                 qsa_layer_iq(lg, w, st, sc, 0, 0, mixed, out0);
+                if (keep_gate) take_gate(gpu_g0);
                 qsa_layer_iq(lg, w, st, sc, 1, 0, mixed, out1);
+                if (keep_gate) take_gate(gpu_g1);
             };
-            run_two(R, y0, y1);
+            run_two(R, y0, y1, true);
             std::vector<float> gpu_mixed((size_t) n_embd), gpu_inj((size_t) hc), gpu_k((size_t) kv_out);
             std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4u);
             std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4u);
@@ -8377,7 +8392,7 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
                                              static_cast<const uint8_t*>(x.o.data()),
                                              static_cast<const float*>(x.q_norm.data()),
                                              static_cast<const float*>(x.k_norm.data()), cos_h.data(), sin_h.data(),
-                                             x.k_ty, x.v_ty, x.q_ty, x.o_ty);
+                                             x.k_ty, x.v_ty, x.q_ty, x.o_ty, gpu_g0.data(), gpu_g1.data());
             std::vector<float> host_mixed, host_inject;
             gr_read_host(static_cast<const float*>(R.data()), x.hc.norm, x.hc.down, x.hc.up, x.hc.inj, n_embd, hc, hc_lr,
                          host_mixed, host_inject);
@@ -8386,8 +8401,8 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
             const double block_rel = rel_l1(host.y0.data(), static_cast<const float*>(y0.data()), n_embd);
             const double pos_rel = rel_l1(host.y1.data(), static_cast<const float*>(y1.data()), n_embd);
             const double key_rel = rel_l1(host.k1.data(), gpu_k.data(), kv_out);
-            run_two(R, y0b, y1b);
-            run_two(zero_r, y0z, y1z);
+            run_two(R, y0b, y1b, false);
+            run_two(zero_r, y0z, y1z, false);
             const std::vector<int64_t> tries = value_flips(x, gpu_mixed.data(), n_embd);
             int64_t flip_at = -1;
             int flip_n = 0;
@@ -8396,7 +8411,7 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
                 std::memcpy(flipped.data(), x.v.data(), (size_t) x.v.size());
                 static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
                 w.v = QsaIqPlane{x.v_ty, &flipped};
-                run_two(R, y0f, y1f);
+                run_two(R, y0f, y1f, false);
                 const int n0 = differ_floats(static_cast<const float*>(y0.data()), static_cast<const float*>(y0f.data()),
                                              n_embd);
                 const int n1 = differ_floats(static_cast<const float*>(y1.data()), static_cast<const float*>(y1f.data()),
@@ -8557,6 +8572,23 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
             const double read_rel = rel_l1(host_mixed.data(), gpu_mixed.data(), n_embd);
             const double inject_rel = rel_l1(host_inject.data(), gpu_inj.data(), hc);
             const double write_rel = rel_l1(host_write.data(), static_cast<const float*>(out.data()), hc_dim);
+            // Position 0's gate, before the repeat step overwrites the scratch. The projection is checked
+            // from it at the block bound and is not printed, so the write line stays the residual write.
+            const int q_n = (int) sh.n_head * (int) sh.head_dim;
+            if (q_n != 24 * 256 || sc.gated.size() != (uint64_t) q_n * 4u)
+                throw MetalError("qsa gated vector has the wrong length");
+            std::vector<float> gpu_gated((size_t) q_n);
+            std::memcpy(gpu_gated.data(), sc.gated.data(), (size_t) q_n * 4u);
+            std::vector<float> cos2((size_t) 2 * (size_t) pairs), sin2(cos2.size());
+            build_rope_table((int) sh.n_rot, strata::kernels::qsa_freq_base(), 2, cos2.data(), sin2.data());
+            const QsaHost host = qsa_iq_host(gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(x.q.data()),
+                                             static_cast<const uint8_t*>(x.k.data()),
+                                             static_cast<const uint8_t*>(x.v.data()),
+                                             static_cast<const uint8_t*>(x.o.data()),
+                                             static_cast<const float*>(x.q_norm.data()),
+                                             static_cast<const float*>(x.k_norm.data()), cos2.data(), sin2.data(),
+                                             x.k_ty, x.v_ty, x.q_ty, x.o_ty, gpu_gated.data(), nullptr);
+            const double proj_rel = rel_l1(host.y0.data(), gpu_block.data(), n_embd);
             step(R, out2);
             step(zero_r, outz);
             const std::vector<int64_t> candidates = value_flips(x, gpu_mixed.data(), n_embd);
@@ -8583,11 +8615,12 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
                                     (flip_at < 0 || static_cast<const float*>(outf.data())[hc_dim] == 7.f);
             const bool live = all_finite(op, hc_dim) && all_finite(o2, hc_dim) && all_finite(gpu_block.data(), n_embd) &&
                               all_finite(host_write.data(), hc_dim) && all_finite(gpu_mixed.data(), n_embd) &&
-                              !still_seven(op, hc_dim);
+                              all_finite(host.y0.data(), n_embd) && !still_seven(op, hc_dim);
             const int again = differ_floats(op, o2, hc_dim);
             const int apart = differ_floats(op, oz, hc_dim);
             const double apart_rel = rel_l1(op, oz, hc_dim);
-            step_ok = live && guard_held && read_rel <= 1e-4 && inject_rel <= 1e-4 && write_rel <= 1e-4;
+            step_ok = live && guard_held && read_rel <= 1e-4 && inject_rel <= 1e-4 && write_rel <= 1e-4 &&
+                      proj_rel <= 1e-5;
             repeat_ok = live && guard_held && again == 0;
             moved_ok = live && guard_held && apart > 0 && std::isfinite(apart_rel);
             flipped_ok = live && guard_held && flip_n > 0;
