@@ -132,7 +132,7 @@ ten alone, then routed + shared, whose residual feeds the next layer. The verdic
 hand-written `run_layerN_*` functions printed.
 
 - The model comes from `STRATA_MODEL_GGUF` (any shard), or the Q2_0 shard 1 under `$HOME`. No path is compiled in.
-- `STRATA_WALK_LAST` is the last layer walked. The default is 19.
+- `STRATA_WALK_LAST` is the last layer walked. The default is 25. Layer 24's tensors are in shard 2.
 - Do not add a `run_layerN_*` function, an offset literal, or a quant type literal for a layer. A new layer is a
   larger `STRATA_WALK_LAST`. When it fails, the fix goes in the generic code: a quant type the host references
   do not know yet (`host_ref`, the chains in `gdn_iq_host` and `qsa_iq_host`, `check_product`), a kernel that
@@ -144,6 +144,6 @@ hand-written `run_layerN_*` functions printed.
 - Layers 0 and 1, `run_routed_ten`, and `run_carried_pair` still read offset literals. Fold them into the walk next.
 
 1. `metal/tools/compare_pack_runs.sh` printed that layers 2-18 match.
-2. Layer 19 passed. It is QSA: query Q3_K, key Q3_K, value Q4_K, output Q4_K. The value reference is `k_ref`
-   with q5 false, and `iq_mmvq` already runs a Q4_K plane. Next is `STRATA_WALK_LAST=20`.
+2. Layers 19-25 passed, including layer 24 from shard 2. Layer 26 is GDN with a Q4_K query, which
+   `gdn_iq_host` does not reference yet.
    Do not sample an argmax. Do not port the PLE table. Expert streaming is not in this tree. There is no token rate.
