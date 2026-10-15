@@ -344,6 +344,8 @@ struct Live {
     // Each shared down scale is base + 0.1 * (0..49). The small fixture uses 8 so that term shows
     // up in the sum. A wider shared expert keeps the same draw and a smaller base.
     float shared_down_base = 8.0f;
+    // Added span on the shared down scales: base + span * (0..49). 0.1 is the original step.
+    float shared_down_span = 0.1f;
     int n_vocab = 32;
     int n_head = 24;
     int n_head_kv = 2;
@@ -475,7 +477,7 @@ void build_live(Live& L) {
     std::vector<float> usc(gsc.size()), dsc((size_t) L.n_embd * (size_t) (L.n_ff_shared / 64));
     for (float& s : gsc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
     for (float& s : usc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
-    for (float& s : dsc) s = L.shared_down_base + 0.1f * (float) (L.rng() % 50);
+    for (float& s : dsc) s = L.shared_down_base + L.shared_down_span * (float) (L.rng() % 50);
     std::vector<uint16_t> ginv((size_t) L.n_embd);
     for (uint16_t& v : ginv) v = strata::kernels::bf16_from_f32(0.05f * L.gauss(L.rng));
     L.gc.reset(new Bytes(upload(gc.data(), gc.size())));
@@ -1124,6 +1126,143 @@ void check_vocab_token() {
     check_live_token(L, "vocab");
 }
 
+// Sixteen cells at that same shape. Top-k stays 2, so the last cell keeps 5 of 16.
+// A fresh cache at top-k 2048 keeps all 16. The filled cache is not replayed: a second
+// pass would append every cell again.
+void check_long_token() {
+    constexpr int kCells = 16;
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    L.hc_lr = 320;
+    L.n_ff = 640;
+    L.n_expert = 512;
+    L.n_ff_shared = 640;
+    // Shared down scales 0.05 to 0.54, so the expert sum does not cover the value mix.
+    L.shared_down_base = 0.05f;
+    L.shared_down_span = 0.01f;
+    L.n_vocab = 248320;
+    L.max_cells = kCells;
+    strata::kernels::QsaShapes shapes;
+    shapes.idx_block = L.block;
+    shapes.idx_top_k = L.top_k;
+    const int w2 = (int) strata::kernels::qsa_selection_width(kCells, shapes);
+    shapes.idx_top_k = 2048;
+    const int w2048 = (int) strata::kernels::qsa_selection_width(kCells, shapes);
+    std::printf("\nmodel sequence  cells %d  n_kv %d  top-k 2 width %d  top-k 2048 width %d\n", kCells, kCells, w2,
+                w2048);
+    build_live(L);
+    // A zero key plane flattens the softmax. Random 4-bit value rows share a positive mean,
+    // so every token lands on that same vector: raw attention was 0.22% apart and the logits
+    // 0.01%. Bias -8 and paired nibbles 7 and 9 center each value row.
+    std::memset(L.pk->codes.data(), 0, (size_t) L.pk->codes.size());
+    std::memset(L.pk->scales.data(), 0, (size_t) L.pk->scales.size());
+    std::memset(L.pk->offs.data(), 0, (size_t) L.pk->offs.size());
+    L.w.qsa.v.form.code_bias = -8;
+    {
+        auto* codes = static_cast<uint8_t*>(L.pv->codes.data());
+        const int row_bytes = L.n_embd / 2;
+        const int n_out = L.n_head_kv * L.head_dim;
+        for (int row = 0; row < n_out; ++row) {
+            uint8_t* r = codes + (size_t) row * (size_t) row_bytes;
+            for (int j = 0; j < row_bytes; ++j) {
+                const uint32_t h = (uint32_t) row * 1315423911u ^ (uint32_t) j * 2654435761u;
+                const uint8_t lo = (h & 1u) ? 7 : 9;
+                const uint8_t hi = (h & 2u) ? 7 : 9;
+                r[j] = (uint8_t) (lo | (hi << 4));
+            }
+        }
+        auto* scales = static_cast<float*>(L.pv->scales.data());
+        for (size_t i = 0; i < (size_t) L.pv->scales.size() / sizeof(float); ++i) scales[i] = 400.0f;
+        auto* offs = static_cast<float*>(L.pv->offs.data());
+        for (size_t i = 0; i < (size_t) L.pv->offs.size() / sizeof(float); ++i) offs[i] = 0.0f;
+    }
+    L.w.qsa.out.form.code_bias = -8;
+    L.w.out.form.code_bias = -8;
+
+    Owned prod = make_live_owned(L);
+    Owned spec = make_live_owned(L);
+    zero_owned(prod);
+    zero_owned(spec);
+    TokenState st_prod = bind_state(prod, *L.table);
+    TokenState st_spec = bind_state(spec, *L.table);
+    TokenScratch sc_prod = make_token_scratch(L.g);
+    TokenScratch sc_spec = make_token_scratch(L.g);
+
+    const int n_vocab = L.n_vocab;
+    const int guard = L.guard;
+    auto fill_guard = [&](Bytes& logits) {
+        auto* p = static_cast<float*>(logits.data());
+        for (int i = 0; i < n_vocab + guard; ++i) p[i] = 7.0f;
+    };
+
+    int logit_bad = 0;
+    double worst = 0;
+    int route_bad = 0;
+    int argmax_bad = 0;
+    int guard_bad = 0;
+    std::vector<int> inputs((size_t) kCells);
+    std::string in_list;
+    for (int pos = 0; pos < kCells; ++pos) {
+        inputs[(size_t) pos] = 3 + pos * 15000;
+        if (!in_list.empty()) in_list.push_back(' ');
+        in_list += std::to_string(inputs[(size_t) pos]);
+    }
+    std::printf("  inputs %s\n", in_list.c_str());
+    std::string id_list;
+    std::vector<float> last((size_t) n_vocab);
+    for (int pos = 0; pos < kCells; ++pos) {
+        fill_guard(sc_prod.logits);
+        fill_guard(sc_spec.logits);
+        const int id = generate_token(L.g, L.w, st_prod, sc_prod, inputs[(size_t) pos], pos, 0, L.sp, nullptr, 0);
+        run_spec(L.g, L.w, st_spec, sc_spec, inputs[(size_t) pos], pos, 0, Trap::None);
+        const float* got = static_cast<const float*>(sc_prod.logits.data());
+        const float* want = static_cast<const float*>(sc_spec.logits.data());
+        double scale = 0;
+        for (int i = 0; i < n_vocab; ++i) scale = std::max(scale, std::fabs((double) want[i]));
+        if (scale < 1e-30) scale = 1e-30;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (got[i] != want[i]) ++logit_bad;
+            const double rel = std::fabs((double) want[i] - (double) got[i]) / scale;
+            if (rel > worst) worst = rel;
+        }
+        for (int i = 0; i < guard; ++i)
+            if (got[n_vocab + i] != 7.0f) ++guard_bad;
+        if (id != argmax(want, n_vocab)) ++argmax_bad;
+        const int* a = static_cast<const int*>(sc_prod.route_ids.data());
+        const int* b = static_cast<const int*>(sc_spec.route_ids.data());
+        for (int e = 0; e < L.k; ++e)
+            if (a[e] != b[e]) ++route_bad;
+        if (!id_list.empty()) id_list.push_back(' ');
+        id_list += std::to_string(id);
+        if (pos + 1 == kCells) std::memcpy(last.data(), want, (size_t) n_vocab * 4u);
+    }
+
+    char wb[64];
+    std::snprintf(wb, sizeof wb, "rel %.3e, %d differ", worst, logit_bad);
+    verdict("the sequence logits match the kernel sequence", logit_bad == 0, wb);
+    verdict("the sequence routed ids match the kernel sequence", route_bad == 0, std::to_string(route_bad) + " differ");
+    verdict("the sequence greedy ids are the argmax", argmax_bad == 0, id_list);
+    verdict("16 words past the sequence logits stayed put", guard_bad == 0, std::to_string(guard_bad) + " changed");
+
+    TokenGeom wide = L.g;
+    wide.qsa.qsa.idx_top_k = 2048;
+    Owned kept = make_live_owned(L);
+    zero_owned(kept);
+    TokenState st_wide = bind_state(kept, *L.table);
+    TokenScratch sc_wide = make_token_scratch(wide);
+    for (int pos = 0; pos < kCells; ++pos)
+        run_spec(wide, L.w, st_wide, sc_wide, inputs[(size_t) pos], pos, 0, Trap::None);
+    const double apart = rel_l1(last.data(), static_cast<const float*>(sc_wide.logits.data()), n_vocab);
+    std::string kept_ids;
+    const int* narrow_ids = static_cast<const int*>(sc_spec.qsa.ids.data());
+    for (int i = 0; i < w2; ++i) {
+        if (i) kept_ids.push_back(' ');
+        kept_ids += std::to_string(narrow_ids[i]);
+    }
+    verdict("top-k 2048 is observable", apart > 0.05, pct(apart) + ", top-k 2 kept " + kept_ids);
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -1147,7 +1286,7 @@ int main(int argc, char** argv) {
     std::printf(
         "token: one block, one greedy sample, one draft step, one model-width token, one model-rank token, "
         "one model-hidden token, one model-expert token, one model-shared token, one model-vocab token, "
-        "synthetic weights\n\n");
+        "one model sequence, synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1532,6 +1671,7 @@ int main(int argc, char** argv) {
         check_expert_token();
         check_shared_token();
         check_vocab_token();
+        check_long_token();
 
         check_serve(argv[0]);
 

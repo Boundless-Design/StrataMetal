@@ -26,7 +26,8 @@ one greedy token at the model embedding, n_embd 2560, indexer dim 128, and 64 ro
 rank 32, 8 experts, hidden 64, vocabulary 32, and top-k 2. It also draws one greedy token at the
 model residual rank, hc_lr 320, on that same embedding. It also draws one greedy token there with
 routed hidden 640, 8 experts, and shared hidden 64. It also draws one greedy token there with
-512 experts, one there with shared hidden 640, and one at vocabulary 248320. Four synthetic
+512 experts, one there with shared hidden 640, and one at vocabulary 248320. It also draws
+sixteen greedy cells at that vocabulary, top-k 2 against top-k 2048. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
 The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
@@ -504,6 +505,23 @@ sampled id was 52472, the argmax. Skipping the attention write was 9.56% apart o
 16 words past the logits stayed put. Top-k stayed at 2. The weights are synthetic. No GGUF was
 loaded. This is not a loaded model. There is no token rate.
 
+The same run draws sixteen greedy cells at that vocabulary. n_embd 2560, hc_lr 320, 4 streams,
+indexer dim 128, 64 rotated values, 24 heads, 2 kv heads, head dim 256, 4 indexer heads, block 4,
+top-k 2, page size 2, 16 cells. The last cell has n_kv 16. The selection width is min(n_kv, top-k
++ block - 1), so top-k 2 keeps 5 cells and top-k 2048 keeps 16. 512 experts, routed hidden 640,
+shared hidden 640, vocabulary 248320. The routed experts stay IQ4_XS gate and up with a Q2_0 down.
+The shared expert stays 2-bit, and its down scales run from 0.05 to 0.54. The key plane is zero.
+The value plane is 4-bit with bias -8, nibbles 7 and 9, group scale 400, and offset 0. The output
+projection and the head use bias -8. Feeding each sample back repeated one id, and that wider
+selection was 0.01% apart. Distinct inputs on the uncentered value rows were 0.01% apart as well.
+The inputs are 3, 15003, 30003, 45003, 60003, 75003, 90003, 105003, 120003, 135003, 150003,
+165003, 180003, 195003, 210003, and 225003. The logits differed from the same kernel sequence on
+0 of 248320 values, relative error 0. The routed ids matched, 0 differ. The sampled ids were
+77714, 25900, 2551, 228616, 19310, 165164, 28183, 19310, 2551, 2551, 113960, 2551, 25900, 119547,
+207094, and 119547, each the argmax. Top-k 2 kept cells 4, 12, 13, 14, and 15. Replaying those
+inputs at top-k 2048 was 165.49% apart on the last logits. 16 words past the logits stayed put.
+The weights are synthetic. No GGUF was loaded. This is not a loaded model. There is no token rate.
+
 The same check draws one draft step. The caller's residual is left as it was. The next token is
 gathered, normalized, and projected. The whole residual is normalized as one row, and each stream
 of that row is projected by the same hidden weight. The layer residual is the sum, with the
@@ -656,7 +674,9 @@ hidden 640 on that rank. The sampled id was 15. Shared hidden stayed 64. The sam
 one greedy token there with 512 experts. The sampled id was 28. Shared hidden and top-k stayed at
 64 and 2. The same check draws one greedy token with shared hidden 640. The sampled id was 30.
 Vocabulary and top-k stayed at 32 and 2. The same check draws one greedy token at vocabulary
-248320. The sampled id was 52472. Top-k stayed 2. The same binary answers
+248320. The sampled id was 52472. Top-k stayed 2. The same check draws sixteen greedy cells
+there. The last cell has n_kv 16. Top-k 2 keeps 5 cells and top-k 2048 keeps 16. Those logits
+were 165.49% apart. The same binary answers
 the serve lines on that fixture. The check started the binary. The Python server was not started.
 The model does not run.
 There is no token rate.
@@ -678,7 +698,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. One greedy sequence long enough that top-k 2048 keeps cells that top-k 2 drops. n_embd stays 2560, hc_lr stays 320, indexer dim stays 128 with 64 rotated values, routed hidden stays 640, shared hidden stays 640, expert count stays 512, and the vocabulary stays 248320. The selection width is min(n_kv, top-k + block - 1), and the block is 4, so the two widths part once the sequence passes 5 cells. That is not a loaded model. This loop does not read a GGUF.
+1. One layer from a real pack index plus the bins beside it. One layer, n_embd 2560, 512 expert blobs of 2,201,600 bytes each. That is not a loaded 48-layer model. A resident set of 48 such layers does not fit this 36 GB Mac. Expert streaming is not in this tree. This does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
