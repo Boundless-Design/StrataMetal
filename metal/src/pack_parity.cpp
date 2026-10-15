@@ -8454,6 +8454,53 @@ void run_layer2_shared(const PackTable& table, const strata::core::ModelGeometry
 }
 
 
+// Layer 3's four attention products. The QSA block is not called. Layer 1's PLE was not applied.
+void run_layer3_attn() {
+    std::printf("\nlayer 3 attention products, QSA block not run, layer 1 PLE not applied\n");
+    const int n_embd = 2560;
+    const int q_out = 12288;
+    const int kv_out = 512;
+    const int attn_out_in = 6144;
+    const uint64_t k_data = 11024672;
+    const uint64_t k_q = 3067725952;
+    const uint64_t k_k = 3058314368;
+    const uint64_t k_v = 3076574336;
+    const uint64_t k_o = 3058878592;
+    const uint64_t n_q = 8847360;
+    const uint64_t n_k = 563200;
+    const uint64_t n_v = 901120;
+    const uint64_t n_o = 8847360;
+    const std::filesystem::path shard =
+        "/Users/kamp/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf";
+    const bool layout = iq_row_bytes(kQ2_0, n_embd) * (size_t) q_out == n_q &&
+                        iq_row_bytes(kQ3_K, n_embd) * (size_t) kv_out == n_k &&
+                        iq_row_bytes(kQ5_K, n_embd) * (size_t) kv_out == n_v &&
+                        iq_row_bytes(kQ4_K, attn_out_in) * (size_t) n_embd == n_o &&
+                        std::filesystem::is_regular_file(shard);
+    std::vector<uint8_t> q, k, v, o;
+    if (layout) {
+        auto load = [&](uint64_t off, uint64_t n, std::vector<uint8_t>& dst) {
+            dst = read_at_path(shard, k_data + off, (size_t) n);
+        };
+        load(k_q, n_q, q);
+        load(k_k, n_k, k);
+        load(k_v, n_v, v);
+        load(k_o, n_o, o);
+    }
+    const uint8_t* qp = layout ? q.data() : nullptr;
+    const uint8_t* kp = layout ? k.data() : nullptr;
+    const uint8_t* vp = layout ? v.data() : nullptr;
+    const uint8_t* op = layout ? o.data() : nullptr;
+    check_rows("the layer-3 query rows match", "a changed layer-3 query code moves that product", qp, layout ? n_q : 0,
+               n_embd, q_out, kQ2_0, 2, q2_ref, nullptr);
+    check_rows("the layer-3 key rows match", "a changed layer-3 key code moves that product", kp, layout ? n_k : 0,
+               n_embd, kv_out, kQ3_K, 32, q3_ref, q3_scalar);
+    check_k("the layer-3 value rows match", "a changed layer-3 value code moves that product", vp, layout ? n_v : 0,
+            n_embd, kv_out, true, 48);
+    check_k("the layer-3 output rows match", "a changed layer-3 output code moves that product", op, layout ? n_o : 0,
+            attn_out_in, n_embd, false, 16);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -9785,6 +9832,7 @@ void run_q2_layer() {
     run_layer2_gdn(g);
     run_layer2_routed(table, g);
     run_layer2_shared(table, g);
+    run_layer3_attn();
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -9809,6 +9857,7 @@ int main(int argc, char** argv) {
         "one layer-1 GDN step on that residual, one layer-1 routed expert pass on that residual, "
         "one layer-2 GDN step on that residual, one layer-2 routed expert pass on that residual, "
         "one layer-2 shared expert on that residual, "
+        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
