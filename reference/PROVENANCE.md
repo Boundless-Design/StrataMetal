@@ -177,13 +177,21 @@ The strings are the ones in the meta files. p1 through p4 are the four required 
 
 Generating 32 tokens runs the forward at positions `prompt_len - 1` through `prompt_len - 1 + 31` and then stops. That is 32 rows. `pos` is that index. `input_token` is the id fed at `pos` (a prompt id for the last prompt position, otherwise the previously chosen id). `next_token` is the greedy choice, and the 32 `next_token` values are the generated ids in order. The last generated token is not fed back, so there is no 33rd row.
 
-The per-token loop also computes teacher-forced logits at positions `0 .. prompt_len - 2`. Those rows are in the raw dump and are not in the JSONL. The fixture positions are the last prompt position and the 31 following positions that the generated tokens were fed into, which together produce the 32 new tokens.
+The per-token loop also computes teacher-forced logits at positions `0 .. prompt_len - 2`. Those rows are in `<prompt-id>.prompt.jsonl`, described in the next section. The generation file's positions are the last prompt position and the 31 following positions that the generated tokens were fed into, which together produce the 32 new tokens.
 
 `top` is 64 `[id, logit]` pairs, highest raw logit first, and the lower id first when logits tie. Logits are the dumped f32 values before softmax and before temperature. JSON numbers are the exact float32 value promoted to float64 (Python's `json` encoding of that promotion). Casting the parsed number back to float32 restores the dump bits.
 
 `max` is the first (lowest-index) maximum, as a float32. `lse` is the log-sum-exp over all 248320 rows, in float64: `max + log(sum(exp(logit - max)))`, the same reduction as `Verifier::window_logprobs` in `src/core/verify.cpp`.
 
 `output_text` is the decode of the 32 new tokens only, special tokens included, for a person reading the file.
+
+## Teacher-forced prompt rows
+
+`reference/fixtures/<prompt-id>.prompt.jsonl` holds positions `0 .. prompt_len - 2` from the same `-a` raw dumps (`/mnt/scratch/runs/<id>-a.bin`). The engine was not run again. The row format matches `<prompt-id>.jsonl`. `input_token` is `prompt_tokens[pos]`. `next_token` is the argmax of that row, lowest id on a tie: the model's prediction at that position, not `prompt_tokens[pos + 1]`. `top`, `max`, and `lse` use the same rules as the generation files.
+
+Row counts: p1 4 (positions 0..3), p2 10 (0..9), p3 3 (0..2), p4 9 (0..8), p5 306 (0..305).
+
+The `-b` dumps were compared with the `-a` dumps on these positions, over the full 248320-wide row. All five are bit-identical, so the argmax, the top 64, `max`, and `lse` match to the last bit.
 
 ## Commands
 
