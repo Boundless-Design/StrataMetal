@@ -8,6 +8,7 @@
 #include "strata/metal/bf16_gemv.hpp"
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
+#include "strata/metal/layer_exec.hpp"
 #include "strata/metal/layer_tensors.hpp"
 #include "strata/metal/launch.hpp"
 #include "strata/metal/qsa_layer.hpp"
@@ -7812,13 +7813,6 @@ bool plane_is(const LayerTensor* t, int64_t n_in, int64_t rows) {
     return rb != 0 && t->bytes == (uint64_t) rows * rb;
 }
 
-Bytes load_tensor(const ModelTensors& m, const LayerTensor& t) {
-    const std::vector<uint8_t> raw = m.read(t);
-    Bytes b((uint64_t) raw.size());
-    std::memcpy(b.data(), raw.data(), raw.size());
-    return b;
-}
-
 // Where the quant codes sit inside one ggml block. `lo`/`hi` is the code span and `probe` is the byte
 // check_product flips. A scale byte can change the host product's fp16 and still vanish once the value is
 // stored as fp16, so the search prefers this span.
@@ -7974,17 +7968,6 @@ void gr_read_host(const float* src, const Bytes& norm, const Bytes& down, const 
     for (int c = 0; c < hc; ++c) host_inject[(size_t) c] = bf16_dot(act.data(), inj_w + (size_t) c * hc_dim, hc_dim);
 }
 
-// The four hyper-connection tensors of one half of a layer ("attn" or "ffn").
-struct HcPlanes {
-    Bytes down, up, inj, norm;
-};
-
-HcPlanes load_hc(const ModelTensors& m, int L, const char* half) {
-    const std::string h = std::string("hc_") + half;
-    return HcPlanes{load_tensor(m, m.at(L, h + "_down.weight")), load_tensor(m, m.at(L, h + "_up.weight")),
-                    load_tensor(m, m.at(L, h + "_inject.weight")), load_tensor(m, m.at(L, h + "_norm.weight"))};
-}
-
 // ---- GDN step: the attention half of a GDN layer -------------------------------------------------------------
 
 void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core::ModelGeometry& g,
@@ -8011,68 +7994,35 @@ void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core
     std::string flip_detail = "bytes";
     if (bytes) {
         try {
-            Bytes qkv = load_tensor(m, *qkv_t);
-            Bytes gate = load_tensor(m, *gate_t);
-            Bytes ssm = load_tensor(m, *ssm_t);
-            Bytes conv_w = load_tensor(m, m.at(L, "ssm_conv1d.weight"));
-            Bytes alpha_w = load_tensor(m, m.at(L, "ssm_alpha.weight"));
-            Bytes beta_w = load_tensor(m, m.at(L, "ssm_beta.weight"));
-            Bytes ssm_a = load_tensor(m, m.at(L, "ssm_a"));
-            Bytes dt_w = load_tensor(m, m.at(L, "ssm_dt.bias"));
-            Bytes ssm_norm = load_tensor(m, m.at(L, "ssm_norm.weight"));
-            HcPlanes hcp = load_hc(m, L, "attn");
-            GdnIqWeights w;
-            w.qkv = GdnIqPlane{qkv_ty, &qkv};
-            w.attn_gate = GdnIqPlane{gate_ty, &gate};
-            w.ssm_out = GdnIqPlane{ssm_ty, &ssm};
-            w.alpha = &alpha_w;
-            w.beta = &beta_w;
-            w.conv = &conv_w;
-            w.ssm_norm = &ssm_norm;
-            w.dt = &dt_w;
-            w.ssm_a = &ssm_a;
-            const GrShapes gs{n_embd, hc, hc_lr};
+            GdnExec gdn = GdnExec::load(m, L, g);
             const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
             const int state_n = (int) lg.S * (int) lg.h_v * (int) lg.S;
             const int conv_n = (int) g.ssm_conv_channels * (int) (lg.d_conv - 1);
             const int guard = 1;
             const int guard_n = hc_dim + guard;
-            Bytes state((uint64_t) state_n * 4), conv((uint64_t) conv_n * 4);
-            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4), gdn_y((uint64_t) n_embd * 4);
             Bytes out((uint64_t) guard_n * 4), out2((uint64_t) guard_n * 4), outz((uint64_t) guard_n * 4);
             Bytes outf((uint64_t) guard_n * 4);
             Bytes R((uint64_t) hc_dim * 4), zero_r((uint64_t) hc_dim * 4);
             std::memcpy(R.data(), in.data(), (size_t) hc_dim * 4);
             std::memset(zero_r.data(), 0, (size_t) zero_r.size());
-            GrScratch gr = make_gr_scratch(gs);
-            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
-            auto step = [&](const Bytes& residual, Bytes& y) {
-                std::memset(state.data(), 0, (size_t) state.size());
-                std::memset(conv.data(), 0, (size_t) conv.size());
-                std::fill_n(static_cast<float*>(gdn_y.data()), (size_t) n_embd, 7.f);
-                std::fill_n(static_cast<float*>(y.data()), (size_t) guard_n, 7.f);
-                GdnLayerState st{&state, &conv};
-                gr_read(gs, residual, hcp.norm, hcp.down, hcp.up, &hcp.inj, 1e-6f, false, gr, mixed, inject);
-                gdn_layer_iq(lg, w, st, sc, mixed, gdn_y);
-                gr_write(gs, residual, gdn_y, inject, y);
-            };
-            step(R, out);
+            gdn.run(R, out, true);
             out_res.assign(static_cast<const float*>(out.data()), static_cast<const float*>(out.data()) + hc_dim);
             std::vector<float> gpu_state((size_t) state_n), gpu_conv((size_t) conv_n), gpu_mixed((size_t) n_embd);
             std::vector<float> gpu_block((size_t) n_embd), gpu_inj((size_t) hc);
-            std::memcpy(gpu_state.data(), state.data(), (size_t) state_n * 4);
-            std::memcpy(gpu_conv.data(), conv.data(), (size_t) conv_n * 4);
-            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4);
-            std::memcpy(gpu_block.data(), gdn_y.data(), (size_t) n_embd * 4);
-            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4);
+            std::memcpy(gpu_state.data(), gdn.state.data(), (size_t) state_n * 4);
+            std::memcpy(gpu_conv.data(), gdn.conv.data(), (size_t) conv_n * 4);
+            std::memcpy(gpu_mixed.data(), gdn.mixed.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_block.data(), gdn.block.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_inj.data(), gdn.inject.data(), (size_t) hc * 4);
             std::vector<float> host_state((size_t) state_n, 0.f), host_conv((size_t) conv_n, 0.f);
             const std::vector<float> host_block = gdn_iq_host(
-                gpu_mixed.data(), static_cast<const uint8_t*>(qkv.data()), static_cast<const uint8_t*>(gate.data()),
-                static_cast<const uint8_t*>(ssm.data()), static_cast<const uint16_t*>(alpha_w.data()),
-                static_cast<const uint16_t*>(beta_w.data()), static_cast<const float*>(conv_w.data()),
-                static_cast<const float*>(ssm_norm.data()), static_cast<const float*>(dt_w.data()),
-                static_cast<const float*>(ssm_a.data()), n_embd, (int) lg.S, (int) lg.h_k, (int) lg.h_v,
-                (int) lg.d_conv, &host_conv, &host_state, gate_ty, ssm_ty, qkv_ty);
+                gpu_mixed.data(), static_cast<const uint8_t*>(gdn.qkv.data()),
+                static_cast<const uint8_t*>(gdn.gate.data()), static_cast<const uint8_t*>(gdn.ssm.data()),
+                static_cast<const uint16_t*>(gdn.alpha_w.data()), static_cast<const uint16_t*>(gdn.beta_w.data()),
+                static_cast<const float*>(gdn.conv_w.data()), static_cast<const float*>(gdn.ssm_norm.data()),
+                static_cast<const float*>(gdn.dt_w.data()), static_cast<const float*>(gdn.ssm_a.data()), n_embd,
+                (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv, &host_conv, &host_state, gate_ty, ssm_ty,
+                qkv_ty);
             std::vector<float> host_write((size_t) hc_dim);
             const float* Rp = static_cast<const float*>(R.data());
             for (int c = 0; c < hc; ++c) {
@@ -8087,30 +8037,30 @@ void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core
             std::vector<float> zeros_s((size_t) state_n, 0.f), zeros_c((size_t) conv_n, 0.f);
             const int state_moved = differ_floats(gpu_state.data(), zeros_s.data(), state_n);
             const int conv_moved = differ_floats(gpu_conv.data(), zeros_c.data(), conv_n);
-            step(R, out2);
-            step(zero_r, outz);
+            gdn.run(R, out2, true);
+            gdn.run(zero_r, outz, true);
             // Value rows, then key rows, then query rows. A query-row code nibble often dies in the norm, so it
             // is tried only after the value and key candidates.
             const int qk = (int) (lg.S * lg.h_k);
             const Bytes xq = q8_of(gpu_mixed.data(), n_embd);
             const std::vector<uint8_t> xqb = bytes_of(xq);
             std::vector<int64_t> candidates =
-                moving_bytes(qkv_ty, static_cast<const uint8_t*>(qkv.data()), qkv.size(), n_embd, 2 * qk,
+                moving_bytes(qkv_ty, static_cast<const uint8_t*>(gdn.qkv.data()), gdn.qkv.size(), n_embd, 2 * qk,
                              (int64_t) g.ssm_conv_channels - 2 * qk, xqb.data(), 6);
-            const std::vector<int64_t> key_rows =
-                moving_bytes(qkv_ty, static_cast<const uint8_t*>(qkv.data()), qkv.size(), n_embd, qk, qk, xqb.data(), 4);
-            const std::vector<int64_t> query_rows =
-                moving_bytes(qkv_ty, static_cast<const uint8_t*>(qkv.data()), qkv.size(), n_embd, 0, qk, xqb.data(), 4);
+            const std::vector<int64_t> key_rows = moving_bytes(qkv_ty, static_cast<const uint8_t*>(gdn.qkv.data()),
+                                                               gdn.qkv.size(), n_embd, qk, qk, xqb.data(), 4);
+            const std::vector<int64_t> query_rows = moving_bytes(qkv_ty, static_cast<const uint8_t*>(gdn.qkv.data()),
+                                                                 gdn.qkv.size(), n_embd, 0, qk, xqb.data(), 4);
             candidates.insert(candidates.end(), key_rows.begin(), key_rows.end());
             candidates.insert(candidates.end(), query_rows.begin(), query_rows.end());
             int64_t flip_at = -1;
             int flip_n = 0;
-            Bytes flipped((uint64_t) qkv.size());
+            Bytes flipped(gdn.qkv.size());
             for (int64_t local : candidates) {
-                std::memcpy(flipped.data(), qkv.data(), qkv.size());
+                std::memcpy(flipped.data(), gdn.qkv.data(), (size_t) gdn.qkv.size());
                 static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
-                w.qkv = GdnIqPlane{qkv_ty, &flipped};
-                step(R, outf);
+                gdn.set_qkv(&flipped);
+                gdn.run(R, outf, true);
                 if (!all_finite(static_cast<const float*>(outf.data()), hc_dim)) {
                     std::fill_n(static_cast<float*>(outf.data()), (size_t) (hc_dim + 1), 7.f);
                     continue;
@@ -8122,7 +8072,7 @@ void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core
                     break;
                 }
             }
-            w.qkv = GdnIqPlane{qkv_ty, &qkv};
+            gdn.set_qkv(nullptr);
             const float* op = static_cast<const float*>(out.data());
             const float* o2 = static_cast<const float*>(out2.data());
             const float* oz = static_cast<const float*>(outz.data());
@@ -8221,13 +8171,6 @@ void walk_attn_products(const ModelTensors& m, int L) {
                   attn_out_in, n_embd);
 }
 
-// Everything one QSA layer's attention half reads, loaded once.
-struct QsaLoaded {
-    int q_ty, k_ty, v_ty, o_ty;
-    Bytes q, k, v, o, q_norm, k_norm, idx_q_norm, idx_k_norm, idx_q, idx_k;
-    HcPlanes hc;
-};
-
 const strata::kernels::QsaShapes& qsa_shapes_checked() {
     static const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
     if (sh.n_head != 24 || sh.n_head_kv != 2 || sh.head_dim != 256 || sh.n_rot != 64 || sh.idx_n_head != 4 ||
@@ -8244,29 +8187,6 @@ bool qsa_planes_ok(const ModelTensors& m, int L, int n_embd) {
            plane_is(m.find(L, "attn_output.weight"), attn_in, n_embd);
 }
 
-QsaLoaded load_qsa(const ModelTensors& m, int L) {
-    const LayerTensor& q = m.at(L, "attn_q.weight");
-    const LayerTensor& k = m.at(L, "attn_k.weight");
-    const LayerTensor& v = m.at(L, "attn_v.weight");
-    const LayerTensor& o = m.at(L, "attn_output.weight");
-    // Bytes has no empty state, so every member is built in the order the struct declares it.
-    return QsaLoaded{q.type,
-                     k.type,
-                     v.type,
-                     o.type,
-                     load_tensor(m, q),
-                     load_tensor(m, k),
-                     load_tensor(m, v),
-                     load_tensor(m, o),
-                     load_tensor(m, m.at(L, "attn_q_norm.weight")),
-                     load_tensor(m, m.at(L, "attn_k_norm.weight")),
-                     load_tensor(m, m.at(L, "indexer.q_norm.weight")),
-                     load_tensor(m, m.at(L, "indexer.k_norm.weight")),
-                     load_tensor(m, m.at(L, "indexer.q_proj.weight")),
-                     load_tensor(m, m.at(L, "indexer.k_proj.weight")),
-                     load_hc(m, L, "attn")};
-}
-
 std::string qsa_types(const ModelTensors& m, int L) {
     auto t = [&](const char* s) {
         const LayerTensor* p = m.find(L, s);
@@ -8277,10 +8197,10 @@ std::string qsa_types(const ModelTensors& m, int L) {
 }
 
 // Value-plane bytes whose flip changes a value row's fp16 product, for the flip checks.
-std::vector<int64_t> value_flips(const QsaLoaded& x, const float* mixed, int n_embd) {
+std::vector<int64_t> value_flips(int v_ty, const Bytes& v, const float* mixed, int n_embd) {
     const Bytes xq = q8_of(mixed, n_embd);
     const std::vector<uint8_t> xqb = bytes_of(xq);
-    return moving_bytes(x.v_ty, static_cast<const uint8_t*>(x.v.data()), x.v.size(), n_embd, 0, 64, xqb.data(), 8);
+    return moving_bytes(v_ty, static_cast<const uint8_t*>(v.data()), v.size(), n_embd, 0, 64, xqb.data(), 8);
 }
 
 void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata::core::ModelGeometry& g,
@@ -8301,45 +8221,8 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
     std::string flip_detail = "bytes";
     if (bytes) {
         try {
-            QsaLoaded x = load_qsa(m, L);
-            const int pairs = (int) sh.n_rot / 2;
-            const int table_rows = 2;
-            std::vector<float> cos_h((size_t) table_rows * (size_t) pairs), sin_h(cos_h.size());
-            build_rope_table((int) sh.n_rot, strata::kernels::qsa_freq_base(), table_rows, cos_h.data(), sin_h.data());
-            Bytes b_cos((uint64_t) cos_h.size() * 4u), b_sin((uint64_t) sin_h.size() * 4u);
-            std::memcpy(b_cos.data(), cos_h.data(), b_cos.size());
-            std::memcpy(b_sin.data(), sin_h.data(), b_sin.size());
-            int page = 0;
-            Bytes b_table(4);
-            std::memcpy(b_table.data(), &page, 4);
-            const size_t pool_n = (size_t) sh.n_head_kv * (size_t) sh.page_size * (size_t) sh.head_dim;
-            Bytes k_pool(pool_n * 2u), v_pool(pool_n * 2u);
-            Bytes idx_tail((size_t) (sh.idx_block - 1) * (size_t) sh.idx_dim * 4u);
-            Bytes idx_dead((size_t) sh.idx_dim * 4u);
-            Bytes idx_pooled((size_t) sh.idx_dim * 4u);
-            Bytes idx_bpos(4);
-            QsaLayerGeom lg;
-            lg.n_embd = n_embd;
-            lg.max_cells = 2;
-            lg.qsa = sh;
-            QsaIqWeights w;
-            w.k = QsaIqPlane{x.k_ty, &x.k};
-            w.v = QsaIqPlane{x.v_ty, &x.v};
-            w.q = QsaIqPlane{x.q_ty, &x.q};
-            w.out = QsaIqPlane{x.o_ty, &x.o};
-            w.idx_k = &x.idx_k;
-            w.idx_q = &x.idx_q;
-            w.k_norm = &x.k_norm;
-            w.q_norm = &x.q_norm;
-            w.idx_k_norm = &x.idx_k_norm;
-            w.idx_q_norm = &x.idx_q_norm;
-            w.cos_tab = &b_cos;
-            w.sin_tab = &b_sin;
-            const GrShapes gs{n_embd, hc, hc_lr};
-            GrScratch gr = make_gr_scratch(gs);
-            QsaLayerScratch sc = make_qsa_layer_scratch(lg);
+            QsaExec qsa = QsaExec::load(m, L, g, 2, 2);
             const int guard = 1;
-            Bytes mixed((uint64_t) n_embd * 4u), inject((uint64_t) hc * 4u);
             Bytes y0((uint64_t) (n_embd + guard) * 4u), y1((uint64_t) (n_embd + guard) * 4u);
             Bytes y0b((uint64_t) (n_embd + guard) * 4u), y1b((uint64_t) (n_embd + guard) * 4u);
             Bytes y0z((uint64_t) (n_embd + guard) * 4u), y1z((uint64_t) (n_embd + guard) * 4u);
@@ -8350,52 +8233,36 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
             const int q_n = (int) sh.n_head * (int) sh.head_dim;
             std::vector<float> gpu_g0, gpu_g1;
             auto take_gate = [&](std::vector<float>& dst) {
-                if (q_n != 24 * 256 || sc.gated.size() != (uint64_t) q_n * 4u)
+                if (q_n != 24 * 256 || qsa.scratch.gated.size() != (uint64_t) q_n * 4u)
                     throw MetalError("qsa gated vector has the wrong length");
                 dst.resize((size_t) q_n);
-                std::memcpy(dst.data(), sc.gated.data(), (size_t) q_n * 4u);
+                std::memcpy(dst.data(), qsa.scratch.gated.data(), (size_t) q_n * 4u);
             };
             auto run_two = [&](const Bytes& residual, Bytes& out0, Bytes& out1, bool keep_gate) {
-                std::memset(k_pool.data(), 0, (size_t) k_pool.size());
-                std::memset(v_pool.data(), 0, (size_t) v_pool.size());
-                std::memset(idx_tail.data(), 0, (size_t) idx_tail.size());
-                std::memset(idx_dead.data(), 0, (size_t) idx_dead.size());
-                std::memset(idx_pooled.data(), 0, (size_t) idx_pooled.size());
-                std::memset(idx_bpos.data(), 0, (size_t) idx_bpos.size());
-                std::fill_n(static_cast<float*>(mixed.data()), (size_t) n_embd, 7.f);
-                std::fill_n(static_cast<float*>(out0.data()), (size_t) (n_embd + guard), 7.f);
-                std::fill_n(static_cast<float*>(out1.data()), (size_t) (n_embd + guard), 7.f);
-                QsaLayerState st;
-                st.k_pool = &k_pool;
-                st.v_pool = &v_pool;
-                st.page_table = &b_table;
-                st.idx_tail = &idx_tail;
-                st.idx_dead = &idx_dead;
-                st.idx_pooled = &idx_pooled;
-                st.idx_block_pos = &idx_bpos;
-                gr_read(gs, residual, x.hc.norm, x.hc.down, x.hc.up, &x.hc.inj, 1e-6f, false, gr, mixed, inject);
-                qsa_layer_iq(lg, w, st, sc, 0, 0, mixed, out0);
+                qsa.begin(residual, true);
+                qsa.block_at(0, 0, out0);
                 if (keep_gate) take_gate(gpu_g0);
-                qsa_layer_iq(lg, w, st, sc, 1, 0, mixed, out1);
+                qsa.block_at(1, 0, out1);
                 if (keep_gate) take_gate(gpu_g1);
             };
             run_two(R, y0, y1, true);
             std::vector<float> gpu_mixed((size_t) n_embd), gpu_inj((size_t) hc), gpu_k((size_t) kv_out);
-            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4u);
-            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4u);
-            std::memcpy(gpu_k.data(), sc.kcur.data(), (size_t) kv_out * 4u);
-            const int* idp = static_cast<const int*>(sc.ids.data());
+            std::memcpy(gpu_mixed.data(), qsa.mixed.data(), (size_t) n_embd * 4u);
+            std::memcpy(gpu_inj.data(), qsa.inject.data(), (size_t) hc * 4u);
+            std::memcpy(gpu_k.data(), qsa.scratch.kcur.data(), (size_t) kv_out * 4u);
+            const int* idp = static_cast<const int*>(qsa.scratch.ids.data());
             const bool ids_ok = idp[0] == 0 && idp[1] == 1;
-            const QsaHost host = qsa_iq_host(gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(x.q.data()),
-                                             static_cast<const uint8_t*>(x.k.data()),
-                                             static_cast<const uint8_t*>(x.v.data()),
-                                             static_cast<const uint8_t*>(x.o.data()),
-                                             static_cast<const float*>(x.q_norm.data()),
-                                             static_cast<const float*>(x.k_norm.data()), cos_h.data(), sin_h.data(),
-                                             x.k_ty, x.v_ty, x.q_ty, x.o_ty, gpu_g0.data(), gpu_g1.data());
+            const float* cos_h = static_cast<const float*>(qsa.cos_tab.data());
+            const float* sin_h = static_cast<const float*>(qsa.sin_tab.data());
+            const QsaHost host = qsa_iq_host(
+                gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(qsa.q.data()),
+                static_cast<const uint8_t*>(qsa.k.data()), static_cast<const uint8_t*>(qsa.v.data()),
+                static_cast<const uint8_t*>(qsa.o.data()), static_cast<const float*>(qsa.q_norm.data()),
+                static_cast<const float*>(qsa.k_norm.data()), cos_h, sin_h, qsa.k_ty, qsa.v_ty, qsa.q_ty, qsa.o_ty,
+                gpu_g0.data(), gpu_g1.data());
             std::vector<float> host_mixed, host_inject;
-            gr_read_host(static_cast<const float*>(R.data()), x.hc.norm, x.hc.down, x.hc.up, x.hc.inj, n_embd, hc, hc_lr,
-                         host_mixed, host_inject);
+            gr_read_host(static_cast<const float*>(R.data()), qsa.hc_norm, qsa.hc_down, qsa.hc_up, qsa.hc_inj, n_embd,
+                         hc, hc_lr, host_mixed, host_inject);
             const double read_rel = rel_l1(host_mixed.data(), gpu_mixed.data(), n_embd);
             const double inject_rel = rel_l1(host_inject.data(), gpu_inj.data(), hc);
             const double block_rel = rel_l1(host.y0.data(), static_cast<const float*>(y0.data()), n_embd);
@@ -8403,14 +8270,14 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
             const double key_rel = rel_l1(host.k1.data(), gpu_k.data(), kv_out);
             run_two(R, y0b, y1b, false);
             run_two(zero_r, y0z, y1z, false);
-            const std::vector<int64_t> tries = value_flips(x, gpu_mixed.data(), n_embd);
+            const std::vector<int64_t> tries = value_flips(qsa.v_ty, qsa.v, gpu_mixed.data(), n_embd);
             int64_t flip_at = -1;
             int flip_n = 0;
-            Bytes flipped(x.v.size());
+            Bytes flipped(qsa.v.size());
             for (int64_t local : tries) {
-                std::memcpy(flipped.data(), x.v.data(), (size_t) x.v.size());
+                std::memcpy(flipped.data(), qsa.v.data(), (size_t) qsa.v.size());
                 static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
-                w.v = QsaIqPlane{x.v_ty, &flipped};
+                qsa.set_v(&flipped);
                 run_two(R, y0f, y1f, false);
                 const int n0 = differ_floats(static_cast<const float*>(y0.data()), static_cast<const float*>(y0f.data()),
                                              n_embd);
@@ -8422,7 +8289,7 @@ void walk_qsa_block(const ModelTensors& m, int L, const char* from, const strata
                     break;
                 }
             }
-            w.v = QsaIqPlane{x.v_ty, &x.v};
+            qsa.set_v(nullptr);
             const float* a0 = static_cast<const float*>(y0.data());
             const float* a1 = static_cast<const float*>(y1.data());
             const float* b0 = static_cast<const float*>(y0b.data());
@@ -8488,80 +8355,23 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
     std::string flip_detail = "bytes";
     if (bytes) {
         try {
-            QsaLoaded x = load_qsa(m, L);
-            const int pairs = (int) sh.n_rot / 2;
-            std::vector<float> cos_h((size_t) pairs), sin_h(cos_h.size());
-            build_rope_table((int) sh.n_rot, strata::kernels::qsa_freq_base(), 1, cos_h.data(), sin_h.data());
-            Bytes b_cos((uint64_t) cos_h.size() * 4u), b_sin((uint64_t) sin_h.size() * 4u);
-            std::memcpy(b_cos.data(), cos_h.data(), b_cos.size());
-            std::memcpy(b_sin.data(), sin_h.data(), b_sin.size());
-            int page = 0;
-            Bytes b_table(4);
-            std::memcpy(b_table.data(), &page, 4);
-            const size_t pool_n = (size_t) sh.n_head_kv * (size_t) sh.page_size * (size_t) sh.head_dim;
-            Bytes k_pool(pool_n * 2u), v_pool(pool_n * 2u);
-            Bytes idx_tail((size_t) (sh.idx_block - 1) * (size_t) sh.idx_dim * 4u);
-            Bytes idx_dead((size_t) sh.idx_dim * 4u);
-            Bytes idx_pooled((size_t) sh.idx_dim * 4u);
-            Bytes idx_bpos(4);
-            QsaLayerGeom lg;
-            lg.n_embd = n_embd;
-            lg.max_cells = 1;
-            lg.qsa = sh;
-            QsaIqWeights w;
-            w.k = QsaIqPlane{x.k_ty, &x.k};
-            w.v = QsaIqPlane{x.v_ty, &x.v};
-            w.q = QsaIqPlane{x.q_ty, &x.q};
-            w.out = QsaIqPlane{x.o_ty, &x.o};
-            w.idx_k = &x.idx_k;
-            w.idx_q = &x.idx_q;
-            w.k_norm = &x.k_norm;
-            w.q_norm = &x.q_norm;
-            w.idx_k_norm = &x.idx_k_norm;
-            w.idx_q_norm = &x.idx_q_norm;
-            w.cos_tab = &b_cos;
-            w.sin_tab = &b_sin;
-            const GrShapes gs{n_embd, hc, hc_lr};
-            GrScratch gr = make_gr_scratch(gs);
-            QsaLayerScratch sc = make_qsa_layer_scratch(lg);
+            QsaExec qsa = QsaExec::load(m, L, g, 1, 1);
             const int guard = 1;
-            Bytes mixed((uint64_t) n_embd * 4u), inject((uint64_t) hc * 4u), block((uint64_t) n_embd * 4u);
             Bytes out((uint64_t) (hc_dim + guard) * 4u), out2((uint64_t) (hc_dim + guard) * 4u);
             Bytes outz((uint64_t) (hc_dim + guard) * 4u), outf((uint64_t) (hc_dim + guard) * 4u);
             Bytes R((uint64_t) hc_dim * 4u), zero_r((uint64_t) hc_dim * 4u);
             std::memcpy(R.data(), in.data(), (size_t) hc_dim * 4u);
             std::memset(zero_r.data(), 0, (size_t) zero_r.size());
-            auto step = [&](const Bytes& residual, Bytes& y) {
-                std::memset(k_pool.data(), 0, (size_t) k_pool.size());
-                std::memset(v_pool.data(), 0, (size_t) v_pool.size());
-                std::memset(idx_tail.data(), 0, (size_t) idx_tail.size());
-                std::memset(idx_dead.data(), 0, (size_t) idx_dead.size());
-                std::memset(idx_pooled.data(), 0, (size_t) idx_pooled.size());
-                std::memset(idx_bpos.data(), 0, (size_t) idx_bpos.size());
-                std::fill_n(static_cast<float*>(mixed.data()), (size_t) n_embd, 7.f);
-                std::fill_n(static_cast<float*>(block.data()), (size_t) n_embd, 7.f);
-                std::fill_n(static_cast<float*>(y.data()), (size_t) (hc_dim + guard), 7.f);
-                QsaLayerState st;
-                st.k_pool = &k_pool;
-                st.v_pool = &v_pool;
-                st.page_table = &b_table;
-                st.idx_tail = &idx_tail;
-                st.idx_dead = &idx_dead;
-                st.idx_pooled = &idx_pooled;
-                st.idx_block_pos = &idx_bpos;
-                gr_read(gs, residual, x.hc.norm, x.hc.down, x.hc.up, &x.hc.inj, 1e-6f, false, gr, mixed, inject);
-                qsa_layer_iq(lg, w, st, sc, 0, 0, mixed, block);
-                gr_write(gs, residual, block, inject, y);
-            };
+            auto step = [&](const Bytes& residual, Bytes& y) { qsa.attend_write(residual, y, true); };
             step(R, out);
             out_res.assign(static_cast<const float*>(out.data()), static_cast<const float*>(out.data()) + hc_dim);
             std::vector<float> gpu_mixed((size_t) n_embd), gpu_inj((size_t) hc), gpu_block((size_t) n_embd);
-            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4u);
-            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4u);
-            std::memcpy(gpu_block.data(), block.data(), (size_t) n_embd * 4u);
+            std::memcpy(gpu_mixed.data(), qsa.mixed.data(), (size_t) n_embd * 4u);
+            std::memcpy(gpu_inj.data(), qsa.inject.data(), (size_t) hc * 4u);
+            std::memcpy(gpu_block.data(), qsa.block.data(), (size_t) n_embd * 4u);
             std::vector<float> host_mixed, host_inject;
-            gr_read_host(static_cast<const float*>(R.data()), x.hc.norm, x.hc.down, x.hc.up, x.hc.inj, n_embd, hc, hc_lr,
-                         host_mixed, host_inject);
+            gr_read_host(static_cast<const float*>(R.data()), qsa.hc_norm, qsa.hc_down, qsa.hc_up, qsa.hc_inj, n_embd,
+                         hc, hc_lr, host_mixed, host_inject);
             std::vector<float> host_write((size_t) hc_dim);
             const float* Rp = static_cast<const float*>(R.data());
             for (int c = 0; c < hc; ++c) {
@@ -8575,30 +8385,30 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
             // Position 0's gate, before the repeat step overwrites the scratch. The projection is checked
             // from it at the block bound and is not printed, so the write line stays the residual write.
             const int q_n = (int) sh.n_head * (int) sh.head_dim;
-            if (q_n != 24 * 256 || sc.gated.size() != (uint64_t) q_n * 4u)
+            if (q_n != 24 * 256 || qsa.scratch.gated.size() != (uint64_t) q_n * 4u)
                 throw MetalError("qsa gated vector has the wrong length");
             std::vector<float> gpu_gated((size_t) q_n);
-            std::memcpy(gpu_gated.data(), sc.gated.data(), (size_t) q_n * 4u);
+            std::memcpy(gpu_gated.data(), qsa.scratch.gated.data(), (size_t) q_n * 4u);
+            const int pairs = (int) sh.n_rot / 2;
             std::vector<float> cos2((size_t) 2 * (size_t) pairs), sin2(cos2.size());
             build_rope_table((int) sh.n_rot, strata::kernels::qsa_freq_base(), 2, cos2.data(), sin2.data());
-            const QsaHost host = qsa_iq_host(gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(x.q.data()),
-                                             static_cast<const uint8_t*>(x.k.data()),
-                                             static_cast<const uint8_t*>(x.v.data()),
-                                             static_cast<const uint8_t*>(x.o.data()),
-                                             static_cast<const float*>(x.q_norm.data()),
-                                             static_cast<const float*>(x.k_norm.data()), cos2.data(), sin2.data(),
-                                             x.k_ty, x.v_ty, x.q_ty, x.o_ty, gpu_gated.data(), nullptr);
+            const QsaHost host = qsa_iq_host(
+                gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(qsa.q.data()),
+                static_cast<const uint8_t*>(qsa.k.data()), static_cast<const uint8_t*>(qsa.v.data()),
+                static_cast<const uint8_t*>(qsa.o.data()), static_cast<const float*>(qsa.q_norm.data()),
+                static_cast<const float*>(qsa.k_norm.data()), cos2.data(), sin2.data(), qsa.k_ty, qsa.v_ty, qsa.q_ty,
+                qsa.o_ty, gpu_gated.data(), nullptr);
             const double proj_rel = rel_l1(host.y0.data(), gpu_block.data(), n_embd);
             step(R, out2);
             step(zero_r, outz);
-            const std::vector<int64_t> candidates = value_flips(x, gpu_mixed.data(), n_embd);
+            const std::vector<int64_t> candidates = value_flips(qsa.v_ty, qsa.v, gpu_mixed.data(), n_embd);
             int64_t flip_at = -1;
             int flip_n = 0;
-            Bytes flipped(x.v.size());
+            Bytes flipped(qsa.v.size());
             for (int64_t local : candidates) {
-                std::memcpy(flipped.data(), x.v.data(), (size_t) x.v.size());
+                std::memcpy(flipped.data(), qsa.v.data(), (size_t) qsa.v.size());
                 static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
-                w.v = QsaIqPlane{x.v_ty, &flipped};
+                qsa.set_v(&flipped);
                 step(R, outf);
                 flip_n = differ_floats(static_cast<const float*>(out.data()), static_cast<const float*>(outf.data()),
                                        hc_dim);
@@ -8607,7 +8417,7 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
                     break;
                 }
             }
-            w.v = QsaIqPlane{x.v_ty, &x.v};
+            qsa.set_v(nullptr);
             const float* op = static_cast<const float*>(out.data());
             const float* o2 = static_cast<const float*>(out2.data());
             const float* oz = static_cast<const float*>(outz.data());
@@ -8655,29 +8465,6 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
 // `with_shared` true is what run_layerN_shared checked, and it is the pass that writes the residual the next layer
 // reads. Both run the result through the output head, so a wrong layer shows up in the logits too.
 
-struct ExpertPlanes {
-    const LayerTensor* gate = nullptr;
-    const LayerTensor* up = nullptr;
-    const LayerTensor* down = nullptr;
-    uint64_t gate_n = 0, up_n = 0, down_n = 0;  // one expert's bytes in each
-};
-
-ExpertPlanes expert_planes(const ModelTensors& m, int L, int n_embd, int n_ff, int n_expert) {
-    ExpertPlanes e;
-    e.gate = m.find(L, "ffn_gate_exps.weight");
-    e.up = m.find(L, "ffn_up_exps.weight");
-    e.down = m.find(L, "ffn_down_exps.weight");
-    if (e.gate && e.up && e.down && n_expert > 0) {
-        e.gate_n = row_bytes_or_0(e.gate->type, n_embd) * (uint64_t) n_ff;
-        e.up_n = row_bytes_or_0(e.up->type, n_embd) * (uint64_t) n_ff;
-        e.down_n = row_bytes_or_0(e.down->type, n_ff) * (uint64_t) n_embd;
-        if (e.gate->bytes != e.gate_n * (uint64_t) n_expert || e.up->bytes != e.up_n * (uint64_t) n_expert ||
-            e.down->bytes != e.down_n * (uint64_t) n_expert || e.gate_n == 0 || e.up_n == 0 || e.down_n == 0)
-            e.gate_n = e.up_n = e.down_n = 0;
-    }
-    return e;
-}
-
 void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata::core::ModelGeometry& g,
               const std::vector<float>& in, bool with_shared, std::vector<float>& out_res) {
     out_res.clear();
@@ -8689,7 +8476,7 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
     const int hc_dim = hc * n_embd;
     const int n_vocab = 248320;
     const int k = 10;
-    const ExpertPlanes ex = expert_planes(m, L, n_embd, n_ff, n_expert);
+    const ExpertSpans ex = expert_spans(m, L, n_embd, n_ff, n_expert);
     const LayerTensor* sg_t = m.find(L, "ffn_gate_shexp.weight");
     const LayerTensor* su_t = m.find(L, "ffn_up_shexp.weight");
     const LayerTensor* sd_t = m.find(L, "ffn_down_shexp.weight");
@@ -8746,13 +8533,24 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
     std::string drop_detail = "bytes";
     if (bytes) {
         try {
-            HcPlanes hcp = load_hc(m, L, "ffn");
-            Bytes router = load_tensor(m, m.at(L, "ffn_gate_inp.weight"));
-            // The routed-only pass does not load the shared planes; a 4-byte stand-in keeps the names valid.
-            Bytes ginp = with_shared ? load_tensor(m, m.at(L, "ffn_gate_inp_shexp.weight")) : Bytes(4);
-            Bytes sgate = with_shared ? load_tensor(m, *sg_t) : Bytes(4);
-            Bytes sup = with_shared ? load_tensor(m, *su_t) : Bytes(4);
-            Bytes sdown = with_shared ? load_tensor(m, *sd_t) : Bytes(4);
+            FfnExec ffn = FfnExec::load(m, L, g, with_shared);
+            Bytes& router = ffn.router;
+            Bytes& ginp = ffn.ginp;
+            Bytes& sgate = ffn.sgate;
+            Bytes& sup = ffn.sup;
+            Bytes& sdown = ffn.sdown;
+            Bytes& combined = ffn.combined;
+            Bytes& shared_y = ffn.shared_y;
+            Bytes& ids = ffn.ids;
+            Bytes& route_w = ffn.route_w;
+            GrScratch& gr = ffn.gr;
+            struct HcRef {
+                Bytes& down;
+                Bytes& up;
+                Bytes& inj;
+                Bytes& norm;
+            };
+            HcRef hcp{ffn.hc_down, ffn.hc_up, ffn.hc_inj, ffn.hc_norm};
             const GrShapes gs{n_embd, hc, hc_lr};
             const int guard = 1;
             const int guard_n = hc_dim + guard;
@@ -8764,144 +8562,9 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
             Bytes layer_y((uint64_t) guard_n * 4), layer_y2((uint64_t) guard_n * 4);
             Bytes layer_yz((uint64_t) guard_n * 4), layer_yf((uint64_t) guard_n * 4);
             Bytes layer_drop((uint64_t) guard_n * 4);
-            Bytes expert_y((uint64_t) (n_embd + guard) * 4);
-            Bytes shared_y((uint64_t) (n_embd + guard) * 4), combined((uint64_t) (n_embd + guard) * 4);
-            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4);
-            Bytes x_bf16((uint64_t) n_embd * 2), route((uint64_t) n_expert * 4);
-            Bytes exq(iq_q8_1_bytes(n_embd)), egate_y((uint64_t) n_ff * 4), eup_y((uint64_t) n_ff * 4);
-            Bytes ehq(iq_q8_1_bytes(n_ff));
-            Bytes sh_xq(iq_q8_1_bytes(n_embd)), sh_gate_y((uint64_t) n_ff * 4), sh_up_y((uint64_t) n_ff * 4);
-            Bytes sh_hq(iq_q8_1_bytes(n_ff)), sh_down_y((uint64_t) (n_embd + guard) * 4), sh_scalar(4);
-            Bytes parts((uint64_t) k * (uint64_t) n_embd * 4);
-            Bytes ids((uint64_t) (k + guard) * 4), route_w((uint64_t) (k + guard) * 4);
-            struct SeN {
-                int n;
-                int pad0;
-                int pad1;
-                int pad2;
-            };
-            static_assert(sizeof(SeN) == 16, "SeN must match the shader");
-            GrScratch gr = make_gr_scratch(gs);
-            const uint64_t blob_n = ex.gate_n + ex.up_n + ex.down_n;
-            auto load_expert = [&](int id, std::vector<uint8_t>& dst) {
-                if (id < 0 || id >= n_expert) throw MetalError("routed expert id is outside the pool");
-                dst.resize((size_t) blob_n);
-                const auto gate_b = m.read(*ex.gate, (uint64_t) id * ex.gate_n, ex.gate_n);
-                const auto up_b = m.read(*ex.up, (uint64_t) id * ex.up_n, ex.up_n);
-                const auto down_b = m.read(*ex.down, (uint64_t) id * ex.down_n, ex.down_n);
-                std::memcpy(dst.data(), gate_b.data(), (size_t) ex.gate_n);
-                std::memcpy(dst.data() + ex.gate_n, up_b.data(), (size_t) ex.up_n);
-                std::memcpy(dst.data() + ex.gate_n + ex.up_n, down_b.data(), (size_t) ex.down_n);
-            };
-            struct Snap {
-                std::vector<float> mixed, inject, residual, shared, combined, layer;
-                std::vector<float> sgate, sup, sdown, route;
-                std::vector<uint8_t> exq, sh_xq, sh_hq;
-                float scale = 0;
-                std::vector<int> ids;
-                std::vector<float> route_w;
-                std::vector<std::vector<float>> egate, eup, edown;
-                std::vector<std::vector<uint8_t>> ehq, blob;
-            };
-            auto shared_forward = [&](Bytes& out) {
-                iq_quantize_q8_1(mixed, n_embd, sh_xq);
-                iq_mmvq(sg_ty, sgate, 0, sh_xq, n_embd, n_ff, 1, sh_gate_y);
-                iq_mmvq(su_ty, sup, 0, sh_xq, n_embd, n_ff, 1, sh_up_y);
-                iq_swiglu_q8(sh_gate_y, sh_up_y, n_ff, sh_hq);
-                iq_mmvq(sd_ty, sdown, 0, sh_hq, n_ff, n_embd, 1, sh_down_y);
-                std::fill_n(static_cast<float*>(out.data()), (size_t) (n_embd + guard), 7.f);
-                std::memcpy(out.data(), sh_down_y.data(), (size_t) n_embd * 4);
-                Bytes x_bf16_s((uint64_t) n_embd * 2);
-                f32_to_bf16_bulk(mixed, x_bf16_s, n_embd);
-                bf16_gemv(x_bf16_s, ginp, sh_scalar, n_embd, 1);
-                const SeN dim{n_embd, 0, 0, 0};
-                const uint32_t groups = (uint32_t) ((n_embd + 255) / 256);
-                const Bytes* scb[] = {&out, &sh_scalar};
-                launch("se_sigmoid_scale", scb, 2, &dim, sizeof dim, Grid{groups, 1, 1, 256, 1, 1});
-            };
-            auto run_pass = [&](const Bytes& residual, Bytes& out, bool add_shared, Snap* snap) {
-                std::fill_n(static_cast<float*>(expert_y.data()), (size_t) (n_embd + guard), 7.f);
-                std::fill_n(static_cast<float*>(combined.data()), (size_t) (n_embd + guard), 7.f);
-                std::fill_n(static_cast<float*>(out.data()), (size_t) guard_n, 7.f);
-                std::fill_n(static_cast<int*>(ids.data()), (size_t) (k + guard), 7);
-                std::fill_n(static_cast<float*>(route_w.data()), (size_t) (k + guard), 7.f);
-                gr_read(gs, residual, hcp.norm, hcp.down, hcp.up, &hcp.inj, 1e-6f, false, gr, mixed, inject);
-                f32_to_bf16_bulk(mixed, x_bf16, n_embd);
-                bf16_gemv(x_bf16, router, route, n_embd, n_expert);
-                router_top10(route, 1, n_expert, k, ids, route_w);
-                iq_quantize_q8_1(mixed, n_embd, exq);
-                const int* idp = static_cast<const int*>(ids.data());
-                if (snap) {
-                    snap->egate.assign((size_t) k, {});
-                    snap->eup.assign((size_t) k, {});
-                    snap->edown.assign((size_t) k, {});
-                    snap->ehq.assign((size_t) k, {});
-                    snap->blob.assign((size_t) k, {});
-                    snap->exq.assign((size_t) exq.size(), 0);
-                    std::memcpy(snap->exq.data(), exq.data(), snap->exq.size());
-                }
-                for (int e = 0; e < k; ++e) {
-                    std::vector<uint8_t> raw;
-                    load_expert(idp[e], raw);
-                    Bytes expert_w((uint64_t) raw.size());
-                    std::memcpy(expert_w.data(), raw.data(), raw.size());
-                    iq_mmvq(eg_ty, expert_w, 0, exq, n_embd, n_ff, 1, egate_y);
-                    iq_mmvq(eu_ty, expert_w, (int64_t) ex.gate_n, exq, n_embd, n_ff, 1, eup_y);
-                    iq_swiglu_q8(egate_y, eup_y, n_ff, ehq);
-                    iq_mmvq(ed_ty, expert_w, (int64_t) (ex.gate_n + ex.up_n), ehq, n_ff, n_embd, 1, expert_y);
-                    std::memcpy(static_cast<float*>(parts.data()) + (size_t) e * n_embd, expert_y.data(),
-                                (size_t) n_embd * 4);
-                    if (snap) {
-                        snap->egate[(size_t) e].resize((size_t) n_ff);
-                        snap->eup[(size_t) e].resize((size_t) n_ff);
-                        snap->edown[(size_t) e].resize((size_t) n_embd);
-                        snap->ehq[(size_t) e].resize(ehq.size());
-                        snap->blob[(size_t) e] = raw;
-                        std::memcpy(snap->egate[(size_t) e].data(), egate_y.data(), (size_t) n_ff * 4);
-                        std::memcpy(snap->eup[(size_t) e].data(), eup_y.data(), (size_t) n_ff * 4);
-                        std::memcpy(snap->edown[(size_t) e].data(), expert_y.data(), (size_t) n_embd * 4);
-                        std::memcpy(snap->ehq[(size_t) e].data(), ehq.data(), ehq.size());
-                    }
-                }
-                if (with_shared) shared_forward(shared_y);
-                moe_combine(parts, route_w, with_shared && add_shared ? &shared_y : nullptr, combined, n_embd, k);
-                gr_write(gs, residual, combined, inject, out);
-                if (snap) {
-                    snap->mixed.resize((size_t) n_embd);
-                    snap->inject.resize((size_t) hc);
-                    snap->residual.resize((size_t) hc_dim);
-                    snap->combined.resize((size_t) n_embd);
-                    snap->layer.resize((size_t) hc_dim);
-                    snap->route.resize((size_t) n_expert);
-                    snap->ids.assign(idp, idp + k);
-                    snap->route_w.resize((size_t) k);
-                    std::memcpy(snap->mixed.data(), mixed.data(), (size_t) n_embd * 4);
-                    std::memcpy(snap->inject.data(), inject.data(), (size_t) hc * 4);
-                    std::memcpy(snap->residual.data(), residual.data(), (size_t) hc_dim * 4);
-                    std::memcpy(snap->combined.data(), combined.data(), (size_t) n_embd * 4);
-                    std::memcpy(snap->layer.data(), out.data(), (size_t) hc_dim * 4);
-                    std::memcpy(snap->route.data(), route.data(), (size_t) n_expert * 4);
-                    std::memcpy(snap->route_w.data(), route_w.data(), (size_t) k * 4);
-                    if (with_shared) {
-                        snap->shared.resize((size_t) n_embd);
-                        snap->sgate.resize((size_t) n_ff);
-                        snap->sup.resize((size_t) n_ff);
-                        snap->sdown.resize((size_t) n_embd);
-                        snap->sh_xq.resize(sh_xq.size());
-                        snap->sh_hq.resize(sh_hq.size());
-                        std::memcpy(snap->shared.data(), shared_y.data(), (size_t) n_embd * 4);
-                        std::memcpy(snap->sgate.data(), sh_gate_y.data(), (size_t) n_ff * 4);
-                        std::memcpy(snap->sup.data(), sh_up_y.data(), (size_t) n_ff * 4);
-                        std::memcpy(snap->sdown.data(), sh_down_y.data(), (size_t) n_embd * 4);
-                        std::memcpy(snap->sh_xq.data(), sh_xq.data(), sh_xq.size());
-                        std::memcpy(snap->sh_hq.data(), sh_hq.data(), sh_hq.size());
-                        snap->scale = static_cast<const float*>(sh_scalar.data())[0];
-                    }
-                }
-            };
+            FfnTrace snap;
+            ffn.run(R, layer_y, true, &snap);
 
-            Snap snap;
-            run_pass(R, layer_y, true, &snap);
             out_res.assign(static_cast<const float*>(layer_y.data()),
                            static_cast<const float*>(layer_y.data()) + hc_dim);
             const bool combine_guard = static_cast<const float*>(combined.data())[n_embd] == 7.f;
@@ -8991,20 +8654,11 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
             fill7(head_inject);
             bool inject_held = true;
             auto mix_read = [&](const Bytes& residual, Bytes& out) {
-                std::fill_n(static_cast<float*>(head_inject.data()), (size_t) (hc + guard), 7.f);
-                std::fill_n(static_cast<float*>(out.data()), (size_t) mix_n, 7.f);
-                gr_read(gs, residual, *head_norm->values, *head_down->values, *head_up->values, nullptr, 1e-6f, false,
-                        gr, out, head_inject);
+                output_mix(gs, gr, residual, *head_norm->values, *head_down->values, *head_up->values, out, head_inject);
                 if (!still_seven(static_cast<const float*>(head_inject.data()), hc + guard)) inject_held = false;
             };
             auto project = [&](const Bytes& mix, Bytes& out) {
-                Bytes actb((uint64_t) n_embd * 4);
-                std::memcpy(actb.data(), mix.data(), actb.size());
-                Bytes q(iq_q8_1_bytes(n_embd));
-                iq_quantize_q8_1(actb, n_embd, q);
-                fill7(out);
-                iq_mmvq(kQ5_K, *head_out->values, 0, q, n_embd, n_vocab, 1, out);
-                return q;
+                return output_project(kQ5_K, *head_out->values, mix, n_embd, n_vocab, out);
             };
             mix_read(layer_y, mix_y);
             const Bytes head_q = project(mix_y, logits);
@@ -9014,13 +8668,13 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
             std::vector<float> host_logits((size_t) n_vocab), scalar_logits((size_t) n_vocab);
             k_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, host_logits.data());
             scalar_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, scalar_logits.data());
-            run_pass(R, layer_y2, true, nullptr);
+            ffn.run(R, layer_y2, true, nullptr);
             mix_read(layer_y2, mix_y2);
             const Bytes head_q2 = project(mix_y2, logits2);
-            run_pass(zero_r, layer_yz, true, nullptr);
+            ffn.run(zero_r, layer_yz, true, nullptr);
             mix_read(layer_yz, mix_yz);
             project(mix_yz, logits_z);
-            if (with_shared) run_pass(R, layer_drop, false, nullptr);
+            if (with_shared) ffn.run(R, layer_drop, false, nullptr);
             else fill7(layer_drop);
 
             const float* layer_p = static_cast<const float*>(layer_y.data());
@@ -9050,7 +8704,7 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
                     std::memcpy(Rf.data(), R.data(), Rf.size());
                     static_cast<uint8_t*>(Rf.data())[local] ^= 1u;
                     if (!all_finite(static_cast<const float*>(Rf.data()), hc_dim)) continue;
-                    run_pass(Rf, layer_yf, true, nullptr);
+                    ffn.run(Rf, layer_yf, true, nullptr);
                     if (!all_finite(static_cast<const float*>(layer_yf.data()), hc_dim)) {
                         std::fill_n(static_cast<float*>(layer_yf.data()), (size_t) guard_n, 7.f);
                         continue;

@@ -94,6 +94,7 @@ add_library(strata_metal_runtime STATIC
   src/kv.mm
   src/rope.mm
   src/qsa_layer.cpp
+  src/layer_exec.cpp
   src/token.cpp
   src/stack.cpp
   src/pack.cpp)
