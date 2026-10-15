@@ -3,7 +3,8 @@
 // for down. Q4_K and Q5_K are the dense gate and the dense output. Q3_K and Q5_0 are the
 // layer-0 shared-expert up and down. Q4_0 is layer 2's shared down: 18 bytes, 32 values,
 // code (nibble - 8) * d. Q6_K is layer 5's shared up: 210 bytes, 256 values, code
-// (6-bit value - 32) * int8 scale * d. A simdgroup of 32 owns one weight row. Lane L adds partials
+// (6-bit value - 32) * int8 scale * d. Q8_0 is layer 14's shared down: 34 bytes, 32 values,
+// code qs[i] * d, with no bias. A simdgroup of 32 owns one weight row. Lane L adds partials
 // L, L+32, L+64, ... and the xor butterfly is the warp sum. q8_1 is 36 bytes: fp16 scale,
 // fp16 sum, 32 int8. This port's sum is the sum of the floats, so Q5_0 and Q4_0 recompute
 // the int8 sum instead of reading that word.
@@ -428,6 +429,18 @@ inline float iq_dot_q6_k(const device uint8_t* blk, const device uint8_t* x0, in
     return iq_f32_from_f16(iq_u16(blk + 208)) * sumf;
 }
 
+// Q8_0 is 34 bytes and 32 values: fp16 d, then 32 int8. The code is qs[i] * d.
+// There is no bias. iqs is 0. One call covers the block, eight signed words of four.
+inline float iq_dot_q8_0(const device uint8_t* blk, const device uint8_t* x0, int iqs) {
+    const device uint8_t* qs = blk + 2;
+    int sumi = 0;
+    for (int j = 0; j < 8; j++) {
+        sumi = iq_dp4a(iq_b2(qs, iqs + j), iq_q8_word(x0, iqs + j), sumi);
+    }
+    float d = iq_f32_from_f16(iq_u16(blk)) * iq_q8_d(x0);
+    return d * (float) sumi;
+}
+
 inline float iq_dot_q2_0(const device uint8_t* blk, const device uint8_t* x0, int iqs) {
     const device uint8_t* qs = blk + 2;
     const device uint8_t* x = x0 + iqs * 36;
@@ -467,6 +480,7 @@ inline void iq_row(const device uint8_t* row, const device uint8_t* col, int n_i
             else if (which == 6) part = iq_dot_q5_0(blk, x0, iqs);
             else if (which == 2) part = iq_dot_q4_0(blk, x0, iqs);
             else if (which == 14) part = iq_dot_q6_k(blk, x0, iqs);
+            else if (which == 8) part = iq_dot_q8_0(blk, x0, iqs);
             else part = iq_dot_q2_0(blk, x0, iqs);
             acc += part;
         }
@@ -492,6 +506,7 @@ inline void iq_mmvq_body(const device uint8_t* w, const device uint8_t* x, devic
         else if (which == 6) iq_row<32, 2, 2, 22>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else if (which == 2) iq_row<32, 2, 2, 18>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else if (which == 14) iq_row<256, 32, 1, 210>(wr, col, dim.n_in, lane, acc, which, g2, g3);
+        else if (which == 8) iq_row<32, 1, 1, 34>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else iq_row<64, 2, 1, 18>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         acc = iq_warp_add(acc);
         if (lane == 0) y[(long) c * dim.n_out + row] = acc;
@@ -571,6 +586,12 @@ kernel void iq_mmvq_q6_k(const device uint8_t* w [[buffer(0)]], const device uin
                          device float* y [[buffer(2)]], constant IqDim& dim [[buffer(3)]],
                          uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
     iq_mmvq_body(w, x, y, dim, lane, row, 14, nullptr, nullptr);
+}
+
+kernel void iq_mmvq_q8_0(const device uint8_t* w [[buffer(0)]], const device uint8_t* x [[buffer(1)]],
+                         device float* y [[buffer(2)]], constant IqDim& dim [[buffer(3)]],
+                         uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    iq_mmvq_body(w, x, y, dim, lane, row, 8, nullptr, nullptr);
 }
 
 kernel void iq_q8_1(const device float* x [[buffer(0)]], device uint8_t* y [[buffer(1)]], constant int& n [[buffer(2)]],

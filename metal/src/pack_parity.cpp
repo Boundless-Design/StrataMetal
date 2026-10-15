@@ -3425,6 +3425,53 @@ void q6_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y
     }
 }
 
+// Q8_0 is 34 bytes and 32 values. Same integer dot as iq_mmvq_q8_0.
+// fp16 d, then 32 int8. The code is qs[i] * d. There is no bias.
+float q80_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const uint8_t* qs = blk + 2;
+    int sumi = 0;
+    for (int j = 0; j < 8; ++j) sumi = q2_dp4a(q2_ld(qs + 4 * (iqs + j)), q2_ld(x0 + 4 + 4 * (iqs + j)), sumi);
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(blk)) *
+                    strata::kernels::f32_from_f16((uint16_t) k_u16(x0));
+    return d * (float) sumi;
+}
+
+float q80_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = n_in / 32;
+    for (int k = 0; k < npart; ++k) lane[k & 31] += q80_partial(row + (size_t) k * 34, col + (size_t) k * 36, 0);
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q80_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 32) * 34;
+    for (int r = 0; r < n_out; ++r) y[r] = q80_row(w + (size_t) r * row, x, n_in);
+}
+
+void dequant_q80(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block));
+    const uint8_t* qs = block + 2;
+    for (int j = 0; j < 32; ++j) out[j] = (float) (int8_t) qs[j] * d;
+}
+
+void q80_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    std::vector<float> act((size_t) n_in), rowv((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 32) * 34;
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 32; ++b) dequant_q80(src + (size_t) b * 34, rowv.data() + (size_t) b * 32);
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) rowv[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
 using RowRef = void (*)(const uint8_t*, const uint8_t*, int, int, float*);
 
 void check_rows(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
@@ -3570,6 +3617,22 @@ void run_kquant() {
     const bool q6_refused =
         threw("not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kIq4Xs, kQ6_K, 2560, 640}); }, q6got);
     verdict("a Q6_K up is refused", q6_refused, q6got);
+
+    std::printf("\nQ8_0 ggml blocks\n");
+    const int q80_in = 128;
+    const int q80_out = 8;
+    std::vector<uint8_t> q80((size_t) q80_out * (q80_in / 32) * 34);
+    for (uint8_t& b : q80) b = (uint8_t) rng();
+    for (size_t off = 0; off < q80.size(); off += 34) {
+        q80[off + 0] = 0x00;
+        q80[off + 1] = 0x3C;
+    }
+    check_rows("a Q8_0 block matches the dequant", "a changed Q8_0 code moves that block", q80.data(), q80.size(),
+               q80_in, q80_out, kQ8_0, 2, q80_ref, q80_scalar);
+    std::string q80got;
+    const bool q80_refused =
+        threw("not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kIq4Xs, kQ8_0, 2560, 640}); }, q80got);
+    verdict("a Q8_0 down is refused", q80_refused, q80got);
 }
 
 // One GDN step from a zero state. The projections are the ggml dots. The middle is the
@@ -24321,7 +24384,7 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output, one Q4_0 product, one Q6_K product, one GDN step, one attention half, one feed-forward half, "
+        "one Q4_K gate, one Q5_K output, one Q4_0 product, one Q6_K product, one Q8_0 product, one GDN step, one attention half, one feed-forward half, "
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
         "one shared expert on that residual, one router selection on that residual, "
         "one routed ten on that residual, one carried state into a second token, "
