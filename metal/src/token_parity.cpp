@@ -431,6 +431,12 @@ void build_live(Live& L) {
         w_kn[(size_t) d] = 0;
         w_qn[(size_t) d] = 0;
     }
+    // The model indexer row is 128 wide and this block rotates 64. Zero the tail so the
+    // dot sits in the rotated pairs. The 64-wide fixture has no tail, and this loop draws nothing.
+    for (int d = L.n_rot; d < L.idx_dim; ++d) {
+        w_ik[(size_t) d] = 0;
+        w_iq[(size_t) d] = 0;
+    }
     const int pairs = L.n_rot / 2;
     std::vector<float> cos_tab((size_t) L.max_cells * (size_t) pairs), sin_tab(cos_tab.size());
     build_rope_table(L.n_rot, 100.0, L.max_cells, cos_tab.data(), sin_tab.data());
@@ -969,6 +975,76 @@ void check_serve(const char* exe) {
     }
 }
 
+// One greedy token at the model embedding. Its own seed. Rank, expert count, hidden size, and
+// vocabulary stay on the small fixture. The draft and the serve loop do not run at this width.
+void check_wide_token() {
+    std::printf("\nmodel width  n_embd 2560  idx_dim 128\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    build_live(L);
+
+    Owned prod = make_live_owned(L);
+    Owned spec = make_live_owned(L);
+    Owned trap = make_live_owned(L);
+    zero_owned(prod);
+    zero_owned(spec);
+    zero_owned(trap);
+    TokenState st_prod = bind_state(prod, *L.table);
+    TokenState st_spec = bind_state(spec, *L.table);
+    TokenState st_trap = bind_state(trap, *L.table);
+    TokenScratch sc_prod = make_token_scratch(L.g);
+    TokenScratch sc_spec = make_token_scratch(L.g);
+    TokenScratch sc_trap = make_token_scratch(L.g);
+
+    const int n_vocab = L.n_vocab;
+    const int guard = L.guard;
+    auto fill_guard = [&](Bytes& logits) {
+        auto* p = static_cast<float*>(logits.data());
+        for (int i = 0; i < n_vocab + guard; ++i) p[i] = 7.0f;
+    };
+    fill_guard(sc_prod.logits);
+    fill_guard(sc_spec.logits);
+
+    const int token0 = 3;
+    const int id = generate_token(L.g, L.w, st_prod, sc_prod, token0, 0, 0, L.sp, nullptr, 0);
+    run_spec(L.g, L.w, st_spec, sc_spec, token0, 0, 0, Trap::None);
+    const float* got = static_cast<const float*>(sc_prod.logits.data());
+    const float* want = static_cast<const float*>(sc_spec.logits.data());
+    int logit_bad = 0;
+    double worst = 0;
+    double scale = 0;
+    for (int i = 0; i < n_vocab; ++i) scale = std::max(scale, std::fabs((double) want[i]));
+    if (scale < 1e-30) scale = 1e-30;
+    for (int i = 0; i < n_vocab; ++i) {
+        if (got[i] != want[i]) ++logit_bad;
+        const double rel = std::fabs((double) want[i] - (double) got[i]) / scale;
+        if (rel > worst) worst = rel;
+    }
+    int guard_bad = 0;
+    for (int i = 0; i < guard; ++i)
+        if (got[n_vocab + i] != 7.0f) ++guard_bad;
+    const int want_id = argmax(want, n_vocab);
+    int id_bad = 0;
+    const int* a = static_cast<const int*>(sc_prod.route_ids.data());
+    const int* b = static_cast<const int*>(sc_spec.route_ids.data());
+    for (int e = 0; e < L.k; ++e)
+        if (a[e] != b[e]) ++id_bad;
+    char wb[64];
+    std::snprintf(wb, sizeof wb, "rel %.3e, %d differ", worst, logit_bad);
+    verdict("the wide logits match the kernel sequence", logit_bad == 0, wb);
+    verdict("the wide routed ids match the kernel sequence", id_bad == 0, std::to_string(id_bad) + " differ");
+    verdict("the wide greedy id is the argmax", id == want_id, "id " + std::to_string(id));
+    verdict("16 words past the wide logits stayed put", guard_bad == 0, std::to_string(guard_bad) + " changed");
+
+    std::vector<float> good(want, want + n_vocab);
+    zero_owned(trap);
+    fill_guard(sc_trap.logits);
+    run_spec(L.g, L.w, st_trap, sc_trap, token0, 0, 0, Trap::SkipAttnWrite);
+    const double apart = rel_l1(good.data(), static_cast<const float*>(sc_trap.logits.data()), n_vocab);
+    verdict("skipping the wide attention write is observable", apart > 0.05, pct(apart));
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -989,7 +1065,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-token [--selftest|--serve]\n");
         return 2;
     }
-    std::printf("token: one block, one greedy sample, one draft step, synthetic weights\n\n");
+    std::printf("token: one block, one greedy sample, one draft step, one model-width token, synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1367,6 +1443,8 @@ int main(int argc, char** argv) {
                 throws_with([&] { draft_token(g, w, bits2, res_a, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0); },
                             "no Q8_0 contract"),
                 "");
+
+        check_wide_token();
 
         check_serve(argv[0]);
 

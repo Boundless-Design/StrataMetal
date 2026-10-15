@@ -21,7 +21,9 @@ block is checked on its own, on synthetic weights. It calls the indexer, the cel
 the paged append, the rotation, the gate, the weighted norm, and the decode kernel. It does not call
 the gated residual, the router, the experts, or the sampler. One synthetic token calls the embedding
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
-the combine, the output projection, and the sampler. It is one block. Four synthetic
+the combine, the output projection, and the sampler. It is one block. The same check also draws
+one greedy token at the model embedding, n_embd 2560, indexer dim 128, and 64 rotated values, with
+rank 32, 8 experts, hidden 64, vocabulary 32, and top-k 2. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
 The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
@@ -431,6 +433,17 @@ shared expert by the first router weight was 8.67% apart on the combine output. 
 logits stayed put. The second token, the sampled id at the next cell, matched on 0 logits and sampled
 15 again. A negative token was refused. An embedding that is not a multiple of 256 was refused.
 
+The same run draws one greedy token at the model embedding. n_embd 2560, indexer dim 128, 64 rotated
+values, 24 heads, 2 kv heads, head dim 256, 4 indexer heads, block 4, top-k 2, page size 2, 4 cells.
+4 streams, rank 32, 8 experts, hidden 64, vocabulary 32. The routed experts stay IQ4_XS gate and up
+with a Q2_0 down. The shared expert stays 2-bit, and its down scales run from 8 to 12.9. The norm
+weights past those 64 rotated values are 0 on the head and on the indexer row. The first token is 3.
+The logits differed from the same kernel sequence on 0 of 32 values, relative error 0. The routed ids
+matched, 0 differ. The sampled id was 27, the argmax. Skipping the attention write was 10.71% apart
+on the logits. 16 words past the logits stayed put. Rank, expert count, hidden size, and top-k stayed
+on the small fixture. The weights are synthetic. No GGUF was loaded. This is not a loaded model.
+There is no token rate.
+
 The same check draws one draft step. The caller's residual is left as it was. The next token is
 gathered, normalized, and projected. The whole residual is normalized as one row, and each stream
 of that row is projected by the same hidden weight. The layer residual is the sum, with the
@@ -575,8 +588,10 @@ rate. This is not a loaded model.
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels and draws one synthetic greedy token
 from the loaded planes. The token check also draws one synthetic greedy draft from a caller
-residual and the next token. The same binary answers the serve lines on that fixture. The check
-started the binary. The Python server was not started. The model does not run. There is no token rate.
+residual and the next token. The same check draws one greedy token at n_embd 2560, indexer dim 128,
+64 rotated values, and top-k 2. Rank stayed 32, with 8 experts, hidden 64, and vocabulary 32. The same
+binary answers the serve lines on that fixture. The check started the binary. The Python server was
+not started. The model does not run. There is no token rate.
 The QSA decode kernel is its own check. The indexer, the indexer cell scores, the top-k, the paged
 KV append, the partial NEOX rotation, and the QSA gate pass as their own checks, and the decode
 kernel does not call them. `strata-metal-qsa-layer` calls those, plus the weighted norm and the
@@ -595,7 +610,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. One greedy token at n_embd 2560. The QSA block runs at that width, with indexer dim 128 and 64 rotated values. Top-k in that check is 2. That is not a loaded model. This loop does not read a GGUF.
+1. One greedy token at the model residual rank. n_embd stays 2560, with indexer dim 128 and 64 rotated values, and the gated residual rank becomes 320. Expert count, hidden size, vocabulary, and top-k stay at 8, 64, 32, and 2. That is not a loaded model. This loop does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
