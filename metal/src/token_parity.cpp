@@ -1108,6 +1108,22 @@ void check_shared_token() {
     check_live_token(L, "shared");
 }
 
+// The same token at the model vocabulary. Top-k stays 2.
+void check_vocab_token() {
+    std::printf("\nmodel vocab  n_embd 2560  n_vocab 248320\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    L.hc_lr = 320;
+    L.n_ff = 640;
+    L.n_expert = 512;
+    L.n_ff_shared = 640;
+    L.shared_down_base = 1.0f;
+    L.n_vocab = 248320;
+    build_live(L);
+    check_live_token(L, "vocab");
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -1130,7 +1146,8 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "token: one block, one greedy sample, one draft step, one model-width token, one model-rank token, "
-        "one model-hidden token, one model-expert token, one model-shared token, synthetic weights\n\n");
+        "one model-hidden token, one model-expert token, one model-shared token, one model-vocab token, "
+        "synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1514,6 +1531,7 @@ int main(int argc, char** argv) {
         check_hidden_token();
         check_expert_token();
         check_shared_token();
+        check_vocab_token();
 
         check_serve(argv[0]);
 
