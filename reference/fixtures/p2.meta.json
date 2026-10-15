@@ -1,0 +1,19 @@
+{
+  "prompt": "Explain in two sentences why the sky is blue.",
+  "prompt_tokens": [
+    814,
+    20139,
+    303,
+    1330,
+    22157,
+    3069,
+    279,
+    12515,
+    369,
+    6105,
+    13
+  ],
+  "bos": false,
+  "chat_template": null,
+  "output_text": "\n\n<think>\nThe user wants a concise two-sentence explanation of why the sky is blue. I need to cover Rayleigh scattering and the wavelength dependence in just"
+}

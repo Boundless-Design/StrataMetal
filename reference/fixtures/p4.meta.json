@@ -1,0 +1,18 @@
+{
+  "prompt": "Write a haiku about a river in autumn.",
+  "prompt_tokens": [
+    7734,
+    264,
+    6185,
+    36974,
+    883,
+    264,
+    14367,
+    303,
+    40297,
+    13
+  ],
+  "bos": false,
+  "chat_template": null,
+  "output_text": "\n\n<think>\nThe user wants a haiku about a river in autumn. A haiku follows the 5-7-5 syllable structure. Let me"
+}
