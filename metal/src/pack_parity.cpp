@@ -1,5 +1,6 @@
 // The pack index, loaded into the kernels that already pass. One stack token is drawn from a pack.
 #include "strata/metal/pack.hpp"
+#include "strata/metal/moe_combine.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -4279,6 +4280,550 @@ void run_head(const PackTable& table, const strata::core::ModelGeometry& g) {
     verdict("a changed embedding byte moves the head", bytes && flipped, flip_detail);
 }
 
+// Token 7971's layer-0 residual, plus the shared expert, through the same head.
+// Expert 0 is weighted exactly 1. The shared vector is added plain. Router logits stay off the block.
+// The patterned pass and the earlier head stay unchanged. This is not a token.
+void run_shared_on_layer(const PackTable& table, const strata::core::ModelGeometry& g,
+                         const std::vector<uint8_t>& blob) {
+    std::printf("\ntoken 7971 layer residual plus the shared expert\n");
+    const int n_embd = (int) g.n_embd;
+    const int n_ff = (int) g.n_ff;
+    const int n_expert = (int) g.n_expert;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const int n_vocab = 248320;
+    const int token = 7971;
+    const size_t emb_row_n = (size_t) (n_embd / 256) * 110;
+    const size_t out_row_n = (size_t) (n_embd / 256) * 176;
+    auto need = [&](const char* name, uint64_t nbytes) -> const PackTensor* {
+        const PackTensor* t = table.find(name);
+        if (!t || !t->values || t->values->size() != nbytes) return nullptr;
+        return t;
+    };
+    auto plane = [&](const char* name, uint64_t nbytes, int64_t ne0, int64_t ne1) -> const PackTensor* {
+        const PackTensor* t = table.find(name);
+        if (!t || !t->values || t->code_bits != 0 || t->ne0 != ne0 || t->ne1 != ne1 || t->values->size() != nbytes)
+            return nullptr;
+        return t;
+    };
+    const PackTensor* qkv = need("blk.0.attn_qkv.weight", 13926400);
+    const PackTensor* attn_gate = need("blk.0.attn_gate.weight", 8847360);
+    const PackTensor* ssm = need("blk.0.ssm_out.weight", 10813440);
+    const PackTensor* conv_w = need("blk.0.ssm_conv1d.weight", 163840);
+    const PackTensor* alpha_w = need("blk.0.ssm_alpha.weight", 245760);
+    const PackTensor* beta_w = need("blk.0.ssm_beta.weight", 245760);
+    const PackTensor* ssm_a = need("blk.0.ssm_a", 192);
+    const PackTensor* dt_w = need("blk.0.ssm_dt.bias", 192);
+    const PackTensor* ssm_norm = need("blk.0.ssm_norm.weight", 512);
+    const PackTensor* attn_down = need("blk.0.hc_attn_down.weight", (uint64_t) hc_lr * (uint64_t) hc_dim * 2);
+    const PackTensor* attn_up = need("blk.0.hc_attn_up.weight", (uint64_t) hc_dim * (uint64_t) hc_lr * 2);
+    const PackTensor* attn_inj = need("blk.0.hc_attn_inject.weight", (uint64_t) hc * (uint64_t) hc_dim * 2);
+    const PackTensor* attn_norm = need("blk.0.hc_attn_norm.weight", (uint64_t) hc_dim * 4);
+    const PackTensor* ffn_down = need("blk.0.hc_ffn_down.weight", (uint64_t) hc_lr * (uint64_t) hc_dim * 2);
+    const PackTensor* ffn_up = need("blk.0.hc_ffn_up.weight", (uint64_t) hc_dim * (uint64_t) hc_lr * 2);
+    const PackTensor* ffn_inj = need("blk.0.hc_ffn_inject.weight", (uint64_t) hc * (uint64_t) hc_dim * 2);
+    const PackTensor* ffn_norm = need("blk.0.hc_ffn_norm.weight", (uint64_t) hc_dim * 4);
+    const PackTensor* router = need("blk.0.ffn_gate_inp.weight", (uint64_t) n_embd * (uint64_t) n_expert * 2);
+    const PackTensor* sgate = plane("blk.0.ffn_gate_shexp.weight", 870400, n_embd, n_ff);
+    const PackTensor* sup = plane("blk.0.ffn_up_shexp.weight", 704000, n_embd, n_ff);
+    const PackTensor* sdown = plane("blk.0.ffn_down_shexp.weight", 1126400, n_ff, n_embd);
+    const PackTensor* ginp = table.find("blk.0.ffn_gate_inp_shexp.weight");
+    const bool ginp_ok = ginp && ginp->values && ginp->kind == strata::core::WeightKind::Bf16InF32 &&
+                         ginp->code_bits == 0 && ginp->ne0 == n_embd && ginp->ne1 == 1 &&
+                         ginp->values->size() == (uint64_t) n_embd * 2;
+    const PackTensor* emb = plane("token_embd.weight", 273152000, n_embd, n_vocab);
+    const PackTensor* head_out = plane("output.weight", 437043200, n_embd, n_vocab);
+    const PackTensor* head_down = table.find("output_hc_down.weight");
+    const PackTensor* head_up = table.find("output_hc_up.weight");
+    const PackTensor* head_norm = table.find("output_hc_norm.weight");
+    const bool head_ok =
+        head_out && head_out->values->size() == (uint64_t) n_vocab * out_row_n && head_down && head_down->values &&
+        head_down->kind == strata::core::WeightKind::Bf16InF32 && head_down->code_bits == 0 &&
+        head_down->ne0 == hc_dim && head_down->ne1 == hc_lr &&
+        head_down->values->size() == (uint64_t) hc_lr * (uint64_t) hc_dim * 2 && head_up && head_up->values &&
+        head_up->kind == strata::core::WeightKind::Bf16InF32 && head_up->code_bits == 0 && head_up->ne0 == hc_lr &&
+        head_up->ne1 == hc_dim && head_up->values->size() == (uint64_t) hc_dim * (uint64_t) hc_lr * 2 && head_norm &&
+        head_norm->values && head_norm->kind == strata::core::WeightKind::F32 && head_norm->code_bits == 0 &&
+        head_norm->ne0 == hc_dim && head_norm->ne1 == 1 && head_norm->values->size() == (uint64_t) hc_dim * 4;
+    const bool bytes =
+        qkv && qkv->code_bits == 0 && attn_gate && ssm && conv_w && alpha_w && beta_w && ssm_a && dt_w && ssm_norm &&
+        attn_down && attn_up && attn_inj && attn_norm && ffn_down && ffn_up && ffn_inj && ffn_norm && router &&
+        sgate && sup && sdown && ginp_ok && emb && head_ok && blob.size() == 1382400 && hc > 0 && n_embd > 0 &&
+        (uint64_t) token * emb_row_n + emb_row_n <= emb->values->size();
+    bool sh_mix_ok = false;
+    bool sh_logits_ok = false;
+    bool sh_repeat = false;
+    bool sh_moved = false;
+    bool sh_flipped = false;
+    bool sh_dropped = false;
+    std::string sh_mix_detail = "bytes";
+    std::string sh_logits_detail = "bytes";
+    std::string sh_repeat_detail = "bytes";
+    std::string sh_move_detail = "bytes";
+    std::string sh_flip_detail = "bytes";
+    std::string sh_drop_detail = "bytes";
+    if (bytes) {
+        try {
+            const uint8_t* emb_src = static_cast<const uint8_t*>(emb->values->data()) + (size_t) token * emb_row_n;
+            std::vector<float> emb_row((size_t) n_embd);
+            for (int b = 0; b < n_embd / 256; ++b)
+                dequant_q3(emb_src + (size_t) b * 110, emb_row.data() + (size_t) b * 256);
+            double emb_ms = 0;
+            for (int i = 0; i < n_embd; ++i) {
+                if (!std::isfinite(emb_row[(size_t) i])) throw MetalError("embedding row is not finite");
+                emb_ms += (double) emb_row[(size_t) i] * (double) emb_row[(size_t) i];
+            }
+            if (emb_ms == 0) throw MetalError("embedding row is zero");
+
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, attn_gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = ssm_norm->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+            const size_t gu = iq_row_bytes(kQ2_0, n_embd);
+            const int64_t up_off = (int64_t) n_ff * (int64_t) gu;
+            const int64_t down_off = up_off * 2;
+            Bytes expert_w((uint64_t) blob.size());
+            std::memcpy(expert_w.data(), blob.data(), expert_w.size());
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4);
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int c = 0; c < hc; ++c)
+                std::memcpy(Rp + (size_t) c * n_embd, emb_row.data(), (size_t) n_embd * sizeof(float));
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            const int guard = 1;
+            const int guard_n = hc_dim + guard;
+            const int mix_n = n_embd + guard;
+            const int logit_n = n_vocab + guard;
+            Bytes layer_y((uint64_t) guard_n * 4), layer_y2((uint64_t) guard_n * 4);
+            Bytes layer_yz((uint64_t) guard_n * 4), layer_yf((uint64_t) guard_n * 4);
+            Bytes layer_drop((uint64_t) guard_n * 4);
+            Bytes mid((uint64_t) guard_n * 4);
+            Bytes expert_y((uint64_t) (n_embd + guard) * 4), shared_y((uint64_t) (n_embd + guard) * 4);
+            Bytes combined((uint64_t) (n_embd + guard) * 4);
+            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4);
+            Bytes x_bf16((uint64_t) n_embd * 2), route((uint64_t) n_expert * 4);
+            Bytes exq(iq_q8_1_bytes(n_embd)), egate_y((uint64_t) n_ff * 4), eup_y((uint64_t) n_ff * 4);
+            Bytes ehq(iq_q8_1_bytes(n_ff));
+            Bytes sh_xq(iq_q8_1_bytes(n_embd)), sh_gate_y((uint64_t) n_ff * 4), sh_up_y((uint64_t) n_ff * 4);
+            Bytes sh_hq(iq_q8_1_bytes(n_ff)), sh_down_y((uint64_t) (n_embd + guard) * 4), sh_scalar(4);
+            Bytes parts((uint64_t) n_embd * 4), route_w(4);
+            static_cast<float*>(route_w.data())[0] = 1.0f;
+            struct SeN {
+                int n;
+                int pad0;
+                int pad1;
+                int pad2;
+            };
+            static_assert(sizeof(SeN) == 16, "SeN must match the shader");
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto shared_forward = [&](Bytes& out) {
+                iq_quantize_q8_1(mixed, n_embd, sh_xq);
+                iq_mmvq(kIq4Xs, *sgate->values, 0, sh_xq, n_embd, n_ff, 1, sh_gate_y);
+                iq_mmvq(kQ3_K, *sup->values, 0, sh_xq, n_embd, n_ff, 1, sh_up_y);
+                iq_swiglu_q8(sh_gate_y, sh_up_y, n_ff, sh_hq);
+                iq_mmvq(kQ5_0, *sdown->values, 0, sh_hq, n_ff, n_embd, 1, sh_down_y);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) (n_embd + guard), 7.f);
+                std::memcpy(out.data(), sh_down_y.data(), (size_t) n_embd * 4);
+                Bytes x_bf16_s((uint64_t) n_embd * 2);
+                f32_to_bf16_bulk(mixed, x_bf16_s, n_embd);
+                bf16_gemv(x_bf16_s, *ginp->values, sh_scalar, n_embd, 1);
+                const SeN dim{n_embd, 0, 0, 0};
+                const uint32_t groups = (uint32_t) ((n_embd + 255) / 256);
+                const Bytes* scb[] = {&out, &sh_scalar};
+                launch("se_sigmoid_scale", scb, 2, &dim, sizeof dim, Grid{groups, 1, 1, 256, 1, 1});
+            };
+            auto run_pass = [&](const Bytes& residual, Bytes& out, bool with_shared) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(mid.data()), (size_t) guard_n, 7.f);
+                std::fill_n(static_cast<float*>(expert_y.data()), (size_t) (n_embd + guard), 7.f);
+                std::fill_n(static_cast<float*>(combined.data()), (size_t) (n_embd + guard), 7.f);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) guard_n, 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, *attn_norm->values, *attn_down->values, *attn_up->values, attn_inj->values.get(),
+                        1e-6f, false, gr, mixed, inject);
+                gdn_layer_iq(lg, w, st, sc, mixed, expert_y);
+                gr_write(gs, residual, expert_y, inject, mid);
+                std::fill_n(static_cast<float*>(expert_y.data()), (size_t) (n_embd + guard), 7.f);
+                gr_read(gs, mid, *ffn_norm->values, *ffn_down->values, *ffn_up->values, ffn_inj->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                f32_to_bf16_bulk(mixed, x_bf16, n_embd);
+                bf16_gemv(x_bf16, *router->values, route, n_embd, n_expert);
+                iq_quantize_q8_1(mixed, n_embd, exq);
+                iq_mmvq(kQ2_0, expert_w, 0, exq, n_embd, n_ff, 1, egate_y);
+                iq_mmvq(kQ2_0, expert_w, up_off, exq, n_embd, n_ff, 1, eup_y);
+                iq_swiglu_q8(egate_y, eup_y, n_ff, ehq);
+                iq_mmvq(kQ2_0, expert_w, down_off, ehq, n_ff, n_embd, 1, expert_y);
+                shared_forward(shared_y);
+                std::memcpy(parts.data(), expert_y.data(), (size_t) n_embd * 4);
+                moe_combine(parts, route_w, with_shared ? &shared_y : nullptr, combined, n_embd, 1);
+                gr_write(gs, mid, combined, inject, out);
+            };
+            Bytes mix_y((uint64_t) mix_n * 4), mix_y2((uint64_t) mix_n * 4);
+            Bytes mix_yz((uint64_t) mix_n * 4), mix_yf((uint64_t) mix_n * 4);
+            Bytes logits((uint64_t) logit_n * 4), logits2((uint64_t) logit_n * 4);
+            Bytes logits_z((uint64_t) logit_n * 4), logits_f((uint64_t) logit_n * 4);
+            Bytes head_inject((uint64_t) (hc + guard) * 4);
+            auto fill7 = [](Bytes& b) { std::fill_n(static_cast<float*>(b.data()), (size_t) (b.size() / 4), 7.f); };
+            fill7(mix_y);
+            fill7(mix_y2);
+            fill7(mix_yz);
+            fill7(mix_yf);
+            fill7(logits);
+            fill7(logits2);
+            fill7(logits_z);
+            fill7(logits_f);
+            fill7(head_inject);
+            bool inject_held = true;
+            auto mix_read = [&](const Bytes& residual, Bytes& out) {
+                std::fill_n(static_cast<float*>(head_inject.data()), (size_t) (hc + guard), 7.f);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) mix_n, 7.f);
+                gr_read(gs, residual, *head_norm->values, *head_down->values, *head_up->values, nullptr, 1e-6f, false,
+                        gr, out, head_inject);
+                if (!still_seven(static_cast<const float*>(head_inject.data()), hc + guard)) inject_held = false;
+            };
+            auto project = [&](const Bytes& mix, Bytes& out) {
+                Bytes act((uint64_t) n_embd * 4);
+                std::memcpy(act.data(), mix.data(), act.size());
+                Bytes q(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(act, n_embd, q);
+                fill7(out);
+                iq_mmvq(kQ5_K, *head_out->values, 0, q, n_embd, n_vocab, 1, out);
+                return q;
+            };
+
+            run_pass(R, layer_y, true);
+            std::vector<float> got_expert((size_t) n_embd), got_shared((size_t) n_embd), got_combined((size_t) n_embd);
+            std::vector<float> got_inject((size_t) hc), got_mixed((size_t) n_embd), got_mid((size_t) hc_dim);
+            std::vector<float> got_layer((size_t) hc_dim);
+            std::vector<float> got_egate((size_t) n_ff), got_eup((size_t) n_ff);
+            std::vector<float> got_sgate((size_t) n_ff), got_sup((size_t) n_ff), got_sdown((size_t) n_embd);
+            std::memcpy(got_expert.data(), expert_y.data(), got_expert.size() * 4);
+            std::memcpy(got_shared.data(), shared_y.data(), got_shared.size() * 4);
+            std::memcpy(got_combined.data(), combined.data(), got_combined.size() * 4);
+            std::memcpy(got_inject.data(), inject.data(), got_inject.size() * 4);
+            std::memcpy(got_mixed.data(), mixed.data(), got_mixed.size() * 4);
+            std::memcpy(got_mid.data(), mid.data(), got_mid.size() * 4);
+            std::memcpy(got_layer.data(), layer_y.data(), got_layer.size() * 4);
+            std::memcpy(got_egate.data(), egate_y.data(), got_egate.size() * 4);
+            std::memcpy(got_eup.data(), eup_y.data(), got_eup.size() * 4);
+            std::memcpy(got_sgate.data(), sh_gate_y.data(), got_sgate.size() * 4);
+            std::memcpy(got_sup.data(), sh_up_y.data(), got_sup.size() * 4);
+            std::memcpy(got_sdown.data(), sh_down_y.data(), got_sdown.size() * 4);
+            const float got_scale = static_cast<const float*>(sh_scalar.data())[0];
+            const bool combine_guard = static_cast<const float*>(combined.data())[n_embd] == 7.f;
+            const bool shared_guard = static_cast<const float*>(shared_y.data())[n_embd] == 7.f;
+            const bool mid_guard = static_cast<const float*>(mid.data())[hc_dim] == 7.f;
+            std::vector<uint8_t> exqb((size_t) exq.size()), ehqb((size_t) ehq.size());
+            std::vector<uint8_t> sh_xqb((size_t) sh_xq.size()), sh_hqb((size_t) sh_hq.size());
+            std::memcpy(exqb.data(), exq.data(), exqb.size());
+            std::memcpy(ehqb.data(), ehq.data(), ehqb.size());
+            std::memcpy(sh_xqb.data(), sh_xq.data(), sh_xqb.size());
+            std::memcpy(sh_hqb.data(), sh_hq.data(), sh_hqb.size());
+            mix_read(layer_y, mix_y);
+            const Bytes head_q = project(mix_y, logits);
+            std::vector<uint8_t> xqb((size_t) head_q.size());
+            std::memcpy(xqb.data(), head_q.data(), xqb.size());
+            std::vector<float> got_mix((size_t) n_embd);
+            std::memcpy(got_mix.data(), mix_y.data(), got_mix.size() * 4);
+
+            std::vector<float> host_egate((size_t) n_ff), host_eup((size_t) n_ff), host_edown((size_t) n_embd);
+            q2_ref(blob.data(), exqb.data(), n_embd, n_ff, host_egate.data());
+            q2_ref(blob.data() + (size_t) up_off, exqb.data(), n_embd, n_ff, host_eup.data());
+            q2_ref(blob.data() + (size_t) down_off, ehqb.data(), n_ff, n_embd, host_edown.data());
+            const uint8_t* sgate_b = static_cast<const uint8_t*>(sgate->values->data());
+            const uint8_t* sup_b = static_cast<const uint8_t*>(sup->values->data());
+            const uint8_t* sdown_b = static_cast<const uint8_t*>(sdown->values->data());
+            std::vector<float> host_sgate((size_t) n_ff), host_sup((size_t) n_ff), host_sdown((size_t) n_embd);
+            xs_ref(sgate_b, sh_xqb.data(), n_embd, n_ff, host_sgate.data());
+            q3_ref(sup_b, sh_xqb.data(), n_embd, n_ff, host_sup.data());
+            q50_ref(sdown_b, sh_hqb.data(), n_ff, n_embd, host_sdown.data());
+            std::vector<float> rounded((size_t) n_embd);
+            for (int i = 0; i < n_embd; ++i) rounded[(size_t) i] = round_bf16(got_mixed[(size_t) i]);
+            const float host_scale =
+                bf16_dot(rounded.data(), static_cast<const uint16_t*>(ginp->values->data()), n_embd);
+            const float sig = gdn_sigmoid(host_scale);
+            std::vector<float> host_shared((size_t) n_embd), host_combined((size_t) n_embd);
+            for (int i = 0; i < n_embd; ++i) {
+                host_shared[(size_t) i] = host_sdown[(size_t) i] * sig;
+                host_combined[(size_t) i] =
+                    (float) ((double) got_expert[(size_t) i] + (double) got_shared[(size_t) i]);
+            }
+            std::vector<float> host_write((size_t) hc_dim);
+            for (int c = 0; c < hc; ++c) {
+                const float scale = 2.0f * gdn_sigmoid(got_inject[(size_t) c] / (float) hc);
+                for (int d = 0; d < n_embd; ++d)
+                    host_write[(size_t) c * n_embd + d] =
+                        got_mid[(size_t) c * n_embd + d] + got_combined[(size_t) d] * scale;
+            }
+            const float* norm_mix = static_cast<const float*>(head_norm->values->data());
+            const uint16_t* down_mix = static_cast<const uint16_t*>(head_down->values->data());
+            const uint16_t* up_mix = static_cast<const uint16_t*>(head_up->values->data());
+            const std::vector<float> host_mix =
+                output_mix_host(got_layer.data(), norm_mix, down_mix, up_mix, n_embd, hc, hc_lr, nullptr);
+            const uint8_t* out_bytes = static_cast<const uint8_t*>(head_out->values->data());
+            std::vector<float> host_logits((size_t) n_vocab), scalar_logits((size_t) n_vocab);
+            k_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, host_logits.data());
+            scalar_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, scalar_logits.data());
+
+            const AttnHalf host_attn = layer0_attn_host(
+                Rp, static_cast<const float*>(attn_norm->values->data()),
+                static_cast<const uint16_t*>(attn_down->values->data()),
+                static_cast<const uint16_t*>(attn_up->values->data()),
+                static_cast<const uint16_t*>(attn_inj->values->data()),
+                static_cast<const uint8_t*>(qkv->values->data()), static_cast<const uint8_t*>(attn_gate->values->data()),
+                static_cast<const uint8_t*>(ssm->values->data()),
+                static_cast<const uint16_t*>(alpha_w->values->data()),
+                static_cast<const uint16_t*>(beta_w->values->data()),
+                static_cast<const float*>(conv_w->values->data()), static_cast<const float*>(ssm_norm->values->data()),
+                static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                n_embd, hc, hc_lr, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+            const FfnHalf host_ffn = layer0_ffn_host(
+                host_attn.out.data(), static_cast<const float*>(ffn_norm->values->data()),
+                static_cast<const uint16_t*>(ffn_down->values->data()),
+                static_cast<const uint16_t*>(ffn_up->values->data()),
+                static_cast<const uint16_t*>(ffn_inj->values->data()),
+                static_cast<const uint16_t*>(router->values->data()), blob.data(), n_embd, n_ff, n_expert, hc, hc_lr);
+            std::vector<float> chain_shexp((size_t) n_embd);
+            {
+                Bytes act_b((uint64_t) n_embd * 4);
+                std::memcpy(act_b.data(), host_ffn.mixed.data(), act_b.size());
+                Bytes cxq(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(act_b, n_embd, cxq);
+                std::vector<uint8_t> cxqb((size_t) cxq.size());
+                std::memcpy(cxqb.data(), cxq.data(), cxqb.size());
+                std::vector<float> cg((size_t) n_ff), cu((size_t) n_ff), hidden((size_t) n_ff), cdown((size_t) n_embd);
+                xs_ref(sgate_b, cxqb.data(), n_embd, n_ff, cg.data());
+                q3_ref(sup_b, cxqb.data(), n_embd, n_ff, cu.data());
+                for (int i = 0; i < n_ff; ++i) hidden[(size_t) i] = gdn_silu(cg[(size_t) i]) * cu[(size_t) i];
+                Bytes hf((uint64_t) n_ff * 4);
+                std::memcpy(hf.data(), hidden.data(), hf.size());
+                Bytes chq(iq_q8_1_bytes(n_ff));
+                iq_quantize_q8_1(hf, n_ff, chq);
+                std::vector<uint8_t> chqb((size_t) chq.size());
+                std::memcpy(chqb.data(), chq.data(), chqb.size());
+                q50_ref(sdown_b, chqb.data(), n_ff, n_embd, cdown.data());
+                std::vector<float> cr((size_t) n_embd);
+                for (int i = 0; i < n_embd; ++i) cr[(size_t) i] = round_bf16(host_ffn.mixed[(size_t) i]);
+                const float cs =
+                    bf16_dot(cr.data(), static_cast<const uint16_t*>(ginp->values->data()), n_embd);
+                const float csig = gdn_sigmoid(cs);
+                for (int i = 0; i < n_embd; ++i) chain_shexp[(size_t) i] = cdown[(size_t) i] * csig;
+            }
+            std::vector<float> chain_inject((size_t) hc, 0.f), chain_res((size_t) hc_dim, 0.f);
+            std::vector<float> chain_block((size_t) n_embd, 0.f);
+            bool chain_res_ok = false;
+            if (all_finite(host_attn.out.data(), hc_dim) && all_finite(host_ffn.block.data(), n_embd) &&
+                all_finite(chain_shexp.data(), n_embd)) {
+                const float* src = host_attn.out.data();
+                const float* norm_w = static_cast<const float*>(ffn_norm->values->data());
+                const uint16_t* iw = static_cast<const uint16_t*>(ffn_inj->values->data());
+                std::vector<float> xn((size_t) hc_dim), act((size_t) hc_dim);
+                for (int c = 0; c < hc; ++c) {
+                    double ms = 0;
+                    for (int d = 0; d < n_embd; ++d) {
+                        const double v = src[(size_t) c * n_embd + d];
+                        ms += v * v;
+                    }
+                    ms /= (double) n_embd;
+                    const float rs = (float) (1.0 / std::sqrt(ms + 1e-6));
+                    for (int d = 0; d < n_embd; ++d) {
+                        const size_t i = (size_t) c * n_embd + d;
+                        xn[i] = src[i] * rs * norm_w[i];
+                    }
+                }
+                for (int i = 0; i < hc_dim; ++i) act[(size_t) i] = round_bf16(xn[(size_t) i]);
+                for (int c = 0; c < hc; ++c)
+                    chain_inject[(size_t) c] = bf16_dot(act.data(), iw + (size_t) c * hc_dim, hc_dim);
+                for (int d = 0; d < n_embd; ++d)
+                    chain_block[(size_t) d] =
+                        (float) ((double) host_ffn.block[(size_t) d] + (double) chain_shexp[(size_t) d]);
+                for (int c = 0; c < hc; ++c) {
+                    const float scale = 2.0f * gdn_sigmoid(chain_inject[(size_t) c] / (float) hc);
+                    for (int d = 0; d < n_embd; ++d)
+                        chain_res[(size_t) c * n_embd + d] = src[(size_t) c * n_embd + d] + chain_block[(size_t) d] * scale;
+                }
+                chain_res_ok = true;
+            }
+            std::vector<float> chain_mix((size_t) n_embd, 0.f);
+            if (chain_res_ok)
+                chain_mix = output_mix_host(chain_res.data(), norm_mix, down_mix, up_mix, n_embd, hc, hc_lr, nullptr);
+            std::vector<float> chain_logits((size_t) n_vocab);
+            bool chain_ran = false;
+            if (chain_res_ok && all_finite(chain_mix.data(), n_embd)) {
+                Bytes chain_act((uint64_t) n_embd * 4);
+                std::memcpy(chain_act.data(), chain_mix.data(), chain_act.size());
+                Bytes chain_q(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(chain_act, n_embd, chain_q);
+                std::vector<uint8_t> chain_qb((size_t) chain_q.size());
+                std::memcpy(chain_qb.data(), chain_q.data(), chain_qb.size());
+                k_ref(out_bytes, chain_qb.data(), n_embd, n_vocab, true, chain_logits.data());
+                chain_ran = true;
+            }
+
+            run_pass(R, layer_y2, true);
+            mix_read(layer_y2, mix_y2);
+            const Bytes head_q2 = project(mix_y2, logits2);
+            run_pass(zero_r, layer_yz, true);
+            mix_read(layer_yz, mix_yz);
+            project(mix_yz, logits_z);
+            run_pass(R, layer_drop, false);
+
+            std::vector<uint8_t> row_copy(emb_row_n);
+            auto launch_flip = [&](int local, bool with_logits) {
+                std::memcpy(row_copy.data(), emb_src, emb_row_n);
+                row_copy[(size_t) local] ^= 1u;
+                std::vector<float> flipped_row((size_t) n_embd);
+                for (int b = 0; b < n_embd / 256; ++b)
+                    dequant_q3(row_copy.data() + (size_t) b * 110, flipped_row.data() + (size_t) b * 256);
+                Bytes Rf((uint64_t) hc_dim * 4);
+                auto* Rfp = static_cast<float*>(Rf.data());
+                for (int c = 0; c < hc; ++c)
+                    std::memcpy(Rfp + (size_t) c * n_embd, flipped_row.data(), (size_t) n_embd * sizeof(float));
+                run_pass(Rf, layer_yf, true);
+                mix_read(layer_yf, mix_yf);
+                if (with_logits) project(mix_yf, logits_f);
+            };
+            int flip_local = 32;
+            launch_flip(flip_local, true);
+
+            const float* layer_p = static_cast<const float*>(layer_y.data());
+            const float* layer2_p = static_cast<const float*>(layer_y2.data());
+            const float* layerz_p = static_cast<const float*>(layer_yz.data());
+            const float* layerf_p = static_cast<const float*>(layer_yf.data());
+            const float* drop_p = static_cast<const float*>(layer_drop.data());
+            const float* mp = static_cast<const float*>(mix_y.data());
+            const float* m2p = static_cast<const float*>(mix_y2.data());
+            const float* mzp = static_cast<const float*>(mix_yz.data());
+            const float* mfp = static_cast<const float*>(mix_yf.data());
+            const float* lp = static_cast<const float*>(logits.data());
+            const float* l2p = static_cast<const float*>(logits2.data());
+            const float* lzp = static_cast<const float*>(logits_z.data());
+            const float* lfp = static_cast<const float*>(logits_f.data());
+            int flipped_n = differ_floats(lp, lfp, n_vocab);
+            if (flipped_n == 0) {
+                for (int i = 0; i < (int) emb_row_n; ++i) {
+                    if (i == 32) continue;
+                    launch_flip(i, false);
+                    if (differ_floats(layer_p, layerf_p, hc_dim) == 0) continue;
+                    project(mix_yf, logits_f);
+                    flipped_n = differ_floats(lp, lfp, n_vocab);
+                    if (flipped_n > 0) {
+                        flip_local = i;
+                        break;
+                    }
+                }
+            }
+            const int flip_at = (int) ((size_t) token * emb_row_n + (size_t) flip_local);
+            double chain_mix_rel = std::nan("");
+            double chain_logit_rel = std::nan("");
+            if (chain_res_ok && all_finite(chain_mix.data(), n_embd))
+                chain_mix_rel = rel_l1(chain_mix.data(), mp, n_embd);
+            if (chain_ran && all_finite(chain_logits.data(), n_vocab))
+                chain_logit_rel = rel_l1(chain_logits.data(), lp, n_vocab);
+
+            const bool guard_held = layer_p[hc_dim] == 7.f && layer2_p[hc_dim] == 7.f && layerz_p[hc_dim] == 7.f &&
+                                    layerf_p[hc_dim] == 7.f && drop_p[hc_dim] == 7.f && mp[n_embd] == 7.f &&
+                                    m2p[n_embd] == 7.f && mzp[n_embd] == 7.f && mfp[n_embd] == 7.f &&
+                                    lp[n_vocab] == 7.f && l2p[n_vocab] == 7.f && lzp[n_vocab] == 7.f &&
+                                    lfp[n_vocab] == 7.f && combine_guard && shared_guard && mid_guard;
+            const bool q_same = head_q.size() == head_q2.size() &&
+                                std::memcmp(head_q.data(), head_q2.data(), head_q.size()) == 0;
+            const bool live =
+                all_finite(layer_p, hc_dim) && all_finite(layer2_p, hc_dim) && all_finite(layerz_p, hc_dim) &&
+                all_finite(layerf_p, hc_dim) && all_finite(mp, n_embd) && all_finite(m2p, n_embd) &&
+                all_finite(mzp, n_embd) && all_finite(mfp, n_embd) && all_finite(lp, n_vocab) &&
+                all_finite(l2p, n_vocab) && all_finite(lzp, n_vocab) && all_finite(lfp, n_vocab) &&
+                all_finite(got_expert.data(), n_embd) && all_finite(got_shared.data(), n_embd) &&
+                all_finite(got_combined.data(), n_embd) && all_finite(got_mixed.data(), n_embd) &&
+                all_finite(got_mid.data(), hc_dim) && all_finite(got_layer.data(), hc_dim) &&
+                all_finite(got_egate.data(), n_ff) && all_finite(got_eup.data(), n_ff) &&
+                all_finite(got_sgate.data(), n_ff) && all_finite(got_sup.data(), n_ff) &&
+                all_finite(got_sdown.data(), n_embd) && std::isfinite(got_scale) && std::isfinite(host_scale) &&
+                all_finite(host_egate.data(), n_ff) && all_finite(host_eup.data(), n_ff) &&
+                all_finite(host_edown.data(), n_embd) && all_finite(host_sgate.data(), n_ff) &&
+                all_finite(host_sup.data(), n_ff) && all_finite(host_sdown.data(), n_embd) &&
+                all_finite(host_shared.data(), n_embd) && all_finite(host_combined.data(), n_embd) &&
+                all_finite(host_write.data(), hc_dim) && all_finite(host_mix.data(), n_embd) &&
+                all_finite(host_logits.data(), n_vocab) && all_finite(scalar_logits.data(), n_vocab) &&
+                all_finite(got_inject.data(), hc) && !still_seven(layer_p, hc_dim) && !still_seven(mp, n_embd) &&
+                !still_seven(lp, n_vocab);
+            const double egate_rel = rel_l1(host_egate.data(), got_egate.data(), n_ff);
+            const double eup_rel = rel_l1(host_eup.data(), got_eup.data(), n_ff);
+            const double expert_rel = rel_l1(host_edown.data(), got_expert.data(), n_embd);
+            const double gate_rel = rel_l1(host_sgate.data(), got_sgate.data(), n_ff);
+            const double up_rel = rel_l1(host_sup.data(), got_sup.data(), n_ff);
+            const double down_rel = rel_l1(host_sdown.data(), got_sdown.data(), n_embd);
+            const double scale_rel = rel_l1(&host_scale, &got_scale, 1);
+            const double shared_rel = rel_l1(host_shared.data(), got_shared.data(), n_embd);
+            const double combine_rel = rel_l1(host_combined.data(), got_combined.data(), n_embd);
+            const double write_rel = rel_l1(host_write.data(), got_layer.data(), hc_dim);
+            const double mix_rel = rel_l1(host_mix.data(), got_mix.data(), n_embd);
+            const double rel = rel_l1(scalar_logits.data(), lp, n_vocab);
+            const double irel = rel_l1(host_logits.data(), lp, n_vocab);
+            const int again = differ_floats(lp, l2p, n_vocab);
+            const int mix_again = differ_floats(mp, m2p, n_embd);
+            const int layer_again = differ_floats(layer_p, layer2_p, hc_dim);
+            const int apart = differ_floats(lp, lzp, n_vocab);
+            const double apart_rel = rel_l1(lp, lzp, n_vocab);
+            const int drop_n = differ_floats(layer_p, drop_p, hc_dim);
+            sh_mix_ok = live && guard_held && inject_held && egate_rel <= 1e-5 && eup_rel <= 1e-5 &&
+                        expert_rel <= 1e-5 && gate_rel <= 1e-5 && up_rel <= 1e-5 && down_rel <= 1e-5 &&
+                        scale_rel <= 1e-4 && shared_rel <= 1e-4 && combine_rel <= 1e-5 && write_rel <= 1e-4 &&
+                        mix_rel <= 1e-4;
+            sh_logits_ok = live && guard_held && inject_held && rel <= 1e-5 && irel <= 1e-5;
+            sh_repeat = live && guard_held && inject_held && again == 0 && mix_again == 0 && layer_again == 0 && q_same;
+            sh_moved = live && guard_held && inject_held && apart > 0 && std::isfinite(apart_rel);
+            sh_flipped = live && guard_held && inject_held && flipped_n > 0;
+            sh_dropped = live && guard_held && inject_held && all_finite(drop_p, hc_dim) && drop_n > 0;
+            char buf[640];
+            std::snprintf(buf, sizeof buf,
+                          "token %d, expert %.3e, gate %.3e, up %.3e, down %.3e, scale %.3e, shared %.3e, "
+                          "combine %.3e, write %.3e, mix %.3e, weight 1, chain mix %.3e",
+                          token, expert_rel, gate_rel, up_rel, down_rel, scale_rel, shared_rel, combine_rel,
+                          write_rel, mix_rel, chain_mix_rel);
+            sh_mix_detail = buf;
+            std::snprintf(buf, sizeof buf, "rel %.3e, integer %.3e, %d rows, chain %.3e", rel, irel, n_vocab,
+                          chain_logit_rel);
+            sh_logits_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            sh_repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, n_vocab, apart_rel * 100.0);
+            sh_move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flipped_n, n_vocab, flip_at);
+            sh_flip_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ", drop_n, hc_dim);
+            sh_drop_detail = buf;
+        } catch (const MetalError& e) {
+            sh_mix_detail = e.what();
+            sh_logits_detail = e.what();
+            sh_repeat_detail = e.what();
+            sh_move_detail = e.what();
+            sh_flip_detail = e.what();
+            sh_drop_detail = e.what();
+        }
+    }
+    verdict("the shared layer mix matches", bytes && sh_mix_ok, sh_mix_detail);
+    verdict("the shared layer logits match", bytes && sh_logits_ok, sh_logits_detail);
+    verdict("that shared layer head repeats", bytes && sh_repeat, sh_repeat_detail);
+    verdict("a zero residual moves that shared layer", bytes && sh_moved, sh_move_detail);
+    verdict("a changed embedding byte moves that shared layer", bytes && sh_flipped, sh_flip_detail);
+    verdict("dropping the shared expert moves that layer", bytes && sh_dropped, sh_drop_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -5601,6 +6146,7 @@ void run_q2_layer() {
     verdict("a zero residual moves that layer head", head_bytes && lh_moved, lh_move_detail);
     verdict("a changed embedding byte moves that layer head", head_bytes && lh_flipped, lh_flip_detail);
 
+    run_shared_on_layer(table, g, blob);
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -5620,6 +6166,7 @@ int main(int argc, char** argv) {
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
+        "one shared expert on that residual, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
