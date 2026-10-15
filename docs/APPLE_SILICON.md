@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. There is no token rate.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
 ## One memory pool
 
@@ -436,6 +436,19 @@ vocabulary was refused. A short residual was refused. A missing embedding norm w
 2-bit hidden projection was refused: code_bits has no Q8_0 contract. One synthetic greedy draft.
 There is no token rate. This is not a loaded model.
 
+The same binary answers `--serve`. The selftest started it as `strata-metal-token --serve --max-context 8192`.
+Extra arguments are ignored. It prints `INFO vocab=32 n_embd=256` and then `READY 4`. The context is
+the fixture's 4 cells. The line does not say `stop`. Each `GEN` starts from an empty sequence.
+`GEN 1 3` sampled id 15. A second `GEN 1 3` sampled 15 again. `GEN 2 3` sampled 15, then 15.
+`GEN 1 3,5` sampled 15, and the first prompt id only filled K and V. `temperature=0` sampled 15.
+Each reply is `T <id>` and then `DONE` with the generated count, the prompt length, the prompt
+time, the decode time, and the word `length`. An id of 99 was refused, and the next `GEN 1 3`
+still sampled 15. Five new tokens on one prompt id was refused: the request does not fit in the
+4 cells. A line that is not `GEN` was refused. `temperature=0.7` was refused. `top_p=0.9` was
+refused. `VRAM`, `STOP`, `BGEN`, `BSTOP`, and `GENI` were refused, and the process stayed up.
+`QUIT` exited 0. The check started that binary. The Python server was not started. One synthetic
+greedy token. There is no token rate. This is not a loaded model.
+
 `strata-metal-stack` draws one greedy id through four layers. A layer is full attention when its index
 modulo 4 is 3, which is the pack's rule. Layers 0, 1, and 2 are GDN. Layer 3 is the QSA attention
 block. Every layer then does the same feed-forward half as the one-block token. No new shader. The
@@ -547,7 +560,8 @@ rate. This is not a loaded model.
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels and draws one synthetic greedy token
 from the loaded planes. The token check also draws one synthetic greedy draft from a caller
-residual and the next token. The model does not run. There is no token rate.
+residual and the next token. The same binary answers the serve lines on that fixture. The check
+started the binary. The Python server was not started. The model does not run. There is no token rate.
 The QSA decode kernel is its own check. The indexer, the indexer cell scores, the top-k, the paged
 KV append, the partial NEOX rotation, and the QSA gate pass as their own checks, and the decode
 kernel does not call them. `strata-metal-qsa-layer` calls those, plus the weighted norm and the
@@ -555,7 +569,8 @@ decode kernel. `strata-metal-token` calls the embedding row, the gated residual,
 block, the router, the routed experts, the shared expert, the combine, the output projection, and
 the sampler. It is one block. It also draws one draft step from a caller residual and the next
 token. Those two projections use a Q8_0 activation. The block after the sum is the same one.
-The caller's residual is not written. `strata-metal-stack` calls that token path's feed-forward half on
+The caller's residual is not written. The same binary answers `--serve` on that fixture. The check
+started it. The Python server was not started. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
 expert, one routed expert, and one 2-bit query on bytes it loaded. It also feeds one stack token
@@ -565,7 +580,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. The Python server in `serve/`, which can stay as it is once it has an engine binary to start.
+1. A loaded model. `strata-metal-token --serve` answers on the synthetic fixture. The check started that binary. The Python server was not started. This loop does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

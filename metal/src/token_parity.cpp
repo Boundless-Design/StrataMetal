@@ -1,4 +1,5 @@
 // One synthetic token: the spec calls each kernel itself, and generate_token has to land on it.
+// --serve answers the engine lines on that same fixture. It does not load a model.
 #include "strata/metal/token.hpp"
 
 #include "strata/metal/bf16_gemv.hpp"
@@ -13,13 +14,27 @@
 
 #include "strata/kernels/bf16_bits.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
+
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
 
 namespace {
 
@@ -316,14 +331,662 @@ bool throws_with(F&& fn, const char* needle) {
     }
 }
 
+// The weights the token check draws, kept alive for a --serve process. Pointers in `w` alias these
+// buffers, so the vectors do not grow after build_live returns.
+struct Live {
+    int n_embd = 256;
+    int hc = 4;
+    int hc_lr = 32;
+    int n_expert = 8;
+    int k = 2;
+    int n_ff = 64;
+    int n_ff_shared = 64;
+    int n_vocab = 32;
+    int n_head = 24;
+    int n_head_kv = 2;
+    int head_dim = 256;
+    int n_rot = 64;
+    int idx_n_head = 4;
+    int idx_dim = 64;
+    int block = 4;
+    int top_k = 2;
+    int page_size = 2;
+    int max_cells = 4;
+    int n_pages = 2;
+    int guard = 16;
+    TokenGeom g;
+    std::mt19937 rng{11u};
+    std::normal_distribution<float> gauss{0.0f, 1.0f};
+    std::unique_ptr<Bytes> emb_c, emb_s, emb_o;
+    std::unique_ptr<GrBuf> attn, ffn, head_gr;
+    std::unique_ptr<PlaneBuf> pk, pv, pq, po, phead;
+    std::unique_ptr<Bytes> idx_k, idx_q, kn, qn, ik, iq, cosb, sinb, table, router;
+    std::unique_ptr<Bytes> gc, gs, uc, us, dc, ds, ginp;
+    std::vector<Bytes> experts;
+    TokenWeights w;
+    SamplerParams sp;
+};
+
+Owned make_live_owned(const Live& L) {
+    const size_t pool_n = (size_t) L.n_pages * (size_t) L.n_head_kv * (size_t) L.page_size * (size_t) L.head_dim;
+    return Owned{Bytes((uint64_t) L.hc * (uint64_t) L.n_embd * 4u), Bytes(pool_n * 2u), Bytes(pool_n * 2u),
+                 Bytes((size_t) (L.block - 1) * (size_t) L.idx_dim * 4u), Bytes((size_t) L.idx_dim * 4u),
+                 Bytes((size_t) (L.max_cells / L.block + 1) * (size_t) L.idx_dim * 4u), Bytes(4)};
+}
+
+void build_live(Live& L) {
+    L.g.n_embd = L.n_embd;
+    L.g.hc = L.hc;
+    L.g.hc_lr = L.hc_lr;
+    L.g.n_expert = L.n_expert;
+    L.g.k = L.k;
+    L.g.n_ff_shared = L.n_ff_shared;
+    L.g.shared_tpr = 32;
+    L.g.n_vocab = L.n_vocab;
+    L.g.qsa.n_embd = L.n_embd;
+    L.g.qsa.max_cells = L.max_cells;
+    L.g.qsa.qsa.n_head = L.n_head;
+    L.g.qsa.qsa.n_head_kv = L.n_head_kv;
+    L.g.qsa.qsa.head_dim = L.head_dim;
+    L.g.qsa.qsa.n_rot = L.n_rot;
+    L.g.qsa.qsa.idx_n_head = L.idx_n_head;
+    L.g.qsa.qsa.idx_dim = L.idx_dim;
+    L.g.qsa.qsa.idx_block = L.block;
+    L.g.qsa.qsa.idx_top_k = L.top_k;
+    L.g.qsa.qsa.page_size = L.page_size;
+    L.g.expert = IqExpert{kIq4Xs, kQ2_0, L.n_embd, L.n_ff};
+    L.n_pages = (L.max_cells + L.page_size - 1) / L.page_size;
+
+    const int per_byte = 2;
+    std::vector<uint8_t> emb_codes((size_t) L.n_vocab * (size_t) (L.n_embd / per_byte));
+    for (uint8_t& v : emb_codes) v = (uint8_t) (L.rng() & 0xFF);
+    std::vector<float> emb_scales((size_t) L.n_vocab * (size_t) (L.n_embd / 32));
+    std::vector<float> emb_offs(emb_scales.size());
+    for (float& v : emb_scales) v = 0.05f + 0.001f * (float) (L.rng() % 20);
+    for (float& v : emb_offs) v = 0.02f * L.gauss(L.rng);
+    L.emb_c.reset(new Bytes(upload(emb_codes.data(), emb_codes.size())));
+    L.emb_s.reset(new Bytes(upload(emb_scales.data(), emb_scales.size() * 4u)));
+    L.emb_o.reset(new Bytes(upload(emb_offs.data(), emb_offs.size() * 4u)));
+
+    L.attn.reset(new GrBuf(make_gr(L.n_embd, L.hc, L.hc_lr, true, L.rng)));
+    L.ffn.reset(new GrBuf(make_gr(L.n_embd, L.hc, L.hc_lr, true, L.rng)));
+    L.head_gr.reset(new GrBuf(make_gr(L.n_embd, L.hc, L.hc_lr, false, L.rng)));
+    L.pk.reset(new PlaneBuf(make_plane(L.n_embd, L.n_head_kv * L.head_dim, L.rng)));
+    L.pv.reset(new PlaneBuf(make_plane(L.n_embd, L.n_head_kv * L.head_dim, L.rng)));
+    L.pq.reset(new PlaneBuf(make_plane(L.n_embd, L.n_head * L.head_dim * 2, L.rng)));
+    L.po.reset(new PlaneBuf(make_plane(L.n_head * L.head_dim, L.n_embd, L.rng)));
+    L.phead.reset(new PlaneBuf(make_plane(L.n_embd, L.n_vocab, L.rng)));
+
+    std::vector<uint16_t> w_idx_k((size_t) L.idx_dim * (size_t) L.n_embd);
+    std::vector<uint16_t> w_idx_q((size_t) L.idx_n_head * (size_t) L.idx_dim * (size_t) L.n_embd);
+    for (uint16_t& v : w_idx_k) v = strata::kernels::bf16_from_f32(0.05f * L.gauss(L.rng));
+    for (uint16_t& v : w_idx_q) v = strata::kernels::bf16_from_f32(0.05f * L.gauss(L.rng));
+    std::vector<float> w_kn((size_t) L.head_dim), w_qn((size_t) L.head_dim), w_ik((size_t) L.idx_dim),
+        w_iq((size_t) L.idx_dim);
+    for (float& v : w_kn) v = 1.0f + 0.1f * L.gauss(L.rng);
+    for (float& v : w_qn) v = 1.0f + 0.1f * L.gauss(L.rng);
+    for (float& v : w_ik) v = 1.0f + 0.1f * L.gauss(L.rng);
+    for (float& v : w_iq) v = 1.0f + 0.1f * L.gauss(L.rng);
+    for (int d = L.n_rot; d < L.head_dim; ++d) {
+        w_kn[(size_t) d] = 0;
+        w_qn[(size_t) d] = 0;
+    }
+    const int pairs = L.n_rot / 2;
+    std::vector<float> cos_tab((size_t) L.max_cells * (size_t) pairs), sin_tab(cos_tab.size());
+    build_rope_table(L.n_rot, 100.0, L.max_cells, cos_tab.data(), sin_tab.data());
+    std::vector<int> page((size_t) L.n_pages);
+    for (int i = 0; i < L.n_pages; ++i) page[(size_t) i] = L.n_pages - 1 - i;
+
+    L.idx_k.reset(new Bytes(upload(w_idx_k.data(), w_idx_k.size() * 2u)));
+    L.idx_q.reset(new Bytes(upload(w_idx_q.data(), w_idx_q.size() * 2u)));
+    L.kn.reset(new Bytes(upload(w_kn.data(), w_kn.size() * 4u)));
+    L.qn.reset(new Bytes(upload(w_qn.data(), w_qn.size() * 4u)));
+    L.ik.reset(new Bytes(upload(w_ik.data(), w_ik.size() * 4u)));
+    L.iq.reset(new Bytes(upload(w_iq.data(), w_iq.size() * 4u)));
+    L.cosb.reset(new Bytes(upload(cos_tab.data(), cos_tab.size() * 4u)));
+    L.sinb.reset(new Bytes(upload(sin_tab.data(), sin_tab.size() * 4u)));
+    L.table.reset(new Bytes(upload(page.data(), page.size() * 4u)));
+    L.router.reset(new Bytes(bf16_matrix(L.n_expert, L.n_embd, 0.02f, L.rng)));
+
+    const size_t blob_n = iq_expert_bytes(L.g.expert);
+    L.experts.reserve((size_t) L.n_expert);
+    for (int e = 0; e < L.n_expert; ++e) {
+        auto gate = random_rows(kIq4Xs, 2 * L.n_ff, L.n_embd, L.rng);
+        auto down = random_rows(kQ2_0, L.n_embd, L.n_ff, L.rng);
+        gate.insert(gate.end(), down.begin(), down.end());
+        if (gate.size() != blob_n) throw MetalError("token parity: expert blob size");
+        L.experts.push_back(upload(gate.data(), gate.size()));
+    }
+
+    const size_t sh_gu = (size_t) L.n_ff_shared * (size_t) L.n_embd / 4u;
+    const size_t sh_dn = (size_t) L.n_embd * (size_t) L.n_ff_shared / 4u;
+    std::vector<uint8_t> gc(sh_gu, 0xFF), uc(sh_gu, 0x00), dc(sh_dn);
+    for (uint8_t& v : dc) v = (uint8_t) (L.rng() & 0xFF);
+    std::vector<float> gsc((size_t) L.n_ff_shared * (size_t) (L.n_embd / 64));
+    std::vector<float> usc(gsc.size()), dsc((size_t) L.n_embd * (size_t) (L.n_ff_shared / 64));
+    for (float& s : gsc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
+    for (float& s : usc) s = 0.02f + 0.001f * (float) (L.rng() % 50);
+    for (float& s : dsc) s = 8.0f + 0.1f * (float) (L.rng() % 50);
+    std::vector<uint16_t> ginv((size_t) L.n_embd);
+    for (uint16_t& v : ginv) v = strata::kernels::bf16_from_f32(0.05f * L.gauss(L.rng));
+    L.gc.reset(new Bytes(upload(gc.data(), gc.size())));
+    L.gs.reset(new Bytes(upload(gsc.data(), gsc.size() * 4u)));
+    L.uc.reset(new Bytes(upload(uc.data(), uc.size())));
+    L.us.reset(new Bytes(upload(usc.data(), usc.size() * 4u)));
+    L.dc.reset(new Bytes(upload(dc.data(), dc.size())));
+    L.ds.reset(new Bytes(upload(dsc.data(), dsc.size() * 4u)));
+    L.ginp.reset(new Bytes(upload(ginv.data(), ginv.size() * 2u)));
+
+    L.w.emb_codes = L.emb_c.get();
+    L.w.emb_scales = L.emb_s.get();
+    L.w.emb_offsets = L.emb_o.get();
+    L.w.attn = gr_view(*L.attn, true);
+    L.w.ffn = gr_view(*L.ffn, true);
+    L.w.head = gr_view(*L.head_gr, false);
+    L.w.qsa.k = view(*L.pk);
+    L.w.qsa.v = view(*L.pv);
+    L.w.qsa.q = view(*L.pq);
+    L.w.qsa.out = view(*L.po);
+    L.w.qsa.idx_k = L.idx_k.get();
+    L.w.qsa.idx_q = L.idx_q.get();
+    L.w.qsa.k_norm = L.kn.get();
+    L.w.qsa.q_norm = L.qn.get();
+    L.w.qsa.idx_k_norm = L.ik.get();
+    L.w.qsa.idx_q_norm = L.iq.get();
+    L.w.qsa.cos_tab = L.cosb.get();
+    L.w.qsa.sin_tab = L.sinb.get();
+    L.w.router = L.router.get();
+    L.w.experts = L.experts.data();
+    L.w.sh_gate_codes = L.gc.get();
+    L.w.sh_gate_scales = L.gs.get();
+    L.w.sh_up_codes = L.uc.get();
+    L.w.sh_up_scales = L.us.get();
+    L.w.sh_down_codes = L.dc.get();
+    L.w.sh_down_scales = L.ds.get();
+    L.w.sh_gate_inp = L.ginp.get();
+    L.w.out = view(*L.phead);
+    L.sp.greedy = true;
+    L.sp.temperature = 0;
+}
+
+std::vector<int> greedy_ids(const Live& L, const std::vector<int>& prompt, int max_new) {
+    Owned o = make_live_owned(L);
+    zero_owned(o);
+    TokenState st = bind_state(o, *L.table);
+    TokenScratch sc = make_token_scratch(L.g);
+    for (int i = 0; i + 1 < (int) prompt.size(); ++i)
+        generate_token(L.g, L.w, st, sc, prompt[(size_t) i], i, 0, L.sp, nullptr, 0);
+    std::vector<int> out;
+    int tok = prompt.back();
+    int pos = (int) prompt.size() - 1;
+    for (int n = 0; n < max_new; ++n) {
+        tok = generate_token(L.g, L.w, st, sc, tok, pos, 0, L.sp, nullptr, 0);
+        out.push_back(tok);
+        ++pos;
+    }
+    return out;
+}
+
+void say(const char* line) {
+    std::fputs(line, stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
+// One request. The prompt tokens fill the layer's own K and V. The sample at the last prompt
+// position is the first new id. Each request starts from an empty sequence.
+bool serve_request(const Live& L, int max_new, const std::vector<int>& ids, std::string& err) {
+    if (max_new < 1) {
+        err = "max_new";
+        return false;
+    }
+    if (ids.empty()) {
+        err = "the prompt is empty";
+        return false;
+    }
+    for (int id : ids) {
+        if (id < 0 || id >= L.n_vocab) {
+            err = "a token id is outside the vocabulary";
+            return false;
+        }
+    }
+    const int last = (int) ids.size() + max_new - 2;
+    if (last >= L.max_cells) {
+        err = "the request does not fit in the context";
+        return false;
+    }
+    Owned o = make_live_owned(L);
+    zero_owned(o);
+    TokenState st = bind_state(o, *L.table);
+    TokenScratch sc = make_token_scratch(L.g);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i + 1 < (int) ids.size(); ++i)
+        generate_token(L.g, L.w, st, sc, ids[(size_t) i], i, 0, L.sp, nullptr, 0);
+    const auto t1 = std::chrono::steady_clock::now();
+    int tok = ids.back();
+    int pos = (int) ids.size() - 1;
+    for (int n = 0; n < max_new; ++n) {
+        tok = generate_token(L.g, L.w, st, sc, tok, pos, 0, L.sp, nullptr, 0);
+        std::printf("T %d\n", tok);
+        std::fflush(stdout);
+        ++pos;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    std::printf("DONE %d %d %.3f %.3f length\n", max_new, (int) ids.size(), prompt_ms, decode_ms);
+    std::fflush(stdout);
+    return true;
+}
+
+bool parse_request(const std::string& line, int& max_new, std::vector<int>& ids, std::string& err) {
+    if (line.rfind("GENI ", 0) == 0) {
+        err = "this engine has no vision";
+        return false;
+    }
+    if (line.rfind("GEN ", 0) != 0) {
+        err = "expected: GEN <max_new> <id,id,...>";
+        return false;
+    }
+    const char* p = line.c_str() + 4;
+    char* end = nullptr;
+    const long long mn = std::strtoll(p, &end, 10);
+    if (end == p || mn > 0x7fffffff) {
+        err = "max_new";
+        return false;
+    }
+    max_new = (int) mn;
+    p = end;
+    for (;;) {
+        while (*p == ' ') ++p;
+        if (*p == '\0') break;
+        const char* start = p;
+        while (*p != '\0' && *p != ' ') ++p;
+        const std::string tok(start, p);
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos) {
+            p = start;
+            break;
+        }
+        const std::string key = tok.substr(0, eq);
+        if (key == "temperature") {
+            char* tend = nullptr;
+            const float t = std::strtof(tok.c_str() + eq + 1, &tend);
+            if (tend == tok.c_str() + eq + 1 || *tend != '\0' || t > 0.0f) {
+                err = "this engine is greedy";
+                return false;
+            }
+        } else {
+            err = "this engine is greedy";
+            return false;
+        }
+    }
+    while (*p == ' ') ++p;
+    ids.clear();
+    if (*p == '\0') {
+        err = "the prompt is empty";
+        return false;
+    }
+    while (*p) {
+        char* e = nullptr;
+        const long v = std::strtol(p, &e, 10);
+        if (e == p) {
+            err = "bad id";
+            return false;
+        }
+        ids.push_back((int) v);
+        p = e;
+        if (*p == ',') ++p;
+        else if (*p != '\0') {
+            err = "bad id";
+            return false;
+        }
+    }
+    return true;
+}
+
+int serve_loop(const Live& L) {
+    std::printf("INFO vocab=%d n_embd=%d\n", L.n_vocab, L.n_embd);
+    std::printf("READY %d\n", L.max_cells);
+    std::fflush(stdout);
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "QUIT") return 0;
+        if (line.rfind("VRAM", 0) == 0) {
+            say("ERR this engine has no elastic cache");
+            continue;
+        }
+        if (line == "STOP" || line.rfind("BGEN", 0) == 0 || line.rfind("BSTOP", 0) == 0) {
+            say("ERR this engine runs one request at a time");
+            continue;
+        }
+        int max_new = 0;
+        std::vector<int> ids;
+        std::string err;
+        if (!parse_request(line, max_new, ids, err) || !serve_request(L, max_new, ids, err)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+        }
+    }
+    return 0;
+}
+
+struct PipeChild {
+    pid_t pid = -1;
+    int in_fd = -1;
+    int out_fd = -1;
+    ~PipeChild() {
+        if (in_fd >= 0) close(in_fd);
+        if (out_fd >= 0) close(out_fd);
+        if (pid > 0) {
+            int status = 0;
+            if (waitpid(pid, &status, WNOHANG) == 0) {
+                kill(pid, SIGTERM);
+                waitpid(pid, &status, 0);
+            }
+        }
+    }
+};
+
+bool read_line(int fd, std::string& line, int timeout_ms) {
+    line.clear();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pollfd p;
+        p.fd = fd;
+        p.events = POLLIN;
+        p.revents = 0;
+        const int left = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        const int pr = poll(&p, 1, left > 0 ? left : 0);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) return false;
+        char c = 0;
+        const ssize_t n = read(fd, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        if (c == '\n') return true;
+        if (c != '\r') line.push_back(c);
+    }
+    return false;
+}
+
+void write_line(int fd, const std::string& line) {
+    const std::string s = line + "\n";
+    size_t off = 0;
+    while (off < s.size()) {
+        const ssize_t n = write(fd, s.data() + off, s.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw MetalError("the engine pipe closed");
+        }
+        if (n == 0) throw MetalError("the engine pipe closed");
+        off += (size_t) n;
+    }
+}
+
+struct IgnorePipe {
+    void (*prev)(int);
+    IgnorePipe() : prev(std::signal(SIGPIPE, SIG_IGN)) {}
+    ~IgnorePipe() { std::signal(SIGPIPE, prev); }
+};
+
+bool spawn_engine(const char* exe, PipeChild& child, std::string& err) {
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    if (pipe(in_pipe) != 0) {
+        err = "pipe";
+        return false;
+    }
+    if (pipe(out_pipe) != 0) {
+        err = "pipe";
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        return false;
+    }
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        err = "file actions";
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        return false;
+    }
+    const int dup_in = posix_spawn_file_actions_adddup2(&actions, in_pipe[0], STDIN_FILENO);
+    const int dup_out = posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, in_pipe[0]);
+    posix_spawn_file_actions_addclose(&actions, in_pipe[1]);
+    posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
+    posix_spawn_file_actions_addclose(&actions, out_pipe[1]);
+    std::string exe_s(exe ? exe : "");
+    std::vector<char> a0(exe_s.begin(), exe_s.end());
+    a0.push_back('\0');
+    char serve[] = "--serve";
+    char ctx[] = "--max-context";
+    char num[] = "8192";
+    char* args[] = {a0.data(), serve, ctx, num, nullptr};
+    pid_t pid = -1;
+    const int rc = (dup_in == 0 && dup_out == 0) ? posix_spawnp(&pid, exe, &actions, nullptr, args, environ) : EINVAL;
+    posix_spawn_file_actions_destroy(&actions);
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    if (rc != 0) {
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        err = "posix_spawnp failed";
+        return false;
+    }
+    child.pid = pid;
+    child.in_fd = in_pipe[1];
+    child.out_fd = out_pipe[0];
+    return true;
+}
+
+bool reap_child(PipeChild& child, int timeout_ms, int& status) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const pid_t r = waitpid(child.pid, &status, WNOHANG);
+        if (r == child.pid) return true;
+        if (r < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        poll(nullptr, 0, 20);
+    }
+}
+
+bool parse_tid(const std::string& line, int& id) {
+    if (line.rfind("T ", 0) != 0) return false;
+    char* end = nullptr;
+    const long v = std::strtol(line.c_str() + 2, &end, 10);
+    if (end == line.c_str() + 2 || *end != '\0') return false;
+    id = (int) v;
+    return true;
+}
+
+// DONE carries generated, prompt length, both times, and the finish word. Nothing after that.
+bool parse_done_line(const std::string& line, int expect_gen, int expect_prompt, std::string& detail) {
+    int gen = 0, prompt = 0;
+    double pms = 0, dms = 0;
+    char finish[32] = {};
+    if (std::sscanf(line.c_str(), "DONE %d %d %lf %lf %31s", &gen, &prompt, &pms, &dms, finish) != 5) {
+        detail = line;
+        return false;
+    }
+    const char* p = line.c_str();
+    for (int i = 0; i < 6; ++i) {
+        while (*p == ' ') ++p;
+        if (*p == '\0') {
+            detail = line;
+            return false;
+        }
+        while (*p && *p != ' ') ++p;
+    }
+    while (*p == ' ') ++p;
+    if (*p != '\0' || gen != expect_gen || prompt != expect_prompt || std::strcmp(finish, "length") != 0 || pms < 0.0 ||
+        dms < 0.0) {
+        detail = line;
+        return false;
+    }
+    detail = "generated " + std::to_string(gen) + ", prompt " + std::to_string(prompt) + ", " + finish;
+    return true;
+}
+
+bool run_gen(PipeChild& child, const std::string& req, const std::vector<int>& ids, int prompt_n, int first_ms,
+             std::string& detail) {
+    write_line(child.in_fd, req);
+    std::string line;
+    std::string shown;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (!read_line(child.out_fd, line, i == 0 ? first_ms : 60000)) {
+            detail = shown.empty() ? "no token line" : shown;
+            return false;
+        }
+        int got = -1;
+        if (!parse_tid(line, got) || got != ids[i]) {
+            detail = line;
+            return false;
+        }
+        if (!shown.empty()) shown += ",";
+        shown += std::to_string(got);
+    }
+    if (!read_line(child.out_fd, line, 60000)) {
+        detail = shown + " then no DONE";
+        return false;
+    }
+    std::string done;
+    if (!parse_done_line(line, (int) ids.size(), prompt_n, done)) {
+        detail = shown + " " + line;
+        return false;
+    }
+    detail = "id " + shown + ", " + done;
+    return true;
+}
+
+bool run_err(PipeChild& child, const std::string& req, const char* needle, std::string& detail) {
+    write_line(child.in_fd, req);
+    std::string line;
+    if (!read_line(child.out_fd, line, 60000)) {
+        detail = "no reply";
+        return false;
+    }
+    detail = line;
+    return line.rfind("ERR ", 0) == 0 && std::strstr(line.c_str(), needle) != nullptr;
+}
+
+// The parent has already used Metal, so the engine is a new process. Its ids have to match a fresh
+// draw of the same fixture, and a refused line has to leave that process up.
+void check_serve(const char* exe) {
+    IgnorePipe ignore_pipe;
+    PipeChild child;
+    try {
+        Live live;
+        build_live(live);
+        const std::vector<int> one = greedy_ids(live, {3}, 1);
+        const std::vector<int> two = greedy_ids(live, {3}, 2);
+        const std::vector<int> pref = greedy_ids(live, {3, 5}, 1);
+        std::string err;
+        if (!spawn_engine(exe, child, err)) {
+            verdict("the engine binary starts", false, err);
+            return;
+        }
+        std::string line;
+        const bool info = read_line(child.out_fd, line, 60000) && line == "INFO vocab=32 n_embd=256";
+        std::string ready;
+        const bool ready_ok = info && read_line(child.out_fd, ready, 60000) && ready == "READY 4";
+        verdict("the engine prints INFO then READY 4", info && ready_ok, info ? ready : line);
+        if (!ready_ok) return;
+
+        std::string detail;
+        const bool g1 = run_gen(child, "GEN 1 3", one, 1, 180000, detail);
+        verdict("GEN 1 3 matches the in-process sample", g1, detail);
+        if (!g1) return;
+        const bool again = run_gen(child, "GEN 1 3", one, 1, 60000, detail);
+        verdict("a second GEN 1 3 matches", again, detail);
+        if (!again) return;
+        const bool both = run_gen(child, "GEN 2 3", two, 1, 60000, detail);
+        verdict("GEN 2 3 matches both samples", both, detail);
+        if (!both) return;
+        const bool prefix = run_gen(child, "GEN 1 3,5", pref, 2, 60000, detail);
+        verdict("a prefix token matches the in-process sample", prefix, detail);
+        if (!prefix) return;
+        const bool greedy = run_gen(child, "GEN 1 temperature=0 3", one, 1, 60000, detail);
+        verdict("temperature=0 stays greedy", greedy, detail);
+        if (!greedy) return;
+
+        const bool outside = run_err(child, "GEN 1 99", "outside the vocabulary", detail);
+        verdict("an id outside the vocabulary is refused", outside, detail);
+        if (!outside) return;
+        const bool still = run_gen(child, "GEN 1 3", one, 1, 60000, detail);
+        verdict("the engine still answers after a refusal", still, detail);
+        if (!still) return;
+        const bool fit = run_err(child, "GEN 5 3", "does not fit", detail);
+        verdict("a request past the context is refused", fit, detail);
+        if (!fit) return;
+        const bool bad = run_err(child, "HELLO", "expected: GEN", detail);
+        verdict("a line that is not GEN is refused", bad, detail);
+        if (!bad) return;
+        const bool warm = run_err(child, "GEN 1 temperature=0.7 3", "this engine is greedy", detail);
+        verdict("temperature=0.7 is refused", warm, detail);
+        if (!warm) return;
+        const bool key = run_err(child, "GEN 1 top_p=0.9 3", "this engine is greedy", detail);
+        verdict("another sampling key is refused", key, detail);
+        if (!key) return;
+        const bool vram = run_err(child, "VRAM 64", "no elastic cache", detail);
+        verdict("VRAM is refused", vram, detail);
+        if (!vram) return;
+        const bool stop = run_err(child, "STOP", "one request at a time", detail);
+        verdict("STOP is refused", stop, detail);
+        if (!stop) return;
+        const bool bgen = run_err(child, "BGEN 0 1 3", "one request at a time", detail);
+        verdict("BGEN is refused", bgen, detail);
+        if (!bgen) return;
+        const bool bstop = run_err(child, "BSTOP 0", "one request at a time", detail);
+        verdict("BSTOP is refused", bstop, detail);
+        if (!bstop) return;
+        const bool vision = run_err(child, "GENI 1 embed.bin", "no vision", detail);
+        verdict("GENI is refused", vision, detail);
+        if (!vision) return;
+
+        write_line(child.in_fd, "QUIT");
+        close(child.in_fd);
+        child.in_fd = -1;
+        int status = 0;
+        const bool gone = reap_child(child, 10000, status);
+        const bool clean = gone && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (gone) child.pid = -1;
+        const int code = gone && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        verdict("QUIT ends the engine", clean, gone ? "exit " + std::to_string(code) : "still running");
+    } catch (const MetalError& e) {
+        verdict("the engine pipe stays open", false, e.what());
+    }
+}
+
 }  // namespace
 
 using namespace strata::metal;
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc >= 2 && std::strcmp(argv[1], "--serve") == 0) {
+        try {
+            Live live;
+            build_live(live);
+            return serve_loop(live);
+        } catch (const MetalError& e) {
+            std::fprintf(stderr, "Metal error: %s\n", e.what());
+            return 2;
+        }
+    }
     if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--selftest") != 0)) {
-        std::fprintf(stderr, "usage: strata-metal-token [--selftest]\n");
+        std::fprintf(stderr, "usage: strata-metal-token [--selftest|--serve]\n");
         return 2;
     }
     std::printf("token: one block, one greedy sample, one draft step, synthetic weights\n\n");
@@ -704,6 +1367,8 @@ int main(int argc, char** argv) {
                 throws_with([&] { draft_token(g, w, bits2, res_a, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0); },
                             "no Q8_0 contract"),
                 "");
+
+        check_serve(argv[0]);
 
         std::printf("\ntoken: %d failures\n", g_fail);
         if (g_fail) return 1;
