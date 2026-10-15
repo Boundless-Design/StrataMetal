@@ -3393,7 +3393,8 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
                                const uint16_t* alpha_w, const uint16_t* beta_w, const float* conv_w,
                                const float* norm, const float* dt, const float* ssm_a, int n_embd, int S, int h_k,
                                int h_v, int d_conv, std::vector<float>* conv_io = nullptr,
-                               std::vector<float>* state_io = nullptr) {
+                               std::vector<float>* state_io = nullptr, int gate_type = kQ4_K,
+                               int out_type = kQ5_K) {
     const int qk = S * h_k;
     const int V = S * h_v;
     const int C = qk + qk + V;
@@ -3463,8 +3464,14 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
         }
     }
 
+    auto project_rows = [&](int type, const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+        if (type == kIq4Xs) xs_ref(w, x, n_in, n_out, y);
+        else if (type == kQ4_K) scalar_ref(w, x, n_in, n_out, false, y);
+        else if (type == kQ5_K) scalar_ref(w, x, n_in, n_out, true, y);
+        else throw MetalError("gdn host quant is not one of these");
+    };
     std::vector<float> z((size_t) V);
-    scalar_ref(gate_w, xqb.data(), n_embd, V, false, z.data());
+    project_rows(gate_type, gate_w, xqb.data(), n_embd, V, z.data());
     std::vector<float> y((size_t) V, 0.f);
     for (int h = 0; h < h_v; ++h) {
         const float* po = o.data() + (size_t) h * S;
@@ -3481,7 +3488,7 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
     std::vector<uint8_t> yqb((size_t) yq.size());
     std::memcpy(yqb.data(), yq.data(), yqb.size());
     std::vector<float> out((size_t) n_embd);
-    scalar_ref(out_w, yqb.data(), V, n_embd, true, out.data());
+    project_rows(out_type, out_w, yqb.data(), V, n_embd, out.data());
     if (conv_io) *conv_io = conv_state;
     if (state_io) {
         for (size_t i = 0; i < state.size(); ++i) (*state_io)[i] = (float) state[i];
@@ -5805,6 +5812,9 @@ void run_routed_ten(const PackTable& table, const strata::core::ModelGeometry& g
     verdict("dropping the shared expert moves that route", bytes && rt_dropped, rt_drop_detail);
 }
 
+// Token 1's layer-0 residual, copied out for the layer-1 check. Empty unless that pass finished.
+std::vector<float> carried_token1_residual;
+
 // Token 7971 from a zero state, then token 1 from that convolution and recurrent state.
 // Token 1 is a fixed row. It is not an argmax. The other 47 layers are not loaded.
 void run_carried_pair(const PackTable& table, const strata::core::ModelGeometry& g,
@@ -6172,6 +6182,8 @@ void run_carried_pair(const PackTable& table, const strata::core::ModelGeometry&
             const double block_rel = rel_l1(host_block.data(), gdn_b.data(), n_embd);
             FfnSnap snap;
             ffn(mid, true, layer_y, &snap);
+            carried_token1_residual.assign(static_cast<const float*>(layer_y.data()),
+                                           static_cast<const float*>(layer_y.data()) + hc_dim);
             const bool id_guard = static_cast<const int*>(ids.data())[k] == 7;
             const bool weight_guard = static_cast<const float*>(route_w.data())[k] == 7.f;
 
@@ -6560,6 +6572,172 @@ void run_carried_pair(const PackTable& table, const strata::core::ModelGeometry&
     verdict("a cleared state moves that second token", bytes && cp_cleared, cp_clear_detail);
     verdict("a changed embedding byte moves that second token", bytes && cp_flipped, cp_flip_detail);
     verdict("dropping the shared expert moves that second token", bytes && cp_dropped, cp_drop_detail);
+}
+
+// Layer 1's GDN step on token 1's layer-0 residual. The six blk.1.ple_* tensors are not added.
+// Layer 1 is the only layer that carries them, and that update sits in front of this read.
+void run_layer1_gdn(const strata::core::ModelGeometry& g) {
+    std::printf("\nlayer 1 GDN step on token 1, PLE not applied\n");
+    const int n_embd = (int) g.n_embd;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const uint64_t k_data = 11024672;
+    const std::filesystem::path shard =
+        "/Users/kamp/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf";
+    const bool bytes = (int) carried_token1_residual.size() == hc_dim && g.ssm_state_size == 128 &&
+                       g.ssm_k_heads == 16 && g.ssm_v_heads == 48 && g.ssm_d_conv == 4 &&
+                       g.ssm_conv_channels == 10240 && std::filesystem::is_regular_file(shard);
+    bool step_ok = false, repeat_ok = false, moved_ok = false, flipped_ok = false;
+    std::string step_detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string move_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (bytes) {
+        try {
+            auto load = [&](uint64_t off, uint64_t n) {
+                const auto raw = read_at_path(shard, k_data + off, (size_t) n);
+                Bytes b(n);
+                std::memcpy(b.data(), raw.data(), (size_t) n);
+                return b;
+            };
+            Bytes qkv = load(1505518976, 13926400);
+            Bytes gate = load(1497163136, 8355840);
+            Bytes ssm = load(2279044352, 8847360);
+            Bytes conv_w = load(2278879808, 163840);
+            Bytes alpha_w = load(2278388288, 245760);
+            Bytes beta_w = load(2278634048, 245760);
+            Bytes ssm_a = load(2278388096, 192);
+            Bytes dt_w = load(2279043648, 192);
+            Bytes ssm_norm = load(2279043840, 512);
+            Bytes attn_down = load(2231243136, 6553600);
+            Bytes attn_up = load(2237919616, 6553600);
+            Bytes attn_inj = load(2237796736, 81920);
+            Bytes attn_norm = load(2237878656, 40960);
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, &qkv};
+            w.attn_gate = GdnIqPlane{kIq4Xs, &gate};
+            w.ssm_out = GdnIqPlane{kQ4_K, &ssm};
+            w.alpha = &alpha_w;
+            w.beta = &beta_w;
+            w.conv = &conv_w;
+            w.ssm_norm = &ssm_norm;
+            w.dt = &dt_w;
+            w.ssm_a = &ssm_a;
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+            const int state_n = (int) lg.S * (int) lg.h_v * (int) lg.S;
+            const int conv_n = (int) g.ssm_conv_channels * (int) (lg.d_conv - 1);
+            const int guard = 1;
+            const int guard_n = hc_dim + guard;
+            Bytes state((uint64_t) state_n * 4), conv((uint64_t) conv_n * 4);
+            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4), gdn_y((uint64_t) n_embd * 4);
+            Bytes out((uint64_t) guard_n * 4), out2((uint64_t) guard_n * 4), outz((uint64_t) guard_n * 4);
+            Bytes outf((uint64_t) guard_n * 4);
+            Bytes R((uint64_t) hc_dim * 4), zero_r((uint64_t) hc_dim * 4);
+            std::memcpy(R.data(), carried_token1_residual.data(), (size_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto step = [&](const Bytes& residual, Bytes& y) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(gdn_y.data()), (size_t) n_embd, 7.f);
+                std::fill_n(static_cast<float*>(y.data()), (size_t) guard_n, 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, attn_norm, attn_down, attn_up, &attn_inj, 1e-6f, false, gr, mixed, inject);
+                gdn_layer_iq(lg, w, st, sc, mixed, gdn_y);
+                gr_write(gs, residual, gdn_y, inject, y);
+            };
+            step(R, out);
+            std::vector<float> gpu_state((size_t) state_n), gpu_conv((size_t) conv_n), gpu_mixed((size_t) n_embd);
+            std::vector<float> gpu_block((size_t) n_embd), gpu_inj((size_t) hc);
+            std::memcpy(gpu_state.data(), state.data(), (size_t) state_n * 4);
+            std::memcpy(gpu_conv.data(), conv.data(), (size_t) conv_n * 4);
+            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_block.data(), gdn_y.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4);
+            std::vector<float> host_state((size_t) state_n, 0.f), host_conv((size_t) conv_n, 0.f);
+            const std::vector<float> host_block = gdn_iq_host(
+                gpu_mixed.data(), static_cast<const uint8_t*>(qkv.data()), static_cast<const uint8_t*>(gate.data()),
+                static_cast<const uint8_t*>(ssm.data()), static_cast<const uint16_t*>(alpha_w.data()),
+                static_cast<const uint16_t*>(beta_w.data()), static_cast<const float*>(conv_w.data()),
+                static_cast<const float*>(ssm_norm.data()), static_cast<const float*>(dt_w.data()),
+                static_cast<const float*>(ssm_a.data()), n_embd, (int) lg.S, (int) lg.h_k, (int) lg.h_v,
+                (int) lg.d_conv, &host_conv, &host_state, kIq4Xs, kQ4_K);
+            std::vector<float> host_write((size_t) hc_dim);
+            const float* Rp = static_cast<const float*>(R.data());
+            for (int c = 0; c < hc; ++c) {
+                const float scale = 2.0f * gdn_sigmoid(gpu_inj[(size_t) c] / (float) hc);
+                for (int d = 0; d < n_embd; ++d)
+                    host_write[(size_t) c * n_embd + d] = Rp[(size_t) c * n_embd + d] + gpu_block[(size_t) d] * scale;
+            }
+            const double state_rel = rel_l1(host_state.data(), gpu_state.data(), state_n);
+            const double conv_rel = rel_l1(host_conv.data(), gpu_conv.data(), conv_n);
+            const double block_rel = rel_l1(host_block.data(), gpu_block.data(), n_embd);
+            const double write_rel = rel_l1(host_write.data(), static_cast<const float*>(out.data()), hc_dim);
+            std::vector<float> zeros_s((size_t) state_n, 0.f), zeros_c((size_t) conv_n, 0.f);
+            const int state_moved = differ_floats(gpu_state.data(), zeros_s.data(), state_n);
+            const int conv_moved = differ_floats(gpu_conv.data(), zeros_c.data(), conv_n);
+            step(R, out2);
+            step(zero_r, outz);
+            const int candidates[] = {32, 2, 8, 136, 1360, 588 * 1360};
+            int flip_at = -1;
+            int flip_n = 0;
+            Bytes flipped((uint64_t) qkv.size());
+            for (int local : candidates) {
+                if (local < 0 || (uint64_t) local >= qkv.size()) continue;
+                std::memcpy(flipped.data(), qkv.data(), qkv.size());
+                static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
+                w.qkv = GdnIqPlane{kIq4Xs, &flipped};
+                step(R, outf);
+                flip_n = differ_floats(static_cast<const float*>(out.data()), static_cast<const float*>(outf.data()), hc_dim);
+                if (flip_n > 0) {
+                    flip_at = local;
+                    break;
+                }
+            }
+            w.qkv = GdnIqPlane{kIq4Xs, &qkv};
+            const float* op = static_cast<const float*>(out.data());
+            const float* o2 = static_cast<const float*>(out2.data());
+            const float* oz = static_cast<const float*>(outz.data());
+            const float* of = static_cast<const float*>(outf.data());
+            const bool guard_held = op[hc_dim] == 7.f && o2[hc_dim] == 7.f && oz[hc_dim] == 7.f &&
+                                    (flip_at < 0 || of[hc_dim] == 7.f);
+            const bool live = all_finite(op, hc_dim) && all_finite(o2, hc_dim) && all_finite(oz, hc_dim) &&
+                              all_finite(host_block.data(), n_embd) && all_finite(host_write.data(), hc_dim) &&
+                              all_finite(gpu_state.data(), state_n) && all_finite(host_state.data(), state_n) &&
+                              !still_seven(op, hc_dim);
+            const int again = differ_floats(op, o2, hc_dim);
+            const int apart = differ_floats(op, oz, hc_dim);
+            const double apart_rel = rel_l1(op, oz, hc_dim);
+            step_ok = live && guard_held && block_rel <= 1e-5 && state_rel <= 1e-5 && conv_rel <= 1e-5 &&
+                      write_rel <= 1e-4 && state_moved > 0 && conv_moved > 0;
+            repeat_ok = live && guard_held && again == 0;
+            moved_ok = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            flipped_ok = live && guard_held && flip_n > 0;
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "block %.3e, state %.3e, conv %.3e, write %.3e, state moved %d, conv moved %d, PLE not applied",
+                          block_rel, state_rel, conv_rel, write_rel, state_moved, conv_moved);
+            step_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, hc_dim, apart_rel * 100.0);
+            move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flip_n, hc_dim, flip_at);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            step_detail = e.what();
+            repeat_detail = e.what();
+            move_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("the layer-1 GDN step matches", bytes && step_ok, step_detail);
+    verdict("that layer-1 step repeats", bytes && repeat_ok, repeat_detail);
+    verdict("a zero residual moves that layer-1 step", bytes && moved_ok, move_detail);
+    verdict("a changed query byte moves that layer-1 step", bytes && flipped_ok, flip_detail);
 }
 
 void run_q2_layer() {
@@ -7888,6 +8066,7 @@ void run_q2_layer() {
     run_layer_route(table, g, blob);
     run_routed_ten(table, g, blob);
     run_carried_pair(table, g, blob);
+    run_layer1_gdn(g);
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -7909,6 +8088,7 @@ int main(int argc, char** argv) {
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
         "one shared expert on that residual, one router selection on that residual, "
         "one routed ten on that residual, one carried state into a second token, "
+        "one layer-1 GDN step on that residual, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
