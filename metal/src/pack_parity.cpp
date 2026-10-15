@@ -4005,6 +4005,189 @@ void run_q2_layer() {
     verdict("that feed-forward half repeats", ffn_bytes && ffn_repeat, ffn_repeat_detail);
     verdict("a zero residual moves the feed-forward half", ffn_bytes && ffn_moved, ffn_move_detail);
     verdict("a changed expert code moves that half", ffn_bytes && ffn_flipped, ffn_flip_detail);
+
+    // One layer-0 pass. The attention write is the residual the feed-forward half reads.
+    // The router logits stay off the expert block. The shared-expert rows are not read.
+    const bool pass_bytes = half_bytes && ffn_bytes;
+    bool pass_ok = false;
+    bool pass_repeat = false;
+    bool pass_moved = false;
+    bool pass_flipped = false;
+    std::string pass_detail = "bytes";
+    std::string pass_repeat_detail = "bytes";
+    std::string pass_move_detail = "bytes";
+    std::string pass_flip_detail = "bytes";
+    if (pass_bytes) {
+        try {
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = norm_w->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+            const size_t gu = iq_row_bytes(kQ2_0, n_embd);
+            const int64_t up_off = (int64_t) n_ff * (int64_t) gu;
+            const int64_t down_off = up_off * 2;
+            Bytes expert_w((uint64_t) blob.size());
+            std::memcpy(expert_w.data(), blob.data(), expert_w.size());
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4);
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int i = 0; i < hc_dim; ++i) Rp[i] = ((i * 17) % 29) * 0.02f - 0.2f;
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            const int guard_n = hc_dim + guard;
+            Bytes y((uint64_t) guard_n * 4), y2((uint64_t) guard_n * 4), yz((uint64_t) guard_n * 4);
+            Bytes yf((uint64_t) guard_n * 4), mid((uint64_t) guard_n * 4);
+            std::fill_n(static_cast<float*>(y.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(y2.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(yz.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(yf.data()), (size_t) guard_n, 7.f);
+            std::fill_n(static_cast<float*>(mid.data()), (size_t) guard_n, 7.f);
+            Bytes mixed((uint64_t) n_embd * 4), block((uint64_t) (n_embd + guard) * 4), inject((uint64_t) hc * 4);
+            Bytes x_bf16((uint64_t) n_embd * 2), route((uint64_t) n_expert * 4);
+            Bytes xq(iq_q8_1_bytes(n_embd)), gate_y((uint64_t) n_ff * 4), up_y((uint64_t) n_ff * 4);
+            Bytes hq(iq_q8_1_bytes(n_ff));
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto run_pass = [&](const Bytes& residual, const GdnIqWeights& ww, const Bytes& expert, Bytes& out) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(mid.data()), (size_t) guard_n, 7.f);
+                std::fill_n(static_cast<float*>(block.data()), (size_t) (n_embd + guard), 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, *norm_h->values, *down_w->values, *up_w->values, inj_w->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                gdn_layer_iq(lg, ww, st, sc, mixed, block);
+                gr_write(gs, residual, block, inject, mid);
+                std::fill_n(static_cast<float*>(block.data()), (size_t) (n_embd + guard), 7.f);
+                gr_read(gs, mid, *ffn_norm->values, *ffn_down->values, *ffn_up->values, ffn_inj->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                f32_to_bf16_bulk(mixed, x_bf16, n_embd);
+                bf16_gemv(x_bf16, *router->values, route, n_embd, n_expert);
+                iq_quantize_q8_1(mixed, n_embd, xq);
+                iq_mmvq(kQ2_0, expert, 0, xq, n_embd, n_ff, 1, gate_y);
+                iq_mmvq(kQ2_0, expert, up_off, xq, n_embd, n_ff, 1, up_y);
+                iq_swiglu_q8(gate_y, up_y, n_ff, hq);
+                iq_mmvq(kQ2_0, expert, down_off, hq, n_ff, n_embd, 1, block);
+                gr_write(gs, mid, block, inject, out);
+            };
+            run_pass(R, w, expert_w, y);
+            std::vector<float> got_attn((size_t) hc_dim), got_mixed((size_t) n_embd), got_route((size_t) n_expert);
+            std::vector<float> got_block((size_t) n_embd);
+            std::memcpy(got_attn.data(), mid.data(), got_attn.size() * 4);
+            std::memcpy(got_mixed.data(), mixed.data(), got_mixed.size() * 4);
+            std::memcpy(got_route.data(), route.data(), got_route.size() * 4);
+            std::memcpy(got_block.data(), block.data(), got_block.size() * 4);
+            const AttnHalf host_attn = layer0_attn_host(
+                Rp, static_cast<const float*>(norm_h->values->data()),
+                static_cast<const uint16_t*>(down_w->values->data()),
+                static_cast<const uint16_t*>(up_w->values->data()),
+                static_cast<const uint16_t*>(inj_w->values->data()),
+                static_cast<const uint8_t*>(qkv->values->data()), static_cast<const uint8_t*>(gate->values->data()),
+                static_cast<const uint8_t*>(ssm->values->data()),
+                static_cast<const uint16_t*>(alpha_w->values->data()),
+                static_cast<const uint16_t*>(beta_w->values->data()),
+                static_cast<const float*>(conv_w->values->data()), static_cast<const float*>(norm_w->values->data()),
+                static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                n_embd, hc, hc_lr, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+            // The feed-forward host reads the residual this pass wrote. A second host, from the
+            // attention host's residual, records how that small gap moves the expert.
+            const FfnHalf host_ffn = layer0_ffn_host(
+                got_attn.data(), static_cast<const float*>(ffn_norm->values->data()),
+                static_cast<const uint16_t*>(ffn_down->values->data()),
+                static_cast<const uint16_t*>(ffn_up->values->data()),
+                static_cast<const uint16_t*>(ffn_inj->values->data()),
+                static_cast<const uint16_t*>(router->values->data()),
+                static_cast<const uint8_t*>(expert_w.data()), n_embd, n_ff, n_expert, hc, hc_lr);
+            const FfnHalf host_chain = layer0_ffn_host(
+                host_attn.out.data(), static_cast<const float*>(ffn_norm->values->data()),
+                static_cast<const uint16_t*>(ffn_down->values->data()),
+                static_cast<const uint16_t*>(ffn_up->values->data()),
+                static_cast<const uint16_t*>(ffn_inj->values->data()),
+                static_cast<const uint16_t*>(router->values->data()),
+                static_cast<const uint8_t*>(expert_w.data()), n_embd, n_ff, n_expert, hc, hc_lr);
+            const bool block_guard = static_cast<const float*>(block.data())[n_embd] == 7.f;
+            const bool mid_guard = static_cast<const float*>(mid.data())[hc_dim] == 7.f;
+            run_pass(R, w, expert_w, y2);
+            run_pass(zero_r, w, expert_w, yz);
+            const float* cw = static_cast<const float*>(conv_w->values->data());
+            int channel = 0;
+            float best_tap = 0.f;
+            for (int c = 0; c < (int) (lg.S * lg.h_k); ++c) {
+                const float tap = std::fabs(cw[(size_t) c * lg.d_conv + (lg.d_conv - 1)]);
+                if (tap > best_tap) {
+                    best_tap = tap;
+                    channel = c;
+                }
+            }
+            const int flip_at = channel * (int) iq_row_bytes(kIq4Xs, n_embd) + 8;
+            Bytes flipped(qkv->values->size());
+            std::memcpy(flipped.data(), qkv->values->data(), flipped.size());
+            static_cast<uint8_t*>(flipped.data())[flip_at] ^= 1u;
+            GdnIqWeights wf = w;
+            wf.qkv.weights = &flipped;
+            run_pass(R, wf, expert_w, yf);
+
+            const float* yp = static_cast<const float*>(y.data());
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const float* yfp = static_cast<const float*>(yf.data());
+            const bool guard_held = yp[hc_dim] == 7.f && y2p[hc_dim] == 7.f && yzp[hc_dim] == 7.f && yfp[hc_dim] == 7.f &&
+                                    mid_guard && block_guard;
+            const bool live = all_finite(yp, hc_dim) && all_finite(y2p, hc_dim) && all_finite(yzp, hc_dim) &&
+                              all_finite(yfp, hc_dim) && all_finite(host_attn.out.data(), hc_dim) &&
+                              all_finite(host_ffn.mixed.data(), n_embd) && all_finite(host_ffn.router.data(), n_expert) &&
+                              all_finite(host_ffn.block.data(), n_embd) && all_finite(host_ffn.out.data(), hc_dim) &&
+                              all_finite(host_chain.block.data(), n_embd) && all_finite(host_chain.out.data(), hc_dim) &&
+                              all_finite(got_attn.data(), hc_dim) && all_finite(got_mixed.data(), n_embd) &&
+                              all_finite(got_route.data(), n_expert) && all_finite(got_block.data(), n_embd) &&
+                              !still_seven(yp, hc_dim) && !still_seven(got_attn.data(), hc_dim);
+            const double attn_rel = rel_l1(host_attn.out.data(), got_attn.data(), hc_dim);
+            const double read_rel = rel_l1(host_ffn.mixed.data(), got_mixed.data(), n_embd);
+            const double route_rel = rel_l1(host_ffn.router.data(), got_route.data(), n_expert);
+            const double expert_rel = rel_l1(host_ffn.block.data(), got_block.data(), n_embd);
+            const double write_rel = rel_l1(host_ffn.out.data(), yp, hc_dim);
+            const double chain_expert = rel_l1(host_chain.block.data(), got_block.data(), n_embd);
+            const double chain_write = rel_l1(host_chain.out.data(), yp, hc_dim);
+            const int again = differ_floats(yp, y2p, hc_dim);
+            const int apart = differ_floats(yp, yzp, hc_dim);
+            const int flipped_n = differ_floats(yp, yfp, hc_dim);
+            const double apart_rel = rel_l1(yp, yzp, hc_dim);
+            pass_ok = live && guard_held && attn_rel <= 1e-4 && read_rel <= 1e-4 && route_rel <= 1e-4 &&
+                      expert_rel <= 1e-4 && write_rel <= 1e-4;
+            pass_repeat = live && guard_held && again == 0;
+            pass_moved = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            pass_flipped = live && guard_held && flipped_n > 0;
+            char buf[240];
+            std::snprintf(buf, sizeof buf,
+                          "attn %.3e, read %.3e, router %.3e, expert %.3e, write %.3e, chain expert %.3e, chain write %.3e",
+                          attn_rel, read_rel, route_rel, expert_rel, write_rel, chain_expert, chain_write);
+            pass_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            pass_repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, hc_dim, apart_rel * 100.0);
+            pass_move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, channel %d", flipped_n, hc_dim, channel);
+            pass_flip_detail = buf;
+        } catch (const MetalError& e) {
+            pass_detail = e.what();
+            pass_repeat_detail = e.what();
+            pass_move_detail = e.what();
+            pass_flip_detail = e.what();
+        }
+    }
+    verdict("the layer-0 pass matches", pass_bytes && pass_ok, pass_detail);
+    verdict("that layer-0 pass repeats", pass_bytes && pass_repeat, pass_repeat_detail);
+    verdict("a zero residual moves the layer-0 pass", pass_bytes && pass_moved, pass_move_detail);
+    verdict("a changed query code moves the layer-0 pass", pass_bytes && pass_flipped, pass_flip_detail);
 }
 
 }  // namespace
@@ -4018,7 +4201,8 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half\n\n");
+        "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
+        "one layer-0 pass\n\n");
     try {
         run_conversions();
         run_refusals();
