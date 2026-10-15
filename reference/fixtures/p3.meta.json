@@ -1,0 +1,12 @@
+{
+  "prompt": "def fibonacci(n):",
+  "prompt_tokens": [
+    727,
+    73111,
+    1393,
+    1590
+  ],
+  "bos": false,
+  "chat_template": null,
+  "output_text": "\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)\n\ndef main():\n   "
+}

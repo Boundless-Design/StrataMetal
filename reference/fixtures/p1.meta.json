@@ -1,0 +1,13 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_tokens": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "bos": false,
+  "chat_template": null,
+  "output_text": " Paris.<|im_end|>\n<|im_start|>assistant\n<think>\nThe user has stated a simple factual statement: \"The capital of France is Paris.\" This is a correct statement."
+}
