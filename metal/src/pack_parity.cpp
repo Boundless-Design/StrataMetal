@@ -5290,6 +5290,317 @@ void run_q2_layer() {
     verdict("a zero residual moves that embedding pass", emb_bytes && emb_moved, emb_move_detail);
     verdict("a changed embedding byte moves that pass", emb_bytes && emb_flipped, emb_flip_detail);
 
+    // The layer-0 write of token 7971 goes through the output mixer and the Q5_K output weight.
+    // The mixer is checked against that GPU residual. The logits are checked against that GPU mix.
+    // The host-of-host chain is reported. The checks above are unchanged. No token is drawn.
+    std::printf("\ntoken 7971 layer residual through the head\n");
+    const PackTensor* head_out = table.find("output.weight");
+    const PackTensor* head_down = table.find("output_hc_down.weight");
+    const PackTensor* head_up = table.find("output_hc_up.weight");
+    const PackTensor* head_norm = table.find("output_hc_norm.weight");
+    const int n_vocab = 248320;
+    const size_t out_row_n = (size_t) (n_embd / 256) * 176;
+    const bool head_bytes =
+        emb_bytes && head_out && head_out->values && head_out->code_bits == 0 && head_out->ne0 == n_embd &&
+        head_out->ne1 == n_vocab && head_out->values->size() == (uint64_t) n_vocab * out_row_n &&
+        head_down && head_down->values && head_down->kind == strata::core::WeightKind::Bf16InF32 &&
+        head_down->code_bits == 0 && head_down->ne0 == hc_dim && head_down->ne1 == hc_lr &&
+        head_down->values->size() == (uint64_t) hc_lr * (uint64_t) hc_dim * 2 &&
+        head_up && head_up->values && head_up->kind == strata::core::WeightKind::Bf16InF32 &&
+        head_up->code_bits == 0 && head_up->ne0 == hc_lr && head_up->ne1 == hc_dim &&
+        head_up->values->size() == (uint64_t) hc_dim * (uint64_t) hc_lr * 2 &&
+        head_norm && head_norm->values && head_norm->kind == strata::core::WeightKind::F32 &&
+        head_norm->code_bits == 0 && head_norm->ne0 == hc_dim && head_norm->ne1 == 1 &&
+        head_norm->values->size() == (uint64_t) hc_dim * 4;
+    bool lh_mix_ok = false;
+    bool lh_logits_ok = false;
+    bool lh_repeat = false;
+    bool lh_moved = false;
+    bool lh_flipped = false;
+    std::string lh_mix_detail = "bytes";
+    std::string lh_logits_detail = "bytes";
+    std::string lh_repeat_detail = "bytes";
+    std::string lh_move_detail = "bytes";
+    std::string lh_flip_detail = "bytes";
+    if (head_bytes) {
+        try {
+            const int head_token = 7971;
+            const size_t head_row_n = (size_t) (n_embd / 256) * 110;
+            const uint8_t* head_src =
+                static_cast<const uint8_t*>(emb->values->data()) + (size_t) head_token * head_row_n;
+            std::vector<float> head_row((size_t) n_embd);
+            for (int b = 0; b < n_embd / 256; ++b)
+                dequant_q3(head_src + (size_t) b * 110, head_row.data() + (size_t) b * 256);
+            double head_ms = 0;
+            for (int i = 0; i < n_embd; ++i) {
+                if (!std::isfinite(head_row[(size_t) i])) throw MetalError("embedding row is not finite");
+                head_ms += (double) head_row[(size_t) i] * (double) head_row[(size_t) i];
+            }
+            if (head_ms == 0) throw MetalError("embedding row is zero");
+
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = norm_w->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+            const size_t gu = iq_row_bytes(kQ2_0, n_embd);
+            const int64_t up_off = (int64_t) n_ff * (int64_t) gu;
+            const int64_t down_off = up_off * 2;
+            Bytes expert_w((uint64_t) blob.size());
+            std::memcpy(expert_w.data(), blob.data(), expert_w.size());
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4);
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int c = 0; c < hc; ++c)
+                std::memcpy(Rp + (size_t) c * n_embd, head_row.data(), (size_t) n_embd * sizeof(float));
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            const int guard_n = hc_dim + guard;
+            const int mix_n = n_embd + guard;
+            const int logit_n = n_vocab + guard;
+            Bytes layer_y((uint64_t) guard_n * 4), layer_y2((uint64_t) guard_n * 4);
+            Bytes layer_yz((uint64_t) guard_n * 4), layer_yf((uint64_t) guard_n * 4);
+            Bytes mid((uint64_t) guard_n * 4), block((uint64_t) (n_embd + guard) * 4);
+            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4);
+            Bytes x_bf16((uint64_t) n_embd * 2), route((uint64_t) n_expert * 4);
+            Bytes exq(iq_q8_1_bytes(n_embd)), gate_y((uint64_t) n_ff * 4), up_y((uint64_t) n_ff * 4);
+            Bytes hq(iq_q8_1_bytes(n_ff));
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto run_pass = [&](const Bytes& residual, Bytes& out) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(mid.data()), (size_t) guard_n, 7.f);
+                std::fill_n(static_cast<float*>(block.data()), (size_t) (n_embd + guard), 7.f);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) guard_n, 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, *norm_h->values, *down_w->values, *up_w->values, inj_w->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                gdn_layer_iq(lg, w, st, sc, mixed, block);
+                gr_write(gs, residual, block, inject, mid);
+                std::fill_n(static_cast<float*>(block.data()), (size_t) (n_embd + guard), 7.f);
+                gr_read(gs, mid, *ffn_norm->values, *ffn_down->values, *ffn_up->values, ffn_inj->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                f32_to_bf16_bulk(mixed, x_bf16, n_embd);
+                bf16_gemv(x_bf16, *router->values, route, n_embd, n_expert);
+                iq_quantize_q8_1(mixed, n_embd, exq);
+                iq_mmvq(kQ2_0, expert_w, 0, exq, n_embd, n_ff, 1, gate_y);
+                iq_mmvq(kQ2_0, expert_w, up_off, exq, n_embd, n_ff, 1, up_y);
+                iq_swiglu_q8(gate_y, up_y, n_ff, hq);
+                iq_mmvq(kQ2_0, expert_w, down_off, hq, n_ff, n_embd, 1, block);
+                gr_write(gs, mid, block, inject, out);
+            };
+            Bytes mix_y((uint64_t) mix_n * 4), mix_y2((uint64_t) mix_n * 4);
+            Bytes mix_yz((uint64_t) mix_n * 4), mix_yf((uint64_t) mix_n * 4);
+            Bytes logits((uint64_t) logit_n * 4), logits2((uint64_t) logit_n * 4);
+            Bytes logits_z((uint64_t) logit_n * 4), logits_f((uint64_t) logit_n * 4);
+            Bytes head_inject((uint64_t) (hc + guard) * 4);
+            auto fill7 = [](Bytes& b) { std::fill_n(static_cast<float*>(b.data()), (size_t) (b.size() / 4), 7.f); };
+            fill7(mix_y);
+            fill7(mix_y2);
+            fill7(mix_yz);
+            fill7(mix_yf);
+            fill7(logits);
+            fill7(logits2);
+            fill7(logits_z);
+            fill7(logits_f);
+            fill7(head_inject);
+            bool inject_held = true;
+            auto mix_read = [&](const Bytes& residual, Bytes& out) {
+                std::fill_n(static_cast<float*>(head_inject.data()), (size_t) (hc + guard), 7.f);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) mix_n, 7.f);
+                gr_read(gs, residual, *head_norm->values, *head_down->values, *head_up->values, nullptr, 1e-6f, false,
+                        gr, out, head_inject);
+                if (!still_seven(static_cast<const float*>(head_inject.data()), hc + guard)) inject_held = false;
+            };
+            auto project = [&](const Bytes& mix, Bytes& out) {
+                Bytes act((uint64_t) n_embd * 4);
+                std::memcpy(act.data(), mix.data(), act.size());
+                Bytes q(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(act, n_embd, q);
+                fill7(out);
+                iq_mmvq(kQ5_K, *head_out->values, 0, q, n_embd, n_vocab, 1, out);
+                return q;
+            };
+
+            run_pass(R, layer_y);
+            std::vector<float> got_attn((size_t) hc_dim), got_layer((size_t) hc_dim);
+            std::memcpy(got_attn.data(), mid.data(), got_attn.size() * 4);
+            std::memcpy(got_layer.data(), layer_y.data(), got_layer.size() * 4);
+            mix_read(layer_y, mix_y);
+            const Bytes head_q = project(mix_y, logits);
+            std::vector<uint8_t> xqb((size_t) head_q.size());
+            std::memcpy(xqb.data(), head_q.data(), xqb.size());
+            const AttnHalf host_attn = layer0_attn_host(
+                Rp, static_cast<const float*>(norm_h->values->data()),
+                static_cast<const uint16_t*>(down_w->values->data()),
+                static_cast<const uint16_t*>(up_w->values->data()),
+                static_cast<const uint16_t*>(inj_w->values->data()),
+                static_cast<const uint8_t*>(qkv->values->data()), static_cast<const uint8_t*>(gate->values->data()),
+                static_cast<const uint8_t*>(ssm->values->data()),
+                static_cast<const uint16_t*>(alpha_w->values->data()),
+                static_cast<const uint16_t*>(beta_w->values->data()),
+                static_cast<const float*>(conv_w->values->data()), static_cast<const float*>(norm_w->values->data()),
+                static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                n_embd, hc, hc_lr, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+            const FfnHalf host_ffn = layer0_ffn_host(
+                got_attn.data(), static_cast<const float*>(ffn_norm->values->data()),
+                static_cast<const uint16_t*>(ffn_down->values->data()),
+                static_cast<const uint16_t*>(ffn_up->values->data()),
+                static_cast<const uint16_t*>(ffn_inj->values->data()),
+                static_cast<const uint16_t*>(router->values->data()),
+                static_cast<const uint8_t*>(expert_w.data()), n_embd, n_ff, n_expert, hc, hc_lr);
+            const FfnHalf host_chain = layer0_ffn_host(
+                host_attn.out.data(), static_cast<const float*>(ffn_norm->values->data()),
+                static_cast<const uint16_t*>(ffn_down->values->data()),
+                static_cast<const uint16_t*>(ffn_up->values->data()),
+                static_cast<const uint16_t*>(ffn_inj->values->data()),
+                static_cast<const uint16_t*>(router->values->data()),
+                static_cast<const uint8_t*>(expert_w.data()), n_embd, n_ff, n_expert, hc, hc_lr);
+            const float* norm_mix = static_cast<const float*>(head_norm->values->data());
+            const uint16_t* down_mix = static_cast<const uint16_t*>(head_down->values->data());
+            const uint16_t* up_mix = static_cast<const uint16_t*>(head_up->values->data());
+            const std::vector<float> host_mix =
+                output_mix_host(got_layer.data(), norm_mix, down_mix, up_mix, n_embd, hc, hc_lr, nullptr);
+            const std::vector<float> chain_mix =
+                output_mix_host(host_chain.out.data(), norm_mix, down_mix, up_mix, n_embd, hc, hc_lr, nullptr);
+            const uint8_t* out_bytes = static_cast<const uint8_t*>(head_out->values->data());
+            std::vector<float> host_logits((size_t) n_vocab), scalar_logits((size_t) n_vocab);
+            k_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, host_logits.data());
+            scalar_ref(out_bytes, xqb.data(), n_embd, n_vocab, true, scalar_logits.data());
+            std::vector<float> chain_logits((size_t) n_vocab);
+            double chain_logit_rel = std::nan("");
+            bool chain_ran = false;
+            if (all_finite(chain_mix.data(), n_embd)) {
+                Bytes chain_act((uint64_t) n_embd * 4);
+                std::memcpy(chain_act.data(), chain_mix.data(), chain_act.size());
+                Bytes chain_q(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(chain_act, n_embd, chain_q);
+                std::vector<uint8_t> chain_qb((size_t) chain_q.size());
+                std::memcpy(chain_qb.data(), chain_q.data(), chain_qb.size());
+                k_ref(out_bytes, chain_qb.data(), n_embd, n_vocab, true, chain_logits.data());
+                chain_ran = true;
+            }
+
+            run_pass(R, layer_y2);
+            mix_read(layer_y2, mix_y2);
+            const Bytes head_q2 = project(mix_y2, logits2);
+            run_pass(zero_r, layer_yz);
+            mix_read(layer_yz, mix_yz);
+            project(mix_yz, logits_z);
+
+            std::vector<uint8_t> row_copy(head_row_n);
+            auto launch_flip = [&](int local, bool with_logits) {
+                std::memcpy(row_copy.data(), head_src, head_row_n);
+                row_copy[(size_t) local] ^= 1u;
+                std::vector<float> flipped_row((size_t) n_embd);
+                for (int b = 0; b < n_embd / 256; ++b)
+                    dequant_q3(row_copy.data() + (size_t) b * 110, flipped_row.data() + (size_t) b * 256);
+                Bytes Rf((uint64_t) hc_dim * 4);
+                auto* Rfp = static_cast<float*>(Rf.data());
+                for (int c = 0; c < hc; ++c)
+                    std::memcpy(Rfp + (size_t) c * n_embd, flipped_row.data(), (size_t) n_embd * sizeof(float));
+                run_pass(Rf, layer_yf);
+                mix_read(layer_yf, mix_yf);
+                if (with_logits) project(mix_yf, logits_f);
+            };
+            int flip_local = 32;
+            launch_flip(flip_local, true);
+
+            const float* layer_p = static_cast<const float*>(layer_y.data());
+            const float* layer2_p = static_cast<const float*>(layer_y2.data());
+            const float* layerz_p = static_cast<const float*>(layer_yz.data());
+            const float* layerf_p = static_cast<const float*>(layer_yf.data());
+            const float* mp = static_cast<const float*>(mix_y.data());
+            const float* m2p = static_cast<const float*>(mix_y2.data());
+            const float* mzp = static_cast<const float*>(mix_yz.data());
+            const float* mfp = static_cast<const float*>(mix_yf.data());
+            const float* lp = static_cast<const float*>(logits.data());
+            const float* l2p = static_cast<const float*>(logits2.data());
+            const float* lzp = static_cast<const float*>(logits_z.data());
+            const float* lfp = static_cast<const float*>(logits_f.data());
+            int flipped_n = differ_floats(lp, lfp, n_vocab);
+            if (flipped_n == 0) {
+                for (int i = 0; i < (int) head_row_n; ++i) {
+                    if (i == 32) continue;
+                    launch_flip(i, false);
+                    if (differ_floats(mp, mfp, n_embd) == 0) continue;
+                    project(mix_yf, logits_f);
+                    flipped_n = differ_floats(lp, lfp, n_vocab);
+                    if (flipped_n > 0) {
+                        flip_local = i;
+                        break;
+                    }
+                }
+            }
+            const int flip_at = (int) ((size_t) head_token * head_row_n + (size_t) flip_local);
+            if (chain_ran && all_finite(chain_logits.data(), n_vocab))
+                chain_logit_rel = rel_l1(chain_logits.data(), lp, n_vocab);
+
+            const bool guard_held = layer_p[hc_dim] == 7.f && layer2_p[hc_dim] == 7.f && layerz_p[hc_dim] == 7.f &&
+                                    layerf_p[hc_dim] == 7.f && mp[n_embd] == 7.f && m2p[n_embd] == 7.f &&
+                                    mzp[n_embd] == 7.f && mfp[n_embd] == 7.f && lp[n_vocab] == 7.f &&
+                                    l2p[n_vocab] == 7.f && lzp[n_vocab] == 7.f && lfp[n_vocab] == 7.f;
+            const bool q_same = head_q.size() == head_q2.size() &&
+                                std::memcmp(head_q.data(), head_q2.data(), head_q.size()) == 0;
+            const bool chain_mix_ok = all_finite(chain_mix.data(), n_embd);
+            const double chain_mix_rel = chain_mix_ok ? rel_l1(chain_mix.data(), mp, n_embd) : std::nan("");
+            const bool live = all_finite(layer_p, hc_dim) && all_finite(layer2_p, hc_dim) && all_finite(layerz_p, hc_dim) &&
+                              all_finite(layerf_p, hc_dim) && all_finite(mp, n_embd) && all_finite(m2p, n_embd) &&
+                              all_finite(mzp, n_embd) && all_finite(mfp, n_embd) && all_finite(lp, n_vocab) &&
+                              all_finite(l2p, n_vocab) && all_finite(lzp, n_vocab) && all_finite(lfp, n_vocab) &&
+                              all_finite(host_ffn.out.data(), hc_dim) && all_finite(host_mix.data(), n_embd) &&
+                              all_finite(host_logits.data(), n_vocab) && all_finite(scalar_logits.data(), n_vocab) &&
+                              !still_seven(layer_p, hc_dim) && !still_seven(mp, n_embd) && !still_seven(lp, n_vocab);
+            const double write_rel = rel_l1(host_ffn.out.data(), got_layer.data(), hc_dim);
+            const double mix_rel = rel_l1(host_mix.data(), mp, n_embd);
+            const double rel = rel_l1(scalar_logits.data(), lp, n_vocab);
+            const double irel = rel_l1(host_logits.data(), lp, n_vocab);
+            const int again = differ_floats(lp, l2p, n_vocab);
+            const int mix_again = differ_floats(mp, m2p, n_embd);
+            const int layer_again = differ_floats(layer_p, layer2_p, hc_dim);
+            const int apart = differ_floats(lp, lzp, n_vocab);
+            const double apart_rel = rel_l1(lp, lzp, n_vocab);
+            lh_mix_ok = live && guard_held && inject_held && write_rel <= 1e-4 && mix_rel <= 1e-4;
+            lh_logits_ok = live && guard_held && inject_held && rel <= 1e-5 && irel <= 1e-5;
+            lh_repeat = live && guard_held && inject_held && again == 0 && mix_again == 0 && layer_again == 0 && q_same;
+            lh_moved = live && guard_held && inject_held && apart > 0 && std::isfinite(apart_rel);
+            lh_flipped = live && guard_held && inject_held && flipped_n > 0;
+            char buf[320];
+            std::snprintf(buf, sizeof buf, "token %d, write %.3e, mix %.3e, inject %d, chain mix %.3e", head_token,
+                          write_rel, mix_rel, inject_held ? 1 : 0, chain_mix_rel);
+            lh_mix_detail = buf;
+            std::snprintf(buf, sizeof buf, "rel %.3e, integer %.3e, %d rows, chain %.3e", rel, irel, n_vocab,
+                          chain_logit_rel);
+            lh_logits_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            lh_repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, n_vocab, apart_rel * 100.0);
+            lh_move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flipped_n, n_vocab, flip_at);
+            lh_flip_detail = buf;
+        } catch (const MetalError& e) {
+            lh_mix_detail = e.what();
+            lh_logits_detail = e.what();
+            lh_repeat_detail = e.what();
+            lh_move_detail = e.what();
+            lh_flip_detail = e.what();
+        }
+    }
+    verdict("the layer-head mix matches", head_bytes && lh_mix_ok, lh_mix_detail);
+    verdict("the layer-head logits match", head_bytes && lh_logits_ok, lh_logits_detail);
+    verdict("that layer head repeats", head_bytes && lh_repeat, lh_repeat_detail);
+    verdict("a zero residual moves that layer head", head_bytes && lh_moved, lh_move_detail);
+    verdict("a changed embedding byte moves that layer head", head_bytes && lh_flipped, lh_flip_detail);
+
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -5308,7 +5619,8 @@ int main(int argc, char** argv) {
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
-        "one layer-0 pass, one embedding through that pass, one shared expert, one Q3_K embedding, "
+        "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
+        "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
         run_conversions();
