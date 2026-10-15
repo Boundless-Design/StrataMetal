@@ -3892,6 +3892,165 @@ void run_vocab_rows(const PackTable& table, const strata::core::ModelGeometry& g
     verdict("the embedding gather refuses these rows", refused && held, got);
 }
 
+// The output mixer is the residual read with no inject weight. The norm is used as stored.
+// Same read as the layer-0 residual. The layer-0 pass does not read these rows.
+// live_i is the down-row element with the largest rounded activation.
+std::vector<float> output_mix_host(const float* R, const float* norm_w, const uint16_t* down_w, const uint16_t* up_w,
+                                   int n_embd, int hc, int hc_lr, int* live_i) {
+    const int hc_dim = hc * n_embd;
+    std::vector<float> xn((size_t) hc_dim);
+    for (int c = 0; c < hc; ++c) {
+        double ms = 0;
+        for (int d = 0; d < n_embd; ++d) {
+            const double v = R[(size_t) c * n_embd + d];
+            ms += v * v;
+        }
+        ms /= (double) n_embd;
+        const float rs = (float) (1.0 / std::sqrt(ms + 1e-6));
+        for (int d = 0; d < n_embd; ++d) {
+            const size_t i = (size_t) c * n_embd + d;
+            xn[i] = R[i] * rs * norm_w[i];
+        }
+    }
+    std::vector<float> act((size_t) hc_dim);
+    int best_i = 0;
+    float best = 0.f;
+    for (int i = 0; i < hc_dim; ++i) {
+        act[(size_t) i] = round_bf16(xn[(size_t) i]);
+        const float a = std::fabs(act[(size_t) i]);
+        if (a > best) {
+            best = a;
+            best_i = i;
+        }
+    }
+    if (live_i) *live_i = best_i;
+    std::vector<float> lo((size_t) hc_lr);
+    for (int k = 0; k < hc_lr; ++k) {
+        const float p = bf16_dot(act.data(), down_w + (size_t) k * hc_dim, hc_dim);
+        lo[(size_t) k] = gdn_silu(p / (float) hc);
+    }
+    std::vector<float> lq((size_t) hc_lr);
+    for (int k = 0; k < hc_lr; ++k) lq[(size_t) k] = round_bf16(lo[(size_t) k]);
+    std::vector<float> mixed((size_t) n_embd, 0.f);
+    for (int d = 0; d < n_embd; ++d) {
+        float m = 0.f;
+        for (int c = 0; c < hc; ++c) {
+            const int i = c * n_embd + d;
+            const float g = bf16_dot(lq.data(), up_w + (size_t) i * hc_lr, hc_lr);
+            m += xn[(size_t) i] * gdn_sigmoid(g);
+        }
+        mixed[(size_t) d] = m / (float) hc;
+    }
+    return mixed;
+}
+
+// gr_read of output_hc_down, output_hc_norm, and output_hc_up. No inject, no residual write,
+// no output projection. This is not added into the layer-0 residual and it does not draw a token.
+void run_output_mix(const PackTable& table, const strata::core::ModelGeometry& g) {
+    std::printf("\noutput mixer from the extracted pack\n");
+    const int n_embd = (int) g.n_embd;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const PackTensor* down = table.find("output_hc_down.weight");
+    const PackTensor* up = table.find("output_hc_up.weight");
+    const PackTensor* norm = table.find("output_hc_norm.weight");
+    const bool bytes =
+        down && down->values && down->kind == strata::core::WeightKind::Bf16InF32 && down->code_bits == 0 &&
+        down->ne0 == hc_dim && down->ne1 == hc_lr && down->values->size() == (uint64_t) hc_lr * (uint64_t) hc_dim * 2 &&
+        up && up->values && up->kind == strata::core::WeightKind::Bf16InF32 && up->code_bits == 0 &&
+        up->ne0 == hc_lr && up->ne1 == hc_dim && up->values->size() == (uint64_t) hc_dim * (uint64_t) hc_lr * 2 &&
+        norm && norm->values && norm->kind == strata::core::WeightKind::F32 && norm->code_bits == 0 &&
+        norm->ne0 == hc_dim && norm->ne1 == 1 && norm->values->size() == (uint64_t) hc_dim * 4;
+    bool ok = false;
+    bool repeat = false;
+    bool cleared = false;
+    bool flipped = false;
+    std::string detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string zero_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (bytes) {
+        try {
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const int guard = 1;
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int i = 0; i < hc_dim; ++i) Rp[i] = ((i * 17) % 29) * 0.02f - 0.2f;
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            Bytes y((uint64_t) (n_embd + guard) * 4), y2((uint64_t) (n_embd + guard) * 4);
+            Bytes yz((uint64_t) (n_embd + guard) * 4), yf((uint64_t) (n_embd + guard) * 4);
+            Bytes inject((uint64_t) (hc + guard) * 4);
+            auto fill7 = [](Bytes& b) { std::fill_n(static_cast<float*>(b.data()), (size_t) (b.size() / 4), 7.f); };
+            fill7(y);
+            fill7(y2);
+            fill7(yz);
+            fill7(yf);
+            fill7(inject);
+            GrScratch gr = make_gr_scratch(gs);
+            bool inject_held = true;
+            auto read = [&](const Bytes& residual, const Bytes& down_w, Bytes& out) {
+                std::fill_n(static_cast<float*>(inject.data()), (size_t) (hc + guard), 7.f);
+                gr_read(gs, residual, *norm->values, down_w, *up->values, nullptr, 1e-6f, false, gr, out, inject);
+                if (!still_seven(static_cast<const float*>(inject.data()), hc + guard)) inject_held = false;
+            };
+            read(R, *down->values, y);
+            int live_i = 0;
+            const std::vector<float> host = output_mix_host(
+                Rp, static_cast<const float*>(norm->values->data()),
+                static_cast<const uint16_t*>(down->values->data()),
+                static_cast<const uint16_t*>(up->values->data()), n_embd, hc, hc_lr, &live_i);
+            read(R, *down->values, y2);
+            read(zero_r, *down->values, yz);
+            const int flip_at = live_i * 2 + 1;
+            Bytes down_flip(down->values->size());
+            std::memcpy(down_flip.data(), down->values->data(), down_flip.size());
+            static_cast<uint8_t*>(down_flip.data())[flip_at] ^= 1u;
+            read(R, down_flip, yf);
+
+            const float* yp = static_cast<const float*>(y.data());
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const float* yfp = static_cast<const float*>(yf.data());
+            const bool guard_held = yp[n_embd] == 7.f && y2p[n_embd] == 7.f && yzp[n_embd] == 7.f && yfp[n_embd] == 7.f;
+            const bool live = all_finite(yp, n_embd) && all_finite(y2p, n_embd) && all_finite(yzp, n_embd) &&
+                              all_finite(yfp, n_embd) && all_finite(host.data(), n_embd) && !still_seven(yp, n_embd);
+            const double rel = rel_l1(host.data(), yp, n_embd);
+            const int again = differ_floats(yp, y2p, n_embd);
+            int zeros = 0;
+            for (int i = 0; i < n_embd; ++i)
+                if (yzp[i] == 0.f) ++zeros;
+            const int apart = differ_floats(yp, yzp, n_embd);
+            const double apart_rel = rel_l1(yp, yzp, n_embd);
+            const int flipped_n = differ_floats(yp, yfp, n_embd);
+            ok = live && guard_held && inject_held && rel <= 1e-4;
+            repeat = live && guard_held && inject_held && again == 0;
+            cleared = live && guard_held && inject_held && zeros == n_embd && apart > 0 && std::isfinite(apart_rel);
+            flipped = live && guard_held && inject_held && flipped_n > 0;
+            char buf[180];
+            std::snprintf(buf, sizeof buf, "rel %.3e, %d rows, inject %d", rel, n_embd, inject_held ? 1 : 0);
+            detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d are zero, %d differ, %.2f%% apart", zeros, n_embd, apart,
+                          apart_rel * 100.0);
+            zero_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flipped_n, n_embd, flip_at);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            detail = e.what();
+            repeat_detail = e.what();
+            zero_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("the output mixer matches", bytes && ok, detail);
+    verdict("that output mixer repeats", bytes && repeat, repeat_detail);
+    verdict("a zero residual clears the output mixer", bytes && cleared, zero_detail);
+    verdict("a changed down byte moves the mixer", bytes && flipped, flip_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -4707,6 +4866,7 @@ void run_q2_layer() {
 
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
+    run_output_mix(table, g);
 }
 
 }  // namespace
@@ -4721,7 +4881,7 @@ int main(int argc, char** argv) {
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
-        "one layer-0 pass, one shared expert, one Q3_K embedding, one output weight\n\n");
+        "one layer-0 pass, one shared expert, one Q3_K embedding, one output weight, one output mixer\n\n");
     try {
         run_conversions();
         run_refusals();
