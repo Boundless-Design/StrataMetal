@@ -9,6 +9,7 @@
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
 #include "strata/metal/launch.hpp"
+#include "strata/metal/qsa_layer.hpp"
 #include "strata/metal/rope.hpp"
 #include "strata/metal/s2_gemv.hpp"
 #include "strata/metal/sgemv.hpp"
@@ -8501,6 +8502,430 @@ void run_layer3_attn() {
             attn_out_in, n_embd, false, 16);
 }
 
+void qsa_rms_rows(std::vector<float>& x, const float* w, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        float part[32];
+        for (int i = 0; i < 32; ++i) part[i] = 0;
+        float* row = x.data() + (size_t) r * (size_t) cols;
+        for (int c = 0; c < cols; ++c) part[c & 31] += row[c] * row[c];
+        for (int off = 16; off > 0; off >>= 1) {
+            float next[32];
+            for (int i = 0; i < 32; ++i) {
+                const float other = (i + off < 32) ? part[i + off] : 0.0f;
+                next[i] = part[i] + other;
+            }
+            for (int i = 0; i < 32; ++i) part[i] = next[i];
+        }
+        const float inv = 1.0f / std::sqrt(part[0] / (float) cols + 1e-6f);
+        for (int c = 0; c < cols; ++c) row[c] = row[c] * w[c] * inv;
+    }
+}
+
+void qsa_rope_rows(std::vector<float>& x, int rows, int head_dim, int n_rot, int pos, const float* cos_tab,
+                   const float* sin_tab) {
+    const int pairs = n_rot / 2;
+    for (int r = 0; r < rows; ++r) {
+        float* row = x.data() + (size_t) r * (size_t) head_dim;
+        for (int i = 0; i < pairs; ++i) {
+            const float a = row[i];
+            const float b = row[pairs + i];
+            const float c = cos_tab[(size_t) pos * (size_t) pairs + (size_t) i];
+            const float s = sin_tab[(size_t) pos * (size_t) pairs + (size_t) i];
+            const float ac = a * c;
+            const float bs = b * s;
+            const float as_ = a * s;
+            const float bc = b * c;
+            row[i] = ac - bs;
+            row[pairs + i] = as_ + bc;
+        }
+    }
+}
+
+std::vector<float> qsa_attend(const std::vector<float>& q, const std::vector<uint16_t>& k, const std::vector<uint16_t>& v,
+                              int n_kv, int n_head, int n_head_kv, int head_dim) {
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    const int group = n_head / n_head_kv;
+    std::vector<float> out((size_t) n_head * (size_t) head_dim, 0.f);
+    for (int h = 0; h < n_head; ++h) {
+        const int kvh = h / group;
+        std::vector<double> sc((size_t) n_kv);
+        for (int j = 0; j < n_kv; ++j) {
+            double dot = 0;
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t at =
+                    ((size_t) j * (size_t) n_head_kv + (size_t) kvh) * (size_t) head_dim + (size_t) d;
+                dot += (double) strata::kernels::f32_from_f16(k[at]) * (double) q[(size_t) h * (size_t) head_dim + d];
+            }
+            sc[(size_t) j] = (double) scale * dot;
+        }
+        double mx = sc[0];
+        for (double s : sc) mx = std::max(mx, s);
+        double sum = 0;
+        for (double& s : sc) {
+            s = std::exp(s - mx);
+            sum += s;
+        }
+        for (double& s : sc) s /= sum;
+        for (int d = 0; d < head_dim; ++d) {
+            double acc = 0;
+            for (int j = 0; j < n_kv; ++j) {
+                const size_t at =
+                    ((size_t) j * (size_t) n_head_kv + (size_t) kvh) * (size_t) head_dim + (size_t) d;
+                acc += sc[(size_t) j] * (double) strata::kernels::f32_from_f16(v[at]);
+            }
+            out[(size_t) h * (size_t) head_dim + (size_t) d] = (float) acc;
+        }
+    }
+    return out;
+}
+
+std::vector<float> qsa_gate(const std::vector<float>& attn, const std::vector<float>& q_full, int n_head, int head_dim) {
+    std::vector<float> out((size_t) n_head * (size_t) head_dim);
+    for (int h = 0; h < n_head; ++h) {
+        for (int d = 0; d < head_dim; ++d) {
+            const float gate = q_full[(size_t) h * (size_t) head_dim * 2u + (size_t) head_dim + (size_t) d];
+            const float s = 1.0f / (1.0f + std::exp(-gate));
+            out[(size_t) h * (size_t) head_dim + (size_t) d] =
+                attn[(size_t) h * (size_t) head_dim + (size_t) d] * s;
+        }
+    }
+    return out;
+}
+
+struct QsaHost {
+    std::vector<float> y0;
+    std::vector<float> y1;
+    std::vector<float> k1;
+};
+
+// Two cells of one activation. Position 0, then position 1. The page table is not in this walk:
+// the cells are stored in order. K and V are the fp16 values the pool stores.
+QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t* kw, const uint8_t* vw,
+                    const uint8_t* ow, const float* qn, const float* kn, const float* cos_tab, const float* sin_tab) {
+    const int n_head = 24;
+    const int n_head_kv = 2;
+    const int head_dim = 256;
+    const int n_rot = 64;
+    const int kv = n_head_kv * head_dim;
+    const int q_full_n = n_head * head_dim * 2;
+    const int q_n = n_head * head_dim;
+    std::vector<uint16_t> hk((size_t) 2 * (size_t) kv), hv(hk.size());
+    QsaHost host;
+    for (int t = 0; t < 2; ++t) {
+        Bytes xin((uint64_t) n_embd * 4u);
+        std::memcpy(xin.data(), x, (size_t) n_embd * 4u);
+        Bytes xq(iq_q8_1_bytes(n_embd));
+        iq_quantize_q8_1(xin, n_embd, xq);
+        const uint8_t* qb = static_cast<const uint8_t*>(xq.data());
+        std::vector<float> kval((size_t) kv), vval((size_t) kv), qfull((size_t) q_full_n);
+        q3_ref(kw, qb, n_embd, kv, kval.data());
+        k_ref(vw, qb, n_embd, kv, true, vval.data());
+        q2_ref(qw, qb, n_embd, q_full_n, qfull.data());
+        qsa_rms_rows(kval, kn, n_head_kv, head_dim);
+        qsa_rope_rows(kval, n_head_kv, head_dim, n_rot, t, cos_tab, sin_tab);
+        if (t == 1) host.k1 = kval;
+        for (int h = 0; h < n_head_kv; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t src = (size_t) h * (size_t) head_dim + (size_t) d;
+                const size_t at = ((size_t) t * (size_t) n_head_kv + (size_t) h) * (size_t) head_dim + (size_t) d;
+                hk[at] = strata::kernels::f16_from_f32(kval[src]);
+                hv[at] = strata::kernels::f16_from_f32(vval[src]);
+            }
+        }
+        std::vector<float> q((size_t) q_n);
+        for (int h = 0; h < n_head; ++h)
+            std::memcpy(q.data() + (size_t) h * (size_t) head_dim,
+                        qfull.data() + (size_t) h * (size_t) head_dim * 2u, (size_t) head_dim * 4u);
+        qsa_rms_rows(q, qn, n_head, head_dim);
+        qsa_rope_rows(q, n_head, head_dim, n_rot, t, cos_tab, sin_tab);
+        const std::vector<float> attn = qsa_attend(q, hk, hv, t + 1, n_head, n_head_kv, head_dim);
+        const std::vector<float> gated = qsa_gate(attn, qfull, n_head, head_dim);
+        Bytes gin((uint64_t) q_n * 4u);
+        std::memcpy(gin.data(), gated.data(), (size_t) q_n * 4u);
+        Bytes gq(iq_q8_1_bytes(q_n));
+        iq_quantize_q8_1(gin, q_n, gq);
+        std::vector<float> y((size_t) n_embd);
+        k_ref(ow, static_cast<const uint8_t*>(gq.data()), q_n, n_embd, false, y.data());
+        if (t == 0) host.y0 = std::move(y);
+        else host.y1 = std::move(y);
+    }
+    return host;
+}
+
+// Layer 3's QSA block on layer 2's shared residual. Position 0 starts from an empty cache.
+// The same activation is repeated at position 1 so the rotation is in that output.
+// The residual write is not run. Layer 1's PLE was not applied.
+void run_layer3_qsa(const strata::core::ModelGeometry& g) {
+    const auto sh = strata::kernels::qsa_real_shapes();
+    if (sh.n_head != 24 || sh.n_head_kv != 2 || sh.head_dim != 256 || sh.n_rot != 64 || sh.idx_n_head != 4 ||
+        sh.idx_dim != 128 || sh.idx_block != 4 || sh.idx_top_k != 2048 || sh.page_size != 4 ||
+        strata::kernels::qsa_freq_base() != 1.0e7)
+        throw MetalError("qsa geometry moved");
+    std::printf("\nlayer 3 QSA block on layer 2's shared residual, position 0, cache empty, layer 1 PLE not applied\n");
+    const int n_embd = (int) g.n_embd;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const int q_out = 12288;
+    const int kv_out = 512;
+    const int attn_in = 6144;
+    const uint64_t k_data = 11024672;
+    const uint64_t n_q = 8847360;
+    const uint64_t n_k = 563200;
+    const uint64_t n_v = 901120;
+    const uint64_t n_o = 8847360;
+    const std::filesystem::path shard =
+        "/Users/kamp/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf";
+    const bool bytes = (int) layer2_shared_residual.size() == hc_dim && g.n_embd == 2560 &&
+                       iq_row_bytes(kQ2_0, n_embd) * (size_t) q_out == n_q &&
+                       iq_row_bytes(kQ3_K, n_embd) * (size_t) kv_out == n_k &&
+                       iq_row_bytes(kQ5_K, n_embd) * (size_t) kv_out == n_v &&
+                       iq_row_bytes(kQ4_K, attn_in) * (size_t) n_embd == n_o &&
+                       std::filesystem::is_regular_file(shard);
+    bool step_ok = false, repeat_ok = false, moved_ok = false, flipped_ok = false;
+    std::string step_detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string move_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (bytes) {
+        try {
+            auto load = [&](uint64_t off, uint64_t n) {
+                const auto raw = read_at_path(shard, k_data + off, (size_t) n);
+                Bytes b(n);
+                std::memcpy(b.data(), raw.data(), (size_t) n);
+                return b;
+            };
+            Bytes q = load(3067725952, n_q);
+            Bytes k = load(3058314368, n_k);
+            Bytes v = load(3076574336, n_v);
+            Bytes o = load(3058878592, n_o);
+            Bytes q_norm = load(3076573312, 1024);
+            Bytes k_norm = load(3058877568, 1024);
+            Bytes idx_q_norm = load(3816850048, 512);
+            Bytes idx_k_norm = load(3816194176, 512);
+            Bytes idx_q = load(3816850560, 2621440);
+            Bytes idx_k = load(3816194688, 655360);
+            Bytes attn_down = load(3789734016, 6553600);
+            Bytes attn_up = load(3796410496, 6553600);
+            Bytes attn_inj = load(3796287616, 81920);
+            Bytes attn_norm = load(3796369536, 40960);
+            const int pairs = (int) sh.n_rot / 2;
+            const int table_rows = 2;
+            std::vector<float> cos_h((size_t) table_rows * (size_t) pairs), sin_h(cos_h.size());
+            build_rope_table((int) sh.n_rot, strata::kernels::qsa_freq_base(), table_rows, cos_h.data(), sin_h.data());
+            Bytes b_cos((uint64_t) cos_h.size() * 4u), b_sin((uint64_t) sin_h.size() * 4u);
+            std::memcpy(b_cos.data(), cos_h.data(), b_cos.size());
+            std::memcpy(b_sin.data(), sin_h.data(), b_sin.size());
+            int page = 0;
+            Bytes b_table(4);
+            std::memcpy(b_table.data(), &page, 4);
+            const size_t pool_n = (size_t) sh.n_head_kv * (size_t) sh.page_size * (size_t) sh.head_dim;
+            Bytes k_pool(pool_n * 2u), v_pool(pool_n * 2u);
+            Bytes idx_tail((size_t) (sh.idx_block - 1) * (size_t) sh.idx_dim * 4u);
+            Bytes idx_dead((size_t) sh.idx_dim * 4u);
+            Bytes idx_pooled((size_t) sh.idx_dim * 4u);
+            Bytes idx_bpos(4);
+            QsaLayerGeom lg;
+            lg.n_embd = n_embd;
+            lg.max_cells = 2;
+            lg.qsa = sh;
+            QsaIqWeights w;
+            w.k = QsaIqPlane{kQ3_K, &k};
+            w.v = QsaIqPlane{kQ5_K, &v};
+            w.q = QsaIqPlane{kQ2_0, &q};
+            w.out = QsaIqPlane{kQ4_K, &o};
+            w.idx_k = &idx_k;
+            w.idx_q = &idx_q;
+            w.k_norm = &k_norm;
+            w.q_norm = &q_norm;
+            w.idx_k_norm = &idx_k_norm;
+            w.idx_q_norm = &idx_q_norm;
+            w.cos_tab = &b_cos;
+            w.sin_tab = &b_sin;
+            const GrShapes gs{n_embd, hc, hc_lr};
+            GrScratch gr = make_gr_scratch(gs);
+            QsaLayerScratch sc = make_qsa_layer_scratch(lg);
+            const int guard = 1;
+            Bytes mixed((uint64_t) n_embd * 4u), inject((uint64_t) hc * 4u);
+            Bytes y0((uint64_t) (n_embd + guard) * 4u), y1((uint64_t) (n_embd + guard) * 4u);
+            Bytes y0b((uint64_t) (n_embd + guard) * 4u), y1b((uint64_t) (n_embd + guard) * 4u);
+            Bytes y0z((uint64_t) (n_embd + guard) * 4u), y1z((uint64_t) (n_embd + guard) * 4u);
+            Bytes y0f((uint64_t) (n_embd + guard) * 4u), y1f((uint64_t) (n_embd + guard) * 4u);
+            Bytes R((uint64_t) hc_dim * 4u), zero_r((uint64_t) hc_dim * 4u);
+            std::memcpy(R.data(), layer2_shared_residual.data(), (size_t) hc_dim * 4u);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            auto run_two = [&](const Bytes& residual, Bytes& out0, Bytes& out1) {
+                std::memset(k_pool.data(), 0, (size_t) k_pool.size());
+                std::memset(v_pool.data(), 0, (size_t) v_pool.size());
+                std::memset(idx_tail.data(), 0, (size_t) idx_tail.size());
+                std::memset(idx_dead.data(), 0, (size_t) idx_dead.size());
+                std::memset(idx_pooled.data(), 0, (size_t) idx_pooled.size());
+                std::memset(idx_bpos.data(), 0, (size_t) idx_bpos.size());
+                std::fill_n(static_cast<float*>(mixed.data()), (size_t) n_embd, 7.f);
+                std::fill_n(static_cast<float*>(out0.data()), (size_t) (n_embd + guard), 7.f);
+                std::fill_n(static_cast<float*>(out1.data()), (size_t) (n_embd + guard), 7.f);
+                QsaLayerState st;
+                st.k_pool = &k_pool;
+                st.v_pool = &v_pool;
+                st.page_table = &b_table;
+                st.idx_tail = &idx_tail;
+                st.idx_dead = &idx_dead;
+                st.idx_pooled = &idx_pooled;
+                st.idx_block_pos = &idx_bpos;
+                gr_read(gs, residual, attn_norm, attn_down, attn_up, &attn_inj, 1e-6f, false, gr, mixed, inject);
+                qsa_layer_iq(lg, w, st, sc, 0, 0, mixed, out0);
+                qsa_layer_iq(lg, w, st, sc, 1, 0, mixed, out1);
+            };
+            run_two(R, y0, y1);
+            std::vector<float> gpu_mixed((size_t) n_embd), gpu_inj((size_t) hc), gpu_k((size_t) kv_out);
+            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4u);
+            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4u);
+            std::memcpy(gpu_k.data(), sc.kcur.data(), (size_t) kv_out * 4u);
+            const int* idp = static_cast<const int*>(sc.ids.data());
+            const bool ids_ok = idp[0] == 0 && idp[1] == 1;
+            const QsaHost host = qsa_iq_host(gpu_mixed.data(), n_embd, static_cast<const uint8_t*>(q.data()),
+                                             static_cast<const uint8_t*>(k.data()), static_cast<const uint8_t*>(v.data()),
+                                             static_cast<const uint8_t*>(o.data()),
+                                             static_cast<const float*>(q_norm.data()),
+                                             static_cast<const float*>(k_norm.data()), cos_h.data(), sin_h.data());
+            std::vector<float> host_mixed((size_t) n_embd, 0.f), host_inject((size_t) hc);
+            {
+                const float* src = static_cast<const float*>(R.data());
+                const float* norm_w = static_cast<const float*>(attn_norm.data());
+                const uint16_t* down_w = static_cast<const uint16_t*>(attn_down.data());
+                const uint16_t* up_w = static_cast<const uint16_t*>(attn_up.data());
+                const uint16_t* inj_w = static_cast<const uint16_t*>(attn_inj.data());
+                std::vector<float> xn((size_t) hc_dim), act((size_t) hc_dim);
+                for (int c = 0; c < hc; ++c) {
+                    double ms = 0;
+                    for (int d = 0; d < n_embd; ++d) {
+                        const double val = src[(size_t) c * n_embd + d];
+                        ms += val * val;
+                    }
+                    ms /= (double) n_embd;
+                    const float rs = (float) (1.0 / std::sqrt(ms + 1e-6));
+                    for (int d = 0; d < n_embd; ++d) {
+                        const size_t i = (size_t) c * n_embd + d;
+                        xn[i] = src[i] * rs * norm_w[i];
+                    }
+                }
+                for (int i = 0; i < hc_dim; ++i) act[(size_t) i] = round_bf16(xn[(size_t) i]);
+                std::vector<float> lo((size_t) hc_lr), lq((size_t) hc_lr);
+                for (int r = 0; r < hc_lr; ++r) {
+                    const float p = bf16_dot(act.data(), down_w + (size_t) r * hc_dim, hc_dim);
+                    lo[(size_t) r] = gdn_silu(p / (float) hc);
+                    lq[(size_t) r] = round_bf16(lo[(size_t) r]);
+                }
+                for (int d = 0; d < n_embd; ++d) {
+                    float m = 0.f;
+                    for (int c = 0; c < hc; ++c) {
+                        const int i = c * n_embd + d;
+                        const float gv = bf16_dot(lq.data(), up_w + (size_t) i * hc_lr, hc_lr);
+                        m += xn[(size_t) i] * gdn_sigmoid(gv);
+                    }
+                    host_mixed[(size_t) d] = m / (float) hc;
+                }
+                for (int c = 0; c < hc; ++c)
+                    host_inject[(size_t) c] = bf16_dot(act.data(), inj_w + (size_t) c * hc_dim, hc_dim);
+            }
+            const double read_rel = rel_l1(host_mixed.data(), gpu_mixed.data(), n_embd);
+            const double inject_rel = rel_l1(host_inject.data(), gpu_inj.data(), hc);
+            const double block_rel = rel_l1(host.y0.data(), static_cast<const float*>(y0.data()), n_embd);
+            const double pos_rel = rel_l1(host.y1.data(), static_cast<const float*>(y1.data()), n_embd);
+            const double key_rel = rel_l1(host.k1.data(), gpu_k.data(), kv_out);
+            run_two(R, y0b, y1b);
+            run_two(zero_r, y0z, y1z);
+            // A one-bit quant change can round away in the fp16 value. Keep bytes that change that fp16.
+            std::vector<int> tries;
+            {
+                Bytes xin((uint64_t) n_embd * 4u);
+                std::memcpy(xin.data(), gpu_mixed.data(), (size_t) n_embd * 4u);
+                Bytes xq(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(xin, n_embd, xq);
+                const uint8_t* qb = static_cast<const uint8_t*>(xq.data());
+                const int row_bytes = 1760;
+                const int offs[] = {16, 48, 80, 120, 160, 192, 400, 880};
+                for (int row = 0; row < 64 && (int) tries.size() < 8; ++row) {
+                    const uint8_t* rowp = static_cast<const uint8_t*>(v.data()) + (size_t) row * (size_t) row_bytes;
+                    float base = 0.f;
+                    k_ref(rowp, qb, n_embd, 1, true, &base);
+                    const uint16_t base16 = strata::kernels::f16_from_f32(base);
+                    for (int off : offs) {
+                        if ((off % 176) < 16 || off >= row_bytes) continue;
+                        std::vector<uint8_t> tmp(rowp, rowp + row_bytes);
+                        tmp[(size_t) off] ^= 1u;
+                        float alt = 0.f;
+                        k_ref(tmp.data(), qb, n_embd, 1, true, &alt);
+                        if (strata::kernels::f16_from_f32(alt) != base16) {
+                            tries.push_back(row * row_bytes + off);
+                            break;
+                        }
+                    }
+                }
+            }
+            int flip_at = -1;
+            int flip_n = 0;
+            Bytes flipped(v.size());
+            for (int local : tries) {
+                std::memcpy(flipped.data(), v.data(), (size_t) v.size());
+                static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
+                w.v = QsaIqPlane{kQ5_K, &flipped};
+                run_two(R, y0f, y1f);
+                const int n0 = differ_floats(static_cast<const float*>(y0.data()), static_cast<const float*>(y0f.data()),
+                                             n_embd);
+                const int n1 = differ_floats(static_cast<const float*>(y1.data()), static_cast<const float*>(y1f.data()),
+                                             n_embd);
+                flip_n = n0 > 0 ? n0 : n1;
+                if (flip_n > 0) {
+                    flip_at = local;
+                    break;
+                }
+            }
+            w.v = QsaIqPlane{kQ5_K, &v};
+            const float* a0 = static_cast<const float*>(y0.data());
+            const float* a1 = static_cast<const float*>(y1.data());
+            const float* b0 = static_cast<const float*>(y0b.data());
+            const float* b1 = static_cast<const float*>(y1b.data());
+            const float* z0 = static_cast<const float*>(y0z.data());
+            const bool guard_held = a0[n_embd] == 7.f && a1[n_embd] == 7.f && b0[n_embd] == 7.f && b1[n_embd] == 7.f &&
+                                    z0[n_embd] == 7.f && (flip_at < 0 || static_cast<const float*>(y0f.data())[n_embd] == 7.f);
+            const bool live = all_finite(a0, n_embd) && all_finite(a1, n_embd) && all_finite(host.y0.data(), n_embd) &&
+                              all_finite(host.y1.data(), n_embd) && all_finite(host.k1.data(), kv_out) &&
+                              all_finite(gpu_mixed.data(), n_embd) && !still_seven(a0, n_embd) && !still_seven(a1, n_embd);
+            const int again = differ_floats(a0, b0, n_embd) + differ_floats(a1, b1, n_embd);
+            const int apart = differ_floats(a0, z0, n_embd);
+            const double apart_rel = rel_l1(a0, z0, n_embd);
+            step_ok = live && guard_held && ids_ok && read_rel <= 1e-4 && inject_rel <= 1e-4 && block_rel <= 1e-5 &&
+                      pos_rel <= 1e-5 && key_rel <= 1e-5;
+            repeat_ok = live && guard_held && again == 0;
+            moved_ok = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            flipped_ok = live && guard_held && flip_n > 0;
+            char buf[480];
+            std::snprintf(buf, sizeof buf,
+                          "read %.3e, inject %.3e, block %.3e, position 1 %.3e, key %.3e, ids %d, "
+                          "rope 64 at 1e7, sections not applied, selection is the identity, "
+                          "residual write not run, layer 1 PLE not applied",
+                          read_rel, inject_rel, block_rel, pos_rel, key_rel, ids_ok ? 0 : 1);
+            step_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, n_embd, apart_rel * 100.0);
+            move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flip_n, n_embd, flip_at);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            step_detail = e.what();
+            repeat_detail = e.what();
+            move_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("the layer-3 QSA block matches", bytes && step_ok, step_detail);
+    verdict("that layer-3 block repeats", bytes && repeat_ok, repeat_detail);
+    verdict("a zero residual moves that layer-3 block", bytes && moved_ok, move_detail);
+    verdict("a changed value byte moves that layer-3 block", bytes && flipped_ok, flip_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -9833,6 +10258,7 @@ void run_q2_layer() {
     run_layer2_routed(table, g);
     run_layer2_shared(table, g);
     run_layer3_attn();
+    run_layer3_qsa(g);
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -9857,7 +10283,7 @@ int main(int argc, char** argv) {
         "one layer-1 GDN step on that residual, one layer-1 routed expert pass on that residual, "
         "one layer-2 GDN step on that residual, one layer-2 routed expert pass on that residual, "
         "one layer-2 shared expert on that residual, "
-        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, "
+        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, one layer-3 QSA block, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {

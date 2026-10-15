@@ -79,4 +79,31 @@ QsaLayerScratch make_qsa_layer_scratch(const QsaLayerGeom& g);
 void qsa_layer(const QsaLayerGeom& g, const QsaLayerWeights& w, QsaLayerState& st, QsaLayerScratch& sc, int pos,
                int pos_base, const Bytes& x, Bytes& out);
 
+// One ggml block plane. `type` is the id iq_mmvq dispatches. The bytes are that block layout,
+// not an S-form row. Q2_0, Q3_K, Q4_K, and Q5_K stay out of the expert wrapper.
+struct QsaIqPlane {
+    int type = 0;
+    const Bytes* weights = nullptr;
+};
+
+// The same block on ggml rows. The activation is q8_1. The indexer projections stay bf16.
+// Scratch is still make_qsa_layer_scratch, and its Q8_K slots stay unused.
+struct QsaIqWeights {
+    QsaIqPlane k;
+    QsaIqPlane v;
+    QsaIqPlane q;
+    QsaIqPlane out;
+    const Bytes* idx_k = nullptr;
+    const Bytes* idx_q = nullptr;
+    const Bytes* k_norm = nullptr;
+    const Bytes* q_norm = nullptr;
+    const Bytes* idx_k_norm = nullptr;
+    const Bytes* idx_q_norm = nullptr;
+    const Bytes* cos_tab = nullptr;
+    const Bytes* sin_tab = nullptr;
+};
+
+void qsa_layer_iq(const QsaLayerGeom& g, const QsaIqWeights& w, QsaLayerState& st, QsaLayerScratch& sc, int pos,
+                  int pos_base, const Bytes& x, Bytes& out);
+
 }  // namespace strata::metal
