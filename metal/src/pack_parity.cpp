@@ -3301,6 +3301,84 @@ void q40_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* 
     }
 }
 
+// Q6_K is 210 bytes and 256 values. Same integer dot as iq_mmvq_q6_k.
+// ql is 128 bytes, qh is 64, the 16 scales are int8, and d is the last fp16.
+float q6_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift = 2 * ((iqs % 16) / 8);
+    const int vl = q2_ld(blk + 4 * iqs);
+    const int vh_index = 8 * (iqs / 16) + (iqs % 8);
+    const uint32_t vh = (uint32_t) q2_ld(blk + 128 + 4 * vh_index) >> vh_shift;
+    const uint8_t* scales = blk + 192;
+    float sumf = 0;
+    for (int i = 0; i < 2; ++i) {
+        const int sc = (int) (int8_t) scales[scale_offset + 4 * i];
+        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int vih = (int) (((vh >> (4 * i)) << 4) & 0x30303030u);
+        const uint8_t* bq8 = x0 + (size_t) (bq8_offset + 2 * i) * 36;
+        const float d8 = strata::kernels::f32_from_f16((uint16_t) k_u16(bq8));
+        sumf += d8 * (float) (q2_dp4a(q3_vsub4(vil | vih, 0x20202020), q2_ld(bq8 + 4 + 4 * (iqs % 8)), 0) * sc);
+    }
+    return strata::kernels::f32_from_f16((uint16_t) k_u16(blk + 208)) * sumf;
+}
+
+float q6_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 256) * 32;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 32;
+        lane[k & 31] += q6_partial(row + (size_t) kbx * 210, col + (size_t) kbx * 8 * 36, k % 32);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q6_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 256) * 210;
+    for (int r = 0; r < n_out; ++r) y[r] = q6_row(w + (size_t) r * row, x, n_in);
+}
+
+void dequant_q6(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block + 208));
+    const uint8_t* ql = block;
+    const uint8_t* qh = block + 128;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(block + 192);
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int q1 = (int) (int8_t) ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int) (int8_t) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int) (int8_t) ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int) (int8_t) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            out[n + l + 0] = d * (float) sc[is + 0] * (float) q1;
+            out[n + l + 32] = d * (float) sc[is + 2] * (float) q2;
+            out[n + l + 64] = d * (float) sc[is + 4] * (float) q3;
+            out[n + l + 96] = d * (float) sc[is + 6] * (float) q4;
+        }
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+}
+
+void q6_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    std::vector<float> act((size_t) n_in), rowv((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 256) * 210;
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 256; ++b) dequant_q6(src + (size_t) b * 210, rowv.data() + (size_t) b * 256);
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) rowv[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
 using RowRef = void (*)(const uint8_t*, const uint8_t*, int, int, float*);
 
 void check_rows(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
@@ -3429,6 +3507,23 @@ void run_kquant() {
     const bool q40_refused =
         threw("not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kIq4Xs, kQ4_0, 2560, 640}); }, q40got);
     verdict("a Q4_0 down is refused", q40_refused, q40got);
+
+    std::printf("\nQ6_K ggml blocks\n");
+    const int q6_in = 512;
+    const int q6_out = 8;
+    std::vector<uint8_t> q6((size_t) q6_out * (q6_in / 256) * 210);
+    for (uint8_t& b : q6) b = (uint8_t) rng();
+    for (size_t off = 0; off < q6.size(); off += 210) {
+        for (int s = 0; s < 16; ++s) q6[off + 192 + s] = 1;
+        q6[off + 208] = 0x00;
+        q6[off + 209] = 0x3C;
+    }
+    check_rows("a Q6_K block matches the dequant", "a changed Q6_K code moves that block", q6.data(), q6.size(), q6_in,
+               q6_out, kQ6_K, 0, q6_ref, q6_scalar);
+    std::string q6got;
+    const bool q6_refused =
+        threw("not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kIq4Xs, kQ6_K, 2560, 640}); }, q6got);
+    verdict("a Q6_K up is refused", q6_refused, q6got);
 }
 
 // One GDN step from a zero state. The projections are the ggml dots. The middle is the
@@ -13202,7 +13297,7 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output, one Q4_0 product, one GDN step, one attention half, one feed-forward half, "
+        "one Q4_K gate, one Q5_K output, one Q4_0 product, one Q6_K product, one GDN step, one attention half, one feed-forward half, "
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
         "one shared expert on that residual, one router selection on that residual, "
         "one routed ten on that residual, one carried state into a second token, "
