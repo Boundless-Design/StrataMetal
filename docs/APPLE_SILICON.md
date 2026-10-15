@@ -199,7 +199,14 @@ apart. Interleaved heads were 59.35% apart. Scaling k as well as q was 34.02% ap
 softplus branch was non-finite. Two heads were above 20 and one was above 88. Sigmoid against SiLU
 on z was 183.47% apart. A transposed conv weight, run on the GPU, was 73.36% apart. The conv state
 appended the projection, and that column was 100.13% away from the SiLU output. S above 128 was
-refused. A value width of 128, which is not a multiple of 256, was refused.
+refused. A value width of 128, which is not a multiple of 256, was refused. An embedding of 200
+was refused. The same order at the model embedding, n_embd 2560, 16 key heads, 48 value heads,
+conv width still 10240, had its largest error at 2.856e-07 on the output norm. The qkv projection
+was 9.406e-08. The conv output, after SiLU, was 1.029e-07. q, after L2 and the scale, was
+1.165e-07. k was 1.139e-07. v, which is not normalised, was 1.052e-07. The gate was 3.115e-08.
+The step output was 2.352e-07 and the state was 1.227e-07. ssm_out was 2.862e-08. The conv state
+was 9.028e-08. The stored column was 100.47% away from the SiLU output. The weights are synthetic.
+No GGUF was loaded. This is not a loaded model. There is no token rate.
 
 `strata-metal-gr` checks the gated residual for one token. The residual is hc streams, each n_embd
 wide. The norm is per stream, and w_norm is the stored (1 + w). The down projection is bf16, then
@@ -580,7 +587,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. A loaded model. `strata-metal-token --serve` answers on the synthetic fixture. The check started that binary. The Python server was not started. This loop does not read a GGUF.
+1. The QSA attention block at n_embd 2560. The GDN layer runs at that width, with 16 key heads and 48 value heads, on synthetic weights. That is not a loaded model. This loop does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

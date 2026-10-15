@@ -540,6 +540,7 @@ int run() {
     std::mt19937 rng(20261014);
     check_case("reduced", GdnLayerGeom{256, 128, 2, 4, 4}, rng, true);
     check_case("model heads", GdnLayerGeom{256, 128, 16, 48, 4}, rng, false);
+    check_case("model width", GdnLayerGeom{2560, 128, 16, 48, 4}, rng, false);
     verdict("S above 128 is refused",
             throws_metal([] {
                 make_gdn_layer_scratch(GdnLayerGeom{256, 129, 2, 4, 4});
@@ -548,6 +549,11 @@ int run() {
     verdict("a value dim that is not a multiple of 256 is refused",
             throws_metal([] {
                 make_gdn_layer_scratch(GdnLayerGeom{256, 128, 1, 1, 4});
+            }),
+            "");
+    verdict("an embedding that is not a multiple of 256 is refused",
+            throws_metal([] {
+                make_gdn_layer_scratch(GdnLayerGeom{200, 128, 2, 4, 4});
             }),
             "");
     std::printf("\ngdn_layer: %d failures\n", g_fail);
