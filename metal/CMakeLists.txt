@@ -32,6 +32,7 @@
 #   ./build-metal/strata-metal-token --selftest
 #   ./build-metal/strata-metal-stack --selftest
 #   ./build-metal/strata-metal-pack --selftest
+#   ./build-metal/strata-metal-layer-tensors --selftest
 #
 # The device binary names the GPU and says which published model sizes fit its working set.
 # The others check a BF16 matrix-vector product, the DeltaNet kernels, paged QSA attention,
@@ -42,6 +43,8 @@
 # paged KV append and gather, the partial NEOX rotation, one QSA attention
 # block, one synthetic token through that block, four layers on the pack
 # schedule, and the pack index loaded into those kernels. None of them runs the model.
+# strata-metal-pack also walks layers 2 onward from the GGUF (STRATA_MODEL_GGUF, STRATA_WALK_LAST).
+# strata-metal-layer-tensors checks the by-name tensor lookup that walk uses; it is host code only.
 cmake_minimum_required(VERSION 3.24)
 project(strata_metal VERSION 0.1.39 LANGUAGES CXX OBJCXX)
 if(NOT APPLE)
@@ -233,6 +236,14 @@ add_executable(strata-metal-pack src/pack_parity.cpp)
 target_link_libraries(strata-metal-pack PRIVATE strata_metal_runtime)
 strata_metal_scheme(strata-metal-pack)
 set_property(TARGET strata-metal-pack PROPERTY XCODE_SCHEME_ARGUMENTS "--selftest")
+
+# The by-name tensor lookup the layer walk uses. Host code only: no Metal, no runtime.
+add_executable(strata-metal-layer-tensors src/layer_tensors_parity.cpp)
+target_include_directories(strata-metal-layer-tensors PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${STRATA_ROOT}/include)
+strata_metal_scheme(strata-metal-layer-tensors)
+set_property(TARGET strata-metal-layer-tensors PROPERTY XCODE_SCHEME_ARGUMENTS "--selftest")
 
 # Files to read in the generated Xcode project. Nothing here is compiled.
 add_custom_target(Handoff SOURCES

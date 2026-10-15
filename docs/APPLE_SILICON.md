@@ -810,7 +810,12 @@ cmake --build build-metal
 ./build-metal/strata-metal-token --selftest
 ./build-metal/strata-metal-stack --selftest
 ./build-metal/strata-metal-pack --selftest
+./build-metal/strata-metal-layer-tensors --selftest
 ```
+
+The model checks read the GGUF named by `STRATA_MODEL_GGUF` (any shard of a split model). Without it they look for
+the Q2_0 shard 1 under `$HOME/Developer/Strata-data/models/Q2_0/`, and print a skip when it is not there. Layers 2
+onward are one loop over the GGUF's own tensor directory; `STRATA_WALK_LAST` sets how far it goes (default 18).
 
 The same targets, opened for capture:
 

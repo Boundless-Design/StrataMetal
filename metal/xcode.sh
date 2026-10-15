@@ -53,5 +53,5 @@ else
   "$CMAKE" -S metal -B build-metal-xcode -G Xcode -DCMAKE_XCODE_GENERATE_SCHEME=ON
   echo "open build-metal-xcode/strata_metal.xcodeproj"
 fi
-echo "Schemes: strata-metal-device, strata-metal-bf16-gemv, strata-metal-gdn, strata-metal-qsa, strata-metal-iq, strata-metal-sgemv, strata-metal-elementwise, strata-metal-gdn-layer, strata-metal-gr, strata-metal-router, strata-metal-sampler, strata-metal-moe-combine, strata-metal-s2-gemv, strata-metal-shared-expert, strata-metal-qsa-gate, strata-metal-indexer, strata-metal-qsa-index, strata-metal-topk, strata-metal-kv, strata-metal-rope, strata-metal-qsa-layer, strata-metal-token, strata-metal-stack, strata-metal-pack"
+echo "Schemes: strata-metal-device, strata-metal-bf16-gemv, strata-metal-gdn, strata-metal-qsa, strata-metal-iq, strata-metal-sgemv, strata-metal-elementwise, strata-metal-gdn-layer, strata-metal-gr, strata-metal-router, strata-metal-sampler, strata-metal-moe-combine, strata-metal-s2-gemv, strata-metal-shared-expert, strata-metal-qsa-gate, strata-metal-indexer, strata-metal-qsa-index, strata-metal-topk, strata-metal-kv, strata-metal-rope, strata-metal-qsa-layer, strata-metal-token, strata-metal-stack, strata-metal-pack, strata-metal-layer-tensors"
 echo "Derived Data stays on the internal disk (Xcode's default)."
