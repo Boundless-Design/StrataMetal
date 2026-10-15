@@ -1,6 +1,6 @@
 # Strata Metal handoff
 
-Open this project and start here. The snapshot date is 2026-10-14.
+Open this project and start here. The snapshot date is 2026-10-15.
 
 This copy lives on the internal disk:
 
@@ -84,19 +84,95 @@ against the double reference passed at 3.912e-08. The bound is 1e-6.
 
 The deepest layer is 47. All 48 layers pass.
 
+## Forward pass
+
+`strata-metal-run` takes token ids and writes one full logit row per position.
+GDN state, QSA fp16 KV, and the PLE window carry across positions. The ten
+routed experts and the PLE table stay on disk. Dense weights, the head, and
+the small PLE projections are resident.
+
+```sh
+cmake --build build-metal --target strata-metal-run
+build-metal/strata-metal-run --tokens 760,6511,314,9338,369 --max-new 0 \
+  --dump-logits /tmp/p1.bin
+python3 metal/tools/compare_fixtures.py /tmp/p1.bin p1
+```
+
+`--max-new 0` scores the prompt except its last token. A positive count also
+scores that last prompt token, then that many new positions minus one.
+`--teacher-force` replaces the greedy picks after the prompt. The lowest id
+wins a tie. The dump is little-endian int32 vocab, int32 rows, then f32 rows.
+
+`compare_fixtures.py --gate` scores every prompt and generation row of p1-p5
+against a clean dump and a one-ulp dump. A pick matches CUDA, or it sits in
+CUDA's top 3 and CUDA's gap from its #1 to that pick is at most 0.5. On p5's
+prompt rows whose real next prompt token is in CUDA's top 64, the Mac mean
+NLL has to be within 1% of CUDA's and not more than 1% worse. Over all 492
+rows, the 95th percentile of |logprob delta| and of top-64 total variation
+must each be at most twice the same percentile for the one-ulp run. The raw
+top-64 logit gap is printed and is not a gate. The percentile is Hyndman-Fan
+type 7.
+
+On this Mac the resident set was 3.275 GiB of 28 GiB: 48 layer execs 2.856
+GiB and the head 0.419 GiB. PLE projections were 0.019 GiB and session scratch
+0.001 GiB. The 492-row gate passed. 478 picks matched. These 14 did not, and
+each is inside the top-3 rule. The widest gap is 0.198.
+
+- p3 pos 17: CUDA 460, Mac 745, rank 2, gap 0.060
+- p5 pos 8: CUDA 198, Mac 271, rank 2, gap 0.057
+- p5 pos 26: CUDA 39332, Mac 18237, rank 2, gap 0.083
+- p5 pos 37: CUDA 13759, Mac 5157, rank 2, gap 0.142
+- p5 pos 56: CUDA 321, Mac 1024, rank 2, gap 0.086
+- p5 pos 59: CUDA 780, Mac 264, rank 2, gap 0.036
+- p5 pos 73: CUDA 310, Mac 60999, rank 2, gap 0.114
+- p5 pos 126: CUDA 7481, Mac 26164, rank 2, gap 0.198
+- p5 pos 168: CUDA 995, Mac 557, rank 2, gap 0.026
+- p5 pos 173: CUDA 8526, Mac 557, rank 3, gap 0.052
+- p5 pos 207: CUDA 3043, Mac 539, rank 2, gap 0.034
+- p5 pos 222: CUDA 3571, Mac 7481, rank 2, gap 0.106
+- p5 pos 223: CUDA 13569, Mac 3162, rank 2, gap 0.115
+- p5 pos 299: CUDA 5820, Mac 5924, rank 2, gap 0.002
+
+p5 prompt NLL used 293 rows. CUDA's mean was 1.593 and the Mac's was 1.584.
+The Mac was lower on 159 rows, CUDA on 134, with no ties. One ulp of layer-0
+noise on the same 492 rows has |logprob delta| p95 0.107 and TV p95 0.054.
+Mac against CUDA is 0.114 and 0.061. Both are under twice the noise.
+
+Free-running greedy for 32 new tokens, no teacher force: p1 matched CUDA at
+all 36 positions, 1.066 s/token. p3 first diverged at position 17, the same
+accepted pick as the teacher-forced row (CUDA 460, Mac 745, gap 0.060). That
+run was 1.118 s/token over 35 positions. Later p3 tokens leave the fixture
+path because the fed token has changed. The rate is a measurement, not a
+target. A long teacher-forced p5 run was 0.775 s/token over 338 positions.
+
+### Diagnostics
+
+`STRATA_PERTURB_ULP` and `STRATA_LOG_MARGINS` are off unless set. Fixture runs
+leave both unset, except the noise dump, which sets only the first.
+
+`STRATA_PERTURB_ULP=1` flips the low mantissa bit of every layer-0 residual
+float after the embedding broadcast, at every position, including position 0.
+Any other value, including unset, does not flip.
+
+`STRATA_LOG_MARGINS` names a file. The run writes the router's 10th-minus-11th
+probability, before the top-10 weights are divided by their sum, one row per
+layer per position. Unset or empty writes nothing.
+
 ## What does not run
 
-The check is one token at a time, against a host reference. There is no
-sampling, no argmax, no PLE table, no expert streaming, and no forward pass
-that produces a real token. There is no token rate.
+The layer walk is still one token at a time, against a host reference. The
+forward pass is greedy. It does not sample. There is no tokenizer, no server,
+and no batched prefill. Routed experts and the PLE table are not copied into
+a GPU buffer.
 
 The CUDA and HIP engines are not built. `python setup.py` on macOS stops and
 points at `docs/APPLE_SILICON.md`.
 
 ## Next
 
-The layer walk covers the model. Do not start a sampler, the PLE table, expert
-streaming, or a token-rate measurement.
+The forward pass matches the CUDA fixtures under the gates in
+`metal/tools/compare_fixtures.py`. Do not start resident experts, kernel
+fusion, a speed pass, batched prefill, a server, or a tokenizer.
 
 The Reference group is the CUDA source of the kernels already ported, except
 the expert product, the S-form projection, and the layer glue. The `.cu` files
@@ -139,5 +215,6 @@ routed plus shared. That residual feeds the next layer.
   name and keep their own checks. The walk starts at layer 2. Those checks
   print a different line than the walk, so folding them in would change the
   verdicts.
-- Do not sample an argmax. Do not port the PLE table. Expert streaming is not
-  in this tree. There is no token rate.
+- The walk does not draw a token. The forward pass is `metal/src/forward.cpp`,
+  and it calls the same execs. `STRATA_PERTURB_ULP` and `STRATA_LOG_MARGINS`
+  are diagnostics. Both are off unless set. See Forward pass.

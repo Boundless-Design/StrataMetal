@@ -40,4 +40,14 @@ walk. `compare_pack_runs.sh` diffs layers 2-18 against commit `128cc72`.
 ## Status
 
 Every layer of the Q2_0 model is verified against a host reference, one token
-at a time. There is no sampling. There is no token rate.
+at a time. `strata-metal-run` is a separate forward pass: token ids in, a full
+logit row per position, greedy argmax, state carried. Experts and the PLE
+table stay on disk. `STRATA_PERTURB_ULP` and `STRATA_LOG_MARGINS` are off
+unless set. `metal/XCODE_HANDOFF.md` describes both.
+
+`metal/tools/compare_fixtures.py` checks those rows against the CUDA fixtures.
+Teacher-forced p1 through p5 passed that gate (478 exact picks, 14 accepted
+top-3 mismatches, none outside the rule). Free-running greedy for 32 new
+tokens matched p1 at every position, 1.066 s/token over 36 positions. p3 first
+diverged at position 17, an accepted gap of 0.060, 1.118 s/token over 35
+positions. The rate is a measurement, not a target.
