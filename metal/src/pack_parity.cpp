@@ -8745,6 +8745,55 @@ void run_layer7_attn() {
             attn_out_in, n_embd, false, 16);
 }
 
+// Layer 11's four attention products on their own activations. The QSA block is not called.
+// Query is Q3_K, key is IQ4_XS, value is IQ4_XS, and output is Q6_K.
+// Layer 1's PLE was not applied. This does not load layers 12 through 47.
+void run_layer11_attn() {
+    std::printf("\nlayer 11 attention products, QSA block not run, layer 1 PLE not applied\n");
+    const int n_embd = 2560;
+    const int q_out = 12288;
+    const int kv_out = 512;
+    const int attn_out_in = 6144;
+    const uint64_t k_data = 11024672;
+    const uint64_t k_q = 9179850112;
+    const uint64_t k_k = 9166250368;
+    const uint64_t k_v = 9193367936;
+    const uint64_t k_o = 9166947712;
+    const uint64_t n_q = 13516800;
+    const uint64_t n_k = 696320;
+    const uint64_t n_v = 696320;
+    const uint64_t n_o = 12902400;
+    const std::filesystem::path shard =
+        "/Users/kamp/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf";
+    const bool layout = iq_row_bytes(kQ3_K, n_embd) * (size_t) q_out == n_q &&
+                        iq_row_bytes(kIq4Xs, n_embd) * (size_t) kv_out == n_k &&
+                        iq_row_bytes(kIq4Xs, n_embd) * (size_t) kv_out == n_v &&
+                        iq_row_bytes(kQ6_K, attn_out_in) * (size_t) n_embd == n_o &&
+                        std::filesystem::is_regular_file(shard);
+    std::vector<uint8_t> q, k, v, o;
+    if (layout) {
+        auto load = [&](uint64_t off, uint64_t n, std::vector<uint8_t>& dst) {
+            dst = read_at_path(shard, k_data + off, (size_t) n);
+        };
+        load(k_q, n_q, q);
+        load(k_k, n_k, k);
+        load(k_v, n_v, v);
+        load(k_o, n_o, o);
+    }
+    const uint8_t* qp = layout ? q.data() : nullptr;
+    const uint8_t* kp = layout ? k.data() : nullptr;
+    const uint8_t* vp = layout ? v.data() : nullptr;
+    const uint8_t* op = layout ? o.data() : nullptr;
+    check_rows("the layer-11 query rows match", "a changed layer-11 query code moves that product", qp, layout ? n_q : 0,
+               n_embd, q_out, kQ3_K, 32, q3_ref, q3_scalar);
+    check_rows("the layer-11 key rows match", "a changed layer-11 key code moves that product", kp, layout ? n_k : 0,
+               n_embd, kv_out, kIq4Xs, 8, xs_ref, nullptr);
+    check_rows("the layer-11 value rows match", "a changed layer-11 value code moves that product", vp, layout ? n_v : 0,
+               n_embd, kv_out, kIq4Xs, 8, xs_ref, nullptr);
+    check_rows("the layer-11 output rows match", "a changed layer-11 output code moves that product", op, layout ? n_o : 0,
+               attn_out_in, n_embd, kQ6_K, 0, q6_ref, q6_scalar);
+}
+
 void qsa_rms_rows(std::vector<float>& x, const float* w, int rows, int cols) {
     for (int r = 0; r < rows; ++r) {
         float part[32];
@@ -19893,6 +19942,7 @@ void run_q2_layer() {
     run_layer10_gdn(g);
     run_layer10_routed(table, g);
     run_layer10_shared(table, g);
+    run_layer11_attn();
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -19917,7 +19967,7 @@ int main(int argc, char** argv) {
         "one layer-1 GDN step on that residual, one layer-1 routed expert pass on that residual, "
         "one layer-2 GDN step on that residual, one layer-2 routed expert pass on that residual, "
         "one layer-2 shared expert on that residual, "
-        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, one layer-3 QSA block, one layer-3 attention write, one layer-3 routed expert pass, one layer-3 shared expert, one layer-4 GDN step, one layer-4 routed expert pass, one layer-4 shared expert, one layer-5 GDN step, one layer-5 routed expert pass, one layer-5 shared expert, one layer-6 GDN step, one layer-6 routed expert pass, one layer-6 shared expert, one layer-7 query, one layer-7 key, one layer-7 value, one layer-7 output, one layer-7 QSA block, one layer-7 attention write, one layer-7 routed expert pass, one layer-7 shared expert, one layer-8 GDN step, one layer-8 routed expert pass, one layer-8 shared expert, one layer-9 GDN step, one layer-9 routed expert pass, one layer-9 shared expert, one layer-10 GDN step, one layer-10 routed expert pass, one layer-10 shared expert, "
+        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, one layer-3 QSA block, one layer-3 attention write, one layer-3 routed expert pass, one layer-3 shared expert, one layer-4 GDN step, one layer-4 routed expert pass, one layer-4 shared expert, one layer-5 GDN step, one layer-5 routed expert pass, one layer-5 shared expert, one layer-6 GDN step, one layer-6 routed expert pass, one layer-6 shared expert, one layer-7 query, one layer-7 key, one layer-7 value, one layer-7 output, one layer-7 QSA block, one layer-7 attention write, one layer-7 routed expert pass, one layer-7 shared expert, one layer-8 GDN step, one layer-8 routed expert pass, one layer-8 shared expert, one layer-9 GDN step, one layer-9 routed expert pass, one layer-9 shared expert, one layer-10 GDN step, one layer-10 routed expert pass, one layer-10 shared expert, one layer-11 query, one layer-11 key, one layer-11 value, one layer-11 output, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
