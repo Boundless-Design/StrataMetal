@@ -2818,6 +2818,275 @@ void xs_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
     for (int r = 0; r < n_out; ++r) y[r] = xs_row(w + (size_t) r * row, x, n_in);
 }
 
+// Q4_K is 144 bytes and Q5_K is 176. Both are 256 values. The dot is vec_dot_q4_K_q8_1 /
+// vec_dot_q5_K_q8_1: d * sum(scale * q * a) - dmin * sum(min * a), with a the q8_1 values.
+int k_u16(const uint8_t* p) { return (int) p[0] | ((int) p[1] << 8); }
+
+void k_scale_min(const uint8_t* scales8, int bq8_offset, int sc[2], int mn[2]) {
+    const int j = bq8_offset / 2;
+    const int jm = j & 1;
+    const unsigned s0 = (unsigned) k_u16(scales8 + 2 * (jm + 0));
+    const unsigned s2 = (unsigned) k_u16(scales8 + 2 * (jm + 2));
+    const unsigned s4 = (unsigned) k_u16(scales8 + 2 * (jm + 4));
+    const unsigned hi = j >= 2 ? 0xFFFFFFFFu : 0u;
+    const unsigned a0 = ((s0 & 0x3f3fu) & ~hi) | ((((s4 >> 0) & 0x0f0fu) | ((s0 & 0xc0c0u) >> 2)) & hi);
+    const unsigned a1 = ((s2 & 0x3f3fu) & ~hi) | ((((s4 >> 4) & 0x0f0fu) | ((s2 & 0xc0c0u) >> 2)) & hi);
+    sc[0] = (int) (a0 & 0xFFu);
+    sc[1] = (int) ((a0 >> 8) & 0xFFu);
+    mn[0] = (int) (a1 & 0xFFu);
+    mn[1] = (int) ((a1 >> 8) & 0xFFu);
+}
+
+float k_partial(const uint8_t* blk, const uint8_t* x0, int iqs, bool q5) {
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int byte = 16 * bq8_offset + 4 * ((iqs / 2) % 4);
+    const uint8_t* ql = q5 ? blk + 48 : blk + 16;
+    const int v0 = q2_ld(ql + byte);
+    const int v1 = q2_ld(ql + byte + 16);
+    int vh0 = 0, vh1 = 0;
+    if (q5) {
+        const int qhb = 4 * ((iqs / 2) % 4);
+        vh0 = q2_ld(blk + 16 + qhb) >> bq8_offset;
+        vh1 = q2_ld(blk + 32 + qhb) >> bq8_offset;
+    }
+    int sc[2], mn[2];
+    k_scale_min(blk + 4, bq8_offset, sc, mn);
+    float sum_d = 0, sum_m = 0;
+    for (int i = 0; i < 2; ++i) {
+        const uint8_t* bq8 = x0 + (size_t) (bq8_offset + i) * 36;
+        const float d8 = strata::kernels::f32_from_f16((uint16_t) k_u16(bq8));
+        const int qoff = (iqs / 2) % 4;
+        const int u0 = q2_ld(bq8 + 4 + 4 * qoff);
+        const int u1 = q2_ld(bq8 + 4 + 4 * (qoff + 4));
+        int p0 = (v0 >> (4 * i)) & 0x0F0F0F0F;
+        int p1 = (v1 >> (4 * i)) & 0x0F0F0F0F;
+        if (q5) {
+            p0 |= ((vh0 >> i) << 4) & 0x10101010;
+            p1 |= ((vh1 >> i) << 4) & 0x10101010;
+        }
+        const int dot1 = q5 ? q2_dp4a(p0, u0, q2_dp4a(p1, u1, 0)) : q2_dp4a(p1, u1, q2_dp4a(p0, u0, 0));
+        const int dot2 = q5 ? q2_dp4a(0x01010101, u0, q2_dp4a(0x01010101, u1, 0))
+                            : q2_dp4a(0x01010101, u1, q2_dp4a(0x01010101, u0, 0));
+        sum_d += d8 * (float) (dot1 * sc[i]);
+        sum_m += d8 * (float) (dot2 * mn[i]);
+    }
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(blk));
+    const float dmin = strata::kernels::f32_from_f16((uint16_t) k_u16(blk + 2));
+    return d * sum_d - dmin * sum_m;
+}
+
+float k_row(const uint8_t* row, const uint8_t* col, int n_in, bool q5) {
+    float lane[32] = {};
+    const int block = q5 ? 176 : 144;
+    const int npart = (n_in / 256) * 16;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 16;
+        const int iqs = 2 * (k % 16);
+        lane[k & 31] += k_partial(row + (size_t) kbx * block, col + (size_t) kbx * 8 * 36, iqs, q5);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void k_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, bool q5, float* y) {
+    const size_t row = (size_t) (n_in / 256) * (q5 ? 176 : 144);
+    for (int r = 0; r < n_out; ++r) y[r] = k_row(w + (size_t) r * row, x, n_in, q5);
+}
+
+void k_scale_byte(int j, const uint8_t* q, int& d, int& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+void dequant_q4(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block));
+    const float mn = strata::kernels::f32_from_f16((uint16_t) k_u16(block + 2));
+    const uint8_t* scales = block + 4;
+    const uint8_t* q = block + 16;
+    int is = 0;
+    for (int j = 0; j < 256; j += 64) {
+        int sc = 0, m = 0;
+        k_scale_byte(is, scales, sc, m);
+        const float d1 = d * (float) sc;
+        const float m1 = mn * (float) m;
+        k_scale_byte(is + 1, scales, sc, m);
+        const float d2 = d * (float) sc;
+        const float m2 = mn * (float) m;
+        for (int l = 0; l < 32; ++l) *out++ = d1 * (float) (q[l] & 0x0F) - m1;
+        for (int l = 0; l < 32; ++l) *out++ = d2 * (float) (q[l] >> 4) - m2;
+        q += 32;
+        is += 2;
+    }
+}
+
+void dequant_q5(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block));
+    const float mn = strata::kernels::f32_from_f16((uint16_t) k_u16(block + 2));
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* ql = block + 48;
+    int is = 0;
+    int u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        int sc = 0, m = 0;
+        k_scale_byte(is, scales, sc, m);
+        const float d1 = d * (float) sc;
+        const float m1 = mn * (float) m;
+        k_scale_byte(is + 1, scales, sc, m);
+        const float d2 = d * (float) sc;
+        const float m2 = mn * (float) m;
+        for (int l = 0; l < 32; ++l)
+            *out++ = d1 * (float) ((ql[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l)
+            *out++ = d2 * (float) ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+void q8_dequant(const uint8_t* x, int n, float* a) {
+    for (int b = 0; b < n / 32; ++b) {
+        const uint8_t* blk = x + (size_t) b * 36;
+        const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(blk));
+        for (int i = 0; i < 32; ++i) {
+            int q = blk[4 + i];
+            if (q >= 128) q -= 256;
+            a[(size_t) b * 32 + i] = d * (float) q;
+        }
+    }
+}
+
+void scalar_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, bool q5, float* y) {
+    std::vector<float> act((size_t) n_in), row((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 256) * (q5 ? 176 : 144);
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 256; ++b) {
+            if (q5) dequant_q5(src + (size_t) b * 176, row.data() + (size_t) b * 256);
+            else dequant_q4(src + (size_t) b * 144, row.data() + (size_t) b * 256);
+        }
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) row[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
+bool k_scales_match(const uint8_t* block) {
+    const uint8_t* scales = block + 4;
+    for (int pair = 0; pair < 4; ++pair) {
+        int sc[2], mn[2];
+        k_scale_min(scales, pair * 2, sc, mn);
+        for (int t = 0; t < 2; ++t) {
+            int d = 0, m = 0;
+            k_scale_byte(pair * 2 + t, scales, d, m);
+            if (sc[t] != d || mn[t] != m) return false;
+        }
+    }
+    return true;
+}
+
+void check_k(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
+             bool q5, int flip_at) {
+    const size_t row = (size_t) (n_in / 256) * (q5 ? 176 : 144);
+    const bool layout = w && nbytes == (uint64_t) n_out * row && n_in % 256 == 0;
+    bool scales = false;
+    if (layout) {
+        scales = k_scales_match(w) && k_scales_match(w + (size_t) (n_out - 1) * row);
+        if (n_in >= 512) scales = scales && k_scales_match(w + (q5 ? 176 : 144));
+    }
+    std::vector<float> x((size_t) n_in);
+    for (int i = 0; i < n_in; ++i) x[(size_t) i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes xf((uint64_t) n_in * 4);
+    std::memcpy(xf.data(), x.data(), xf.size());
+    Bytes xq(iq_q8_1_bytes(n_in));
+    iq_quantize_q8_1(xf, n_in, xq);
+    std::vector<uint8_t> xqb((size_t) xq.size());
+    std::memcpy(xqb.data(), xq.data(), xqb.size());
+    std::vector<float> got((size_t) n_out), host((size_t) n_out), scalar((size_t) n_out);
+    double rel = 1, irel = 1;
+    bool ok = false;
+    if (layout) {
+        Bytes dw(nbytes);
+        std::memcpy(dw.data(), w, nbytes);
+        Bytes dy((uint64_t) n_out * 4);
+        iq_mmvq(q5 ? kQ5_K : kQ4_K, dw, 0, xq, n_in, n_out, 1, dy);
+        std::memcpy(got.data(), dy.data(), got.size() * 4);
+        k_ref(w, xqb.data(), n_in, n_out, q5, host.data());
+        scalar_ref(w, xqb.data(), n_in, n_out, q5, scalar.data());
+        rel = rel_l1(scalar.data(), got.data(), n_out);
+        irel = rel_l1(host.data(), got.data(), n_out);
+        ok = scales && all_finite(got.data(), n_out) && rel <= 1e-5 && irel <= 1e-5;
+    }
+    char detail[120];
+    std::snprintf(detail, sizeof detail, "rel %.3e, integer %.3e, %d rows", rel, irel, n_out);
+    verdict(match_name, layout && ok, layout ? detail : "bytes");
+
+    int moved = 0;
+    bool zero_clear = false;
+    int from_zero = 0;
+    if (ok) {
+        Bytes dw(nbytes);
+        std::memcpy(dw.data(), w, nbytes);
+        static_cast<uint8_t*>(dw.data())[flip_at] ^= 1u;
+        Bytes dy((uint64_t) n_out * 4);
+        iq_mmvq(q5 ? kQ5_K : kQ4_K, dw, 0, xq, n_in, n_out, 1, dy);
+        const float* yp = static_cast<const float*>(dy.data());
+        for (int i = 0; i < n_out; ++i)
+            if (yp[i] != got[(size_t) i]) ++moved;
+        std::memcpy(dw.data(), w, nbytes);
+        Bytes zx(xq.size());
+        std::memset(zx.data(), 0, zx.size());
+        iq_mmvq(q5 ? kQ5_K : kQ4_K, dw, 0, zx, n_in, n_out, 1, dy);
+        const float* zp = static_cast<const float*>(dy.data());
+        zero_clear = true;
+        for (int i = 0; i < n_out; ++i) {
+            if (zp[i] != 0.f) zero_clear = false;
+            if (got[(size_t) i] != 0.f) ++from_zero;
+        }
+    }
+    char move_detail[80];
+    std::snprintf(move_detail, sizeof move_detail, "%d of %d differ, zero %d", moved, n_out, from_zero);
+    verdict(move_name, ok && moved > 0 && zero_clear && from_zero == n_out, move_detail);
+}
+
+void run_kquant() {
+    std::printf("\nQ4_K and Q5_K ggml blocks\n");
+    std::mt19937 rng(20261014);
+    const int n_in = 512;
+    const int n_out = 8;
+    std::vector<uint8_t> q4((size_t) n_out * (n_in / 256) * 144);
+    std::vector<uint8_t> q5((size_t) n_out * (n_in / 256) * 176);
+    for (uint8_t& b : q4) b = (uint8_t) rng();
+    for (uint8_t& b : q5) b = (uint8_t) rng();
+    auto finite_scales = [](std::vector<uint8_t>& raw, int block) {
+        for (size_t off = 0; off < raw.size(); off += (size_t) block) {
+            raw[off + 0] = 0x00;
+            raw[off + 1] = 0x3C;
+            raw[off + 2] = 0x00;
+            raw[off + 3] = 0x3C;
+            for (int s = 0; s < 12; ++s) raw[off + 4 + s] = 0x3F;
+        }
+    };
+    finite_scales(q4, 144);
+    finite_scales(q5, 176);
+    check_k("a Q4_K block matches the dequant", "a changed Q4_K code moves that block", q4.data(), q4.size(), n_in,
+            n_out, false, 16);
+    check_k("a Q5_K block matches the dequant", "a changed Q5_K code moves that block", q5.data(), q5.size(), n_in,
+            n_out, true, 48);
+}
+
 // Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
 // The loader does not open the GGUF. A missing directory skips this section.
 void run_q2_layer() {
@@ -2894,6 +3163,15 @@ void run_q2_layer() {
     char q_move_detail[80];
     std::snprintf(q_move_detail, sizeof q_move_detail, "%d of %d differ", q_moved, q_out);
     verdict("a changed IQ4_XS code moves the query", q_ok && q_moved > 0, q_move_detail);
+
+    const PackTensor* gate = table.find("blk.0.attn_gate.weight");
+    const PackTensor* ssm = table.find("blk.0.ssm_out.weight");
+    check_k("the Q4_K gate rows match", "a changed Q4_K code moves the gate",
+            gate && gate->values ? static_cast<const uint8_t*>(gate->values->data()) : nullptr,
+            gate && gate->values ? gate->values->size() : 0, 2560, 6144, false, 16);
+    check_k("the Q5_K output rows match", "a changed Q5_K code moves the output",
+            ssm && ssm->values ? static_cast<const uint8_t*>(ssm->values->data()) : nullptr,
+            ssm && ssm->values ? ssm->values->size() : 0, 6144, 2560, true, 48);
 
     const PackTensor* router = table.find("blk.0.ffn_gate_inp.weight");
     const int n_in = 2560;
@@ -3020,7 +3298,8 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
-        "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query\n\n");
+        "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
+        "one Q4_K gate, one Q5_K output\n\n");
     try {
         run_conversions();
         run_refusals();
@@ -3032,6 +3311,7 @@ int main(int argc, char** argv) {
         run_attn();
         run_stack();
         run_model_layer();
+        run_kquant();
         run_q2_layer();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());

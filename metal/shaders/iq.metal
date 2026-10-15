@@ -1,6 +1,7 @@
 // Coder expert product. The integer dots are the ones in src/kernels/cuda/iq_kernels.cu
 // (llama.cpp vec_dot_*_q8_1): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS for gate and up, IQ4_NL and Q2_0
-// for down. A simdgroup of 32 owns one weight row. Lane L adds partials L, L+32, L+64, ...
+// for down. Q4_K and Q5_K are the ggml super-blocks for the dense gate and the dense output.
+// A simdgroup of 32 owns one weight row. Lane L adds partials L, L+32, L+64, ...
 // and the xor butterfly is the warp sum. q8_1 is 36 bytes: fp16 scale, fp16 sum, 32 int8.
 #include <metal_stdlib>
 using namespace metal;
@@ -244,6 +245,85 @@ inline float iq_dot_iq4_xs(const device uint8_t* blk, const device uint8_t* x0, 
     return d * (float) sumi;
 }
 
+inline void iq_k_scale_min(const device uint8_t* scales8, int bq8_offset, ushort aux[2]) {
+    int j = bq8_offset / 2;
+    int jm = j & 1;
+    uint s0 = (uint) iq_u16(scales8 + 2 * (jm + 0));
+    uint s2 = (uint) iq_u16(scales8 + 2 * (jm + 2));
+    uint s4 = (uint) iq_u16(scales8 + 2 * (jm + 4));
+    uint hi = j >= 2 ? 0xFFFFFFFFu : 0u;
+    aux[0] = (ushort) (((s0 & 0x3f3fu) & ~hi) | ((((s4 >> 0) & 0x0f0fu) | ((s0 & 0xc0c0u) >> 2)) & hi));
+    aux[1] = (ushort) (((s2 & 0x3f3fu) & ~hi) | ((((s4 >> 4) & 0x0f0fu) | ((s2 & 0xc0c0u) >> 2)) & hi));
+}
+
+inline float iq_dot_q4_k(const device uint8_t* blk, const device uint8_t* x0, int iqs) {
+    int bq8_offset = 2 * ((iqs / 2) / 4);
+    const device uint8_t* qs = blk + 16;
+    int byte = 16 * bq8_offset + 4 * ((iqs / 2) % 4);
+    int v0 = iq_ld(qs + byte);
+    int v1 = iq_ld(qs + byte + 16);
+    ushort aux[2];
+    iq_k_scale_min(blk + 4, bq8_offset, aux);
+    uint packed = (uint) aux[0] | ((uint) aux[1] << 16);
+    float sum_d = 0;
+    float sum_m = 0;
+    for (int i = 0; i < 2; i++) {
+        const device uint8_t* bq8 = x0 + (long) (bq8_offset + i) * 36;
+        float d8 = iq_q8_d(bq8);
+        int qoff = (iqs / 2) % 4;
+        int u0 = iq_ld(bq8 + 4 + 4 * qoff);
+        int u1 = iq_ld(bq8 + 4 + 4 * (qoff + 4));
+        int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+        int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+        int dot1 = iq_dp4a(v1i, u1, iq_dp4a(v0i, u0, 0));
+        int dot2 = iq_dp4a(0x01010101, u1, iq_dp4a(0x01010101, u0, 0));
+        int sc = (int) ((packed >> (8 * i)) & 0xFFu);
+        int mn = (int) ((packed >> (16 + 8 * i)) & 0xFFu);
+        sum_d += d8 * (float) (dot1 * sc);
+        sum_m += d8 * (float) (dot2 * mn);
+    }
+    float d = iq_f32_from_f16(iq_u16(blk));
+    float dmin = iq_f32_from_f16(iq_u16(blk + 2));
+    return d * sum_d - dmin * sum_m;
+}
+
+inline float iq_dot_q5_k(const device uint8_t* blk, const device uint8_t* x0, int iqs) {
+    int bq8_offset = 2 * ((iqs / 2) / 4);
+    const device uint8_t* qh = blk + 16;
+    const device uint8_t* ql = blk + 48;
+    int byte = 16 * bq8_offset + 4 * ((iqs / 2) % 4);
+    int vl0 = iq_ld(ql + byte);
+    int vl1 = iq_ld(ql + byte + 16);
+    int qhb = 4 * ((iqs / 2) % 4);
+    int vh0 = iq_ld(qh + qhb) >> bq8_offset;
+    int vh1 = iq_ld(qh + qhb + 16) >> bq8_offset;
+    ushort aux[2];
+    iq_k_scale_min(blk + 4, bq8_offset, aux);
+    uint packed = (uint) aux[0] | ((uint) aux[1] << 16);
+    float sum_d = 0;
+    float sum_m = 0;
+    for (int i = 0; i < 2; i++) {
+        const device uint8_t* bq8 = x0 + (long) (bq8_offset + i) * 36;
+        float d8 = iq_q8_d(bq8);
+        int qoff = (iqs / 2) % 4;
+        int u0 = iq_ld(bq8 + 4 + 4 * qoff);
+        int u1 = iq_ld(bq8 + 4 + 4 * (qoff + 4));
+        int vl0i = (vl0 >> (4 * i)) & 0x0F0F0F0F;
+        int vl1i = (vl1 >> (4 * i)) & 0x0F0F0F0F;
+        int vh0i = ((vh0 >> i) << 4) & 0x10101010;
+        int vh1i = ((vh1 >> i) << 4) & 0x10101010;
+        int dot1 = iq_dp4a(vl0i | vh0i, u0, iq_dp4a(vl1i | vh1i, u1, 0));
+        int dot2 = iq_dp4a(0x01010101, u0, iq_dp4a(0x01010101, u1, 0));
+        int sc = (int) ((packed >> (8 * i)) & 0xFFu);
+        int mn = (int) ((packed >> (16 + 8 * i)) & 0xFFu);
+        sum_d += d8 * (float) (dot1 * sc);
+        sum_m += d8 * (float) (dot2 * mn);
+    }
+    float d = iq_f32_from_f16(iq_u16(blk));
+    float dmin = iq_f32_from_f16(iq_u16(blk + 2));
+    return d * sum_d - dmin * sum_m;
+}
+
 inline float iq_dot_q2_0(const device uint8_t* blk, const device uint8_t* x0, int iqs) {
     const device uint8_t* qs = blk + 2;
     const device uint8_t* x = x0 + iqs * 36;
@@ -277,6 +357,8 @@ inline void iq_row(const device uint8_t* row, const device uint8_t* col, int n_i
             else if (which == 21) part = iq_dot_iq3_s(blk, x0, iqs, g3);
             else if (which == 20) part = iq_dot_iq4_nl(blk, x0, iqs);
             else if (which == 23) part = iq_dot_iq4_xs(blk, x0, iqs);
+            else if (which == 12) part = iq_dot_q4_k(blk, x0, iqs);
+            else if (which == 13) part = iq_dot_q5_k(blk, x0, iqs);
             else part = iq_dot_q2_0(blk, x0, iqs);
             acc += part;
         }
@@ -296,6 +378,8 @@ inline void iq_mmvq_body(const device uint8_t* w, const device uint8_t* x, devic
         else if (which == 21) iq_row<256, 8, 2, 110>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else if (which == 20) iq_row<32, 2, 2, 18>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else if (which == 23) iq_row<256, 8, 4, 136>(wr, col, dim.n_in, lane, acc, which, g2, g3);
+        else if (which == 12) iq_row<256, 16, 2, 144>(wr, col, dim.n_in, lane, acc, which, g2, g3);
+        else if (which == 13) iq_row<256, 16, 2, 176>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         else iq_row<64, 2, 1, 18>(wr, col, dim.n_in, lane, acc, which, g2, g3);
         acc = iq_warp_add(acc);
         if (lane == 0) y[(long) c * dim.n_out + row] = acc;
@@ -339,6 +423,18 @@ kernel void iq_mmvq_q2_0(const device uint8_t* w [[buffer(0)]], const device uin
                          device float* y [[buffer(2)]], constant IqDim& dim [[buffer(3)]],
                          uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
     iq_mmvq_body(w, x, y, dim, lane, row, 42, nullptr, nullptr);
+}
+
+kernel void iq_mmvq_q4_k(const device uint8_t* w [[buffer(0)]], const device uint8_t* x [[buffer(1)]],
+                         device float* y [[buffer(2)]], constant IqDim& dim [[buffer(3)]],
+                         uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    iq_mmvq_body(w, x, y, dim, lane, row, 12, nullptr, nullptr);
+}
+
+kernel void iq_mmvq_q5_k(const device uint8_t* w [[buffer(0)]], const device uint8_t* x [[buffer(1)]],
+                         device float* y [[buffer(2)]], constant IqDim& dim [[buffer(3)]],
+                         uint lane [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    iq_mmvq_body(w, x, y, dim, lane, row, 13, nullptr, nullptr);
 }
 
 kernel void iq_q8_1(const device float* x [[buffer(0)]], device uint8_t* y [[buffer(1)]], constant int& n [[buffer(2)]],

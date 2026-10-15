@@ -67,6 +67,8 @@ const char* mmvq_kernel(int t) {
         case kIq4Nl: return "iq_mmvq_iq4_nl";
         case kIq4Xs: return "iq_mmvq_iq4_xs";
         case kQ2_0: return "iq_mmvq_q2_0";
+        case kQ4_K: return "iq_mmvq_q4_k";
+        case kQ5_K: return "iq_mmvq_q5_k";
         default: return nullptr;
     }
 }
@@ -81,11 +83,16 @@ const Bytes& mmvq_grid(int t) {
 
 }  // namespace
 
-bool iq_type_supported(int ggml_type) noexcept { return mmvq_kernel(ggml_type) != nullptr; }
+bool iq_type_supported(int ggml_type) noexcept {
+    // Q4_K and Q5_K have a matrix-vector product. They are not a Coder expert gate or down.
+    if (ggml_type == kQ4_K || ggml_type == kQ5_K) return false;
+    return mmvq_kernel(ggml_type) != nullptr;
+}
 
 int iq_block_values(int ggml_type) {
     if (ggml_type == kIq4Nl) return 32;
     if (ggml_type == kQ2_0) return 64;
+    if (ggml_type == kQ4_K || ggml_type == kQ5_K) return 256;
     if (iq_type_supported(ggml_type)) return 256;
     return 0;
 }
@@ -98,6 +105,8 @@ size_t iq_block_bytes(int ggml_type) {
         case kIq2S: return 82;
         case kIq4Xs: return 136;
         case kQ2_0: return 18;
+        case kQ4_K: return 144;
+        case kQ5_K: return 176;
         default: return 0;
     }
 }

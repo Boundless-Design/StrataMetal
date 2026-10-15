@@ -29,7 +29,7 @@ routed hidden 640, 8 experts, and shared hidden 64. It also draws one greedy tok
 512 experts, one there with shared hidden 640, and one at vocabulary 248320. It also draws
 sixteen greedy cells at that vocabulary, top-k 2 against top-k 2048. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. The same check writes one synthetic layer at n_embd 2560, 512 experts, and loads it back. When the Q2_0 extract is present, it also loads layer 0 of that file: the query plane is IQ4_XS and its product matched, and one expert's rows are Q2_0. That is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. The same check writes one synthetic layer at n_embd 2560, 512 experts, and loads it back. When the Q2_0 extract is present, it also loads layer 0 of that file: the query plane is IQ4_XS, the gate is Q4_K, the output is Q5_K, and those three products matched. One expert's rows are Q2_0. That is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
 ## One memory pool
 
@@ -680,8 +680,14 @@ bytes. The loader did not open a GGUF. n_embd is 2560. The other 47 layers are n
 The name check passed. `blk.0.attn_qkv.weight` is 13,926,400 bytes, stored as IQ4_XS, and the binder
 refused it: code_bits 0 has no Q8_K contract. The same bytes through the IQ4_XS product matched the
 integer reference, relative error 0, on 10240 rows. Flipping one code byte differed on 1 of 10240
-outputs. `blk.0.attn_gate.weight` is Q4_K, 8,847,360 bytes.
-`blk.0.ssm_out.weight` is Q5_K, 10,813,440 bytes. Those planes are not a Q8_K GDN step. The router,
+outputs. `blk.0.attn_gate.weight` is Q4_K, 8,847,360 bytes, 6144 rows of 2560. The product matched
+the dequantized values, relative error 1.747e-07. The integer dot matched, relative error 0.
+Flipping one code byte differed on 1 of 6144 outputs. A zero activation was 0 on all 6144 outputs.
+`blk.0.ssm_out.weight` is Q5_K, 10,813,440 bytes, 2560 rows of 6144. The product matched the
+dequantized values, relative error 1.786e-07. The integer dot matched, relative error 0. Flipping
+one code byte differed on 1 of 2560 outputs. A zero activation was 0 on all 2560 outputs. A
+synthetic Q4_K block matched at relative error 1.139e-08, and a synthetic Q5_K block matched at
+2.116e-08. Each flip moved 1 of 8 outputs. Those planes are not a Q8_K GDN step. The router,
 `blk.0.ffn_gate_inp.weight`, is bf16, 2560 by 512. The product matched at relative error 6.683e-08.
 A zero activation was 0 on all 512 outputs and differed on 512 of 512 from the patterned activation. Expert 0 is Q2_0 on the gate, the up, and the down,
 460,800 bytes each. The three products matched the integer reference, relative error 0. Flipping one
@@ -693,7 +699,8 @@ The GDN check is one layer, on synthetic weights. The stack check is four layers
 weights. The pack check reads an index into those kernels and draws one synthetic greedy token
 from the loaded planes. It also writes one synthetic layer at n_embd 2560 and, when the
 extract is present, loads layer 0 of the Q2_0 file. The query plane there is IQ4_XS. Its product matched, relative error 0, on 10240 rows, and
-the binder still refuses it. Expert 0's three Q2_0 products match, and a Q2_0 gate is refused. The token
+the binder still refuses it. The gate product matched at relative error 1.747e-07, 6144 rows.
+The output product matched at relative error 1.786e-07, 2560 rows. Expert 0's three Q2_0 products match, and a Q2_0 gate is refused. The token
 check also draws one synthetic greedy draft from a caller residual and the next token. The same check draws one greedy token at n_embd 2560, indexer dim 128,
 64 rotated values, and top-k 2. Rank stayed 32, with 8 experts, hidden 64, and vocabulary 32. The same
 check draws one greedy token at hc_lr 320 on that embedding. The sampled id was 30. Expert count,
@@ -727,7 +734,7 @@ pack. One synthetic greedy token. There is no token rate. The expert-half add is
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. One product on the Q4_K gate and one product on the Q5_K output of layer 0, then one GDN step on those planes. The query product already matches: IQ4_XS, 13,926,400 bytes, relative error 0, 10240 rows. The Q8_K binder still refuses that plane. The gate is Q4_K, 8,847,360 bytes. The output is Q5_K, 10,813,440 bytes. Those two are the ggml blocks, and this check does not multiply them. Expert 0's three Q2_0 products already match, and the wrapper still refuses a Q2_0 gate. That is one expert of 1,382,400 bytes, not 512 resident experts, and not 48 layers. Expert streaming is not in this tree. There is no token rate.
+1. One GDN step on layer 0 that calls these products. The query is IQ4_XS, relative error 0, 10240 rows. The gate is Q4_K, relative error 1.747e-07, 6144 rows. The output is Q5_K, relative error 1.786e-07, 2560 rows. The Q8_K binder still refuses the three planes, so the existing GDN layer does not run them. Expert 0's three Q2_0 products already match, and the wrapper still refuses a Q2_0 gate. That is one expert of 1,382,400 bytes, not 512 resident experts, and not 48 layers. Expert streaming is not in this tree. There is no token rate.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
