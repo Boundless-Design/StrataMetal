@@ -2766,6 +2766,58 @@ void q2_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
     for (int r = 0; r < n_out; ++r) y[r] = q2_row(w + (size_t) r * row, x, n_in);
 }
 
+// IQ4_XS block, 136 bytes and 256 values. Same integer dot as iq_mmvq_iq4_xs.
+const int kIq4Code[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+void xs_nibbles(int aux, int& vx, int& vy) {
+    vx = vy = 0;
+    for (int b = 0; b < 4; ++b) {
+        const unsigned byte = (unsigned) (aux >> (8 * b)) & 0xFFu;
+        vx |= (int) (uint8_t) kIq4Code[byte & 0xFu] << (8 * b);
+        vy |= (int) (uint8_t) kIq4Code[byte >> 4] << (8 * b);
+    }
+}
+
+float xs_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const uint8_t* qs = blk + 8;
+    const uint8_t* x = x0 + (iqs / 4) * 36;
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        int vx = 0, vy = 0;
+        xs_nibbles(q2_ld(qs + 4 * (iqs + j)), vx, vy);
+        sumi = q2_dp4a(vx, q2_ld(x + 4 + 4 * j), sumi);
+        sumi = q2_dp4a(vy, q2_ld(x + 4 + 4 * (j + 4)), sumi);
+    }
+    const int sh = (int) blk[2] | ((int) blk[3] << 8);
+    const int ls = (((blk + 4)[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((sh >> (iqs / 2)) & 0x03) << 4);
+    sumi *= ls - 32;
+    const uint16_t hs = (uint16_t) (blk[0] | (blk[1] << 8));
+    const uint16_t hd = (uint16_t) (x[0] | (x[1] << 8));
+    const float d = strata::kernels::f32_from_f16(hs) * strata::kernels::f32_from_f16(hd);
+    return d * (float) sumi;
+}
+
+float xs_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 256) * 8;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 8;
+        const int iqs = 4 * (k % 8);
+        lane[k & 31] += xs_partial(row + (size_t) kbx * 136, col + (size_t) kbx * 8 * 36, iqs);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void xs_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 256) * 136;
+    for (int r = 0; r < n_out; ++r) y[r] = xs_row(w + (size_t) r * row, x, n_in);
+}
+
 // Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
 // The loader does not open the GGUF. A missing directory skips this section.
 void run_q2_layer() {
@@ -2800,6 +2852,48 @@ void run_q2_layer() {
                          bind_got.find("code_bits 0") != std::string::npos;
     verdict("the Q2_0 query projection is not Q8_K", qkv_bytes && refused && qkv_msg,
             qkv_bytes && refused ? "IQ4_XS, 13926400 B, " + bind_got : bind_got);
+
+    const int q_in = 2560;
+    const int q_out = 10240;
+    const size_t q_row = (size_t) (q_in / 256) * 136;
+    const bool q_layout = qkv_bytes && qkv->values->size() == (uint64_t) q_out * q_row;
+    std::vector<float> qx((size_t) q_in);
+    for (int i = 0; i < q_in; ++i) qx[(size_t) i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes qxf((uint64_t) q_in * 4);
+    std::memcpy(qxf.data(), qx.data(), qxf.size());
+    Bytes qxq(iq_q8_1_bytes(q_in));
+    iq_quantize_q8_1(qxf, q_in, qxq);
+    std::vector<uint8_t> qxqb((size_t) qxq.size());
+    std::memcpy(qxqb.data(), qxq.data(), qxqb.size());
+    std::vector<float> q_got((size_t) q_out), q_host((size_t) q_out);
+    double q_rel = 1;
+    bool q_ok = false;
+    if (q_layout) {
+        Bytes qy((uint64_t) q_out * 4);
+        iq_mmvq(kIq4Xs, *qkv->values, 0, qxq, q_in, q_out, 1, qy);
+        std::memcpy(q_got.data(), qy.data(), q_got.size() * 4);
+        xs_ref(static_cast<const uint8_t*>(qkv->values->data()), qxqb.data(), q_in, q_out, q_host.data());
+        q_rel = rel_l1(q_host.data(), q_got.data(), q_out);
+        q_ok = all_finite(q_got.data(), q_out) && q_rel <= 1e-5;
+    }
+    char q_detail[80];
+    std::snprintf(q_detail, sizeof q_detail, "rel %.3e, %d rows", q_rel, q_out);
+    verdict("the IQ4_XS query rows match", q_layout && q_ok, q_layout ? q_detail : "query bytes");
+
+    int q_moved = 0;
+    if (q_ok) {
+        Bytes flipped(qkv->values->size());
+        std::memcpy(flipped.data(), qkv->values->data(), flipped.size());
+        static_cast<uint8_t*>(flipped.data())[8] ^= 1u;
+        Bytes y2((uint64_t) q_out * 4);
+        iq_mmvq(kIq4Xs, flipped, 0, qxq, q_in, q_out, 1, y2);
+        const float* y2p = static_cast<const float*>(y2.data());
+        for (int i = 0; i < q_out; ++i)
+            if (y2p[i] != q_got[(size_t) i]) ++q_moved;
+    }
+    char q_move_detail[80];
+    std::snprintf(q_move_detail, sizeof q_move_detail, "%d of %d differ", q_moved, q_out);
+    verdict("a changed IQ4_XS code moves the query", q_ok && q_moved > 0, q_move_detail);
 
     const PackTensor* router = table.find("blk.0.ffn_gate_inp.weight");
     const int n_in = 2560;
@@ -2926,7 +3020,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
-        "one routed expert, one 2-bit query, one stack token, one model layer\n\n");
+        "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query\n\n");
     try {
         run_conversions();
         run_refusals();
