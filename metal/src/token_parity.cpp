@@ -1075,6 +1075,19 @@ void check_hidden_token() {
     check_live_token(L, "hidden");
 }
 
+// The same token at the model expert count. Shared hidden, vocabulary, and top-k stay put.
+void check_expert_token() {
+    std::printf("\nmodel experts  n_embd 2560  hc_lr 320  n_ff 640  n_expert 512\n");
+    Live L;
+    L.n_embd = 2560;
+    L.idx_dim = 128;
+    L.hc_lr = 320;
+    L.n_ff = 640;
+    L.n_expert = 512;
+    build_live(L);
+    check_live_token(L, "expert");
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -1097,7 +1110,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "token: one block, one greedy sample, one draft step, one model-width token, one model-rank token, "
-        "one model-hidden token, synthetic weights\n\n");
+        "one model-hidden token, one model-expert token, synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -1479,6 +1492,7 @@ int main(int argc, char** argv) {
         check_wide_token();
         check_rank_token();
         check_hidden_token();
+        check_expert_token();
 
         check_serve(argv[0]);
 
