@@ -29,7 +29,7 @@ routed hidden 640, 8 experts, and shared hidden 64. It also draws one greedy tok
 512 experts, one there with shared hidden 640, and one at vocabulary 248320. It also draws
 sixteen greedy cells at that vocabulary, top-k 2 against top-k 2048. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. The same check writes one synthetic layer at n_embd 2560, 512 experts, and loads it back. When the Q2_0 extract is present, it also loads layer 0 of that file: the query plane is IQ4_XS and one expert's rows are Q2_0. That is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. `strata-metal-token --serve` answers on that same fixture. The check started the binary. The Python server was not started. There is no token rate.
 
 ## One memory pool
 
@@ -663,10 +663,36 @@ opened. The layer bind still leaves the embedding, the shared expert, the routed
 2-bit query, and the output projection unbound. One synthetic greedy token. There is no token
 rate. This is not a loaded model.
 
+The same run writes one layer at the model width and loads it back. n_embd 2560, and n_layers is 1.
+The other defaults stay the model's: 4 streams, rank 320, 512 experts, hidden 640, interval 4, state
+128, 16 key heads, 48 value heads, convolution 4, conv width 10240, value width 6144. Layer 0 is GDN.
+The check wrote the weights. The gate and up rows are IQ4_XS and the down rows are Q2_0. One blob is
+2,201,600 bytes. The file is 1,127,219,200 bytes. The name check saw 23 tensors. Layer 1 is outside
+0..0. The layer bound. One GDN step from a zero state repeated, 0 differ, and the guard word stayed 1.
+A zero activation differed on 2560 of 2560 outputs, 100.00% apart. Experts 0 and 511 matched the file
+bytes, 0 differ, and those two outputs were 44.88% apart. The 3-D role span differed on 2560 of 2560
+outputs, 120.22% apart. Expert 512 was refused. No GGUF was opened. This is not a loaded model. There
+is no token rate.
+
+When the extract directory is present, the same run loads layer 0 of the Q2_0 file. On this Mac that
+directory holds 22 tensors in dense.bin, 66,030,976 bytes, and one expert in experts.bin, 1,382,400
+bytes. The loader did not open a GGUF. n_embd is 2560. The other 47 layers are not in the directory.
+The name check passed. `blk.0.attn_qkv.weight` is 13,926,400 bytes, stored as IQ4_XS, and the binder
+refused it: code_bits 0 has no Q8_K contract. `blk.0.attn_gate.weight` is Q4_K, 8,847,360 bytes.
+`blk.0.ssm_out.weight` is Q5_K, 10,813,440 bytes. Those planes are not a Q8_K GDN step. The router,
+`blk.0.ffn_gate_inp.weight`, is bf16, 2560 by 512. The product matched at relative error 6.683e-08.
+A zero activation was 0 on all 512 outputs and differed on 512 of 512 from the patterned activation. Expert 0 is Q2_0 on the gate, the up, and the down,
+460,800 bytes each. The three products matched the integer reference, relative error 0. Flipping one
+code byte differed on 1 of 640 gate outputs. The expert wrapper refused the gate: the gate type is a
+down quant. The file has 512 experts. This check loaded expert 0. No token was drawn. There is no
+token rate. This is not a loaded model.
+
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels and draws one synthetic greedy token
-from the loaded planes. The token check also draws one synthetic greedy draft from a caller
-residual and the next token. The same check draws one greedy token at n_embd 2560, indexer dim 128,
+from the loaded planes. It also writes one synthetic layer at n_embd 2560 and, when the
+extract is present, loads layer 0 of the Q2_0 file. The query plane there is IQ4_XS and
+the binder refuses it. Expert 0's three Q2_0 products match, and a Q2_0 gate is refused. The token
+check also draws one synthetic greedy draft from a caller residual and the next token. The same check draws one greedy token at n_embd 2560, indexer dim 128,
 64 rotated values, and top-k 2. Rank stayed 32, with 8 experts, hidden 64, and vocabulary 32. The same
 check draws one greedy token at hc_lr 320 on that embedding. The sampled id was 30. Expert count,
 hidden size, and top-k stayed at 8, 64, and 2. The same check draws one greedy token with routed
@@ -692,13 +718,14 @@ started it. The Python server was not started. `strata-metal-stack` calls that t
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
 expert, one routed expert, and one 2-bit query on bytes it loaded. It also feeds one stack token
-from those planes. The stack query is the Q8_K plane. The stack's shared expert is the 2-bit
-function. output.weight on that path is Q8_K. The rope table is not in the pack. One synthetic
-greedy token. There is no token rate. The expert-half add is still a kernel only. The 2-bit
+from those planes. It also writes one synthetic layer at n_embd 2560 and, when the extract is
+present, loads layer 0 of the Q2_0 file. The stack query is the Q8_K plane. The stack's shared
+expert is the 2-bit function. output.weight on that path is Q8_K. The rope table is not in the
+pack. One synthetic greedy token. There is no token rate. The expert-half add is still a kernel only. The 2-bit
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. One layer from a real pack index plus the bins beside it. One layer, n_embd 2560, 512 expert blobs of 2,201,600 bytes each. That is not a loaded 48-layer model. A resident set of 48 such layers does not fit this 36 GB Mac. Expert streaming is not in this tree. This does not read a GGUF.
+1. One GDN step on layer 0 of the Q2_0 file. The query plane is IQ4_XS, 13,926,400 bytes. The gate plane is Q4_K, 8,847,360 bytes. The output plane is Q5_K, 10,813,440 bytes. The Q8_K binder refuses the query. Expert 0's three Q2_0 products already match, and the wrapper still refuses a Q2_0 gate. That is one expert of 1,382,400 bytes, not 512 resident experts, and not 48 layers. Expert streaming is not in this tree. There is no token rate.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

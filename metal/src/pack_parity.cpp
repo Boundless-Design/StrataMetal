@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -1450,6 +1451,31 @@ std::vector<uint8_t> expert_blob(const IqExpert& e, uint32_t seed) {
     return blob;
 }
 
+// A full expert blob with a finite fp16 scale on every block. Bytes 2 and 3 of the
+// gate carry the seed, so two experts are not the same file.
+std::vector<uint8_t> model_expert_blob(const IqExpert& e, uint32_t seed) {
+    auto fill = [](int type, int rows, int n_in, uint32_t s) {
+        const size_t rb = iq_row_bytes(type, n_in);
+        const size_t bs = iq_block_bytes(type);
+        if (bs < 4) throw MetalError("fixture block");
+        std::vector<uint8_t> w((size_t) rows * rb);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = (uint8_t) (s + (uint32_t) i * 17u);
+        const uint16_t h = 0x3c00;
+        for (size_t o = 0; o < w.size(); o += bs) {
+            w[o] = (uint8_t) h;
+            w[o + 1] = (uint8_t) (h >> 8);
+        }
+        w[2] = (uint8_t) s;
+        w[3] = (uint8_t) (s >> 8);
+        return w;
+    };
+    auto blob = fill(e.gu_type, (int) (2 * e.n_ff), (int) e.n_embd, seed);
+    auto down = fill(e.d_type, (int) e.n_embd, (int) e.n_ff, seed + 17);
+    blob.insert(blob.end(), down.begin(), down.end());
+    if (blob.size() != iq_expert_bytes(e)) throw MetalError("fixture blob size");
+    return blob;
+}
+
 void add_role_span(Built& b, const std::vector<uint8_t>& bytes) {
     Row row;
     row.name = "blk.0.ffn_gate_exps.weight";
@@ -2391,6 +2417,505 @@ void run_stack() {
         });
 }
 
+double rel_l1(const float* a, const float* b, int n) {
+    double num = 0, den = 0;
+    for (int i = 0; i < n; ++i) {
+        num += std::fabs((double) a[i] - (double) b[i]);
+        den += std::fabs((double) a[i]);
+    }
+    if (den == 0) return num == 0 ? 0 : 1;
+    return num / den;
+}
+
+bool all_finite(const float* a, int n) {
+    for (int i = 0; i < n; ++i)
+        if (!std::isfinite(a[i])) return false;
+    return true;
+}
+
+std::vector<uint8_t> read_at_path(const std::filesystem::path& path, uint64_t off, size_t n) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw MetalError("cannot open " + path.string());
+    if (fseeko(f, (off_t) off, SEEK_SET) != 0) {
+        std::fclose(f);
+        throw MetalError("seek failed in " + path.string());
+    }
+    std::vector<uint8_t> got(n);
+    const size_t nread = n ? std::fread(got.data(), 1, n, f) : 0;
+    std::fclose(f);
+    if (nread != n) throw MetalError("short read in " + path.string());
+    return got;
+}
+
+// One GDN layer at the model width. This check writes the index and the bins, then
+// loads them. n_layers is 1. The other 47 layers are not written. experts.bin is the
+// 512 blobs. The 3-D role span is a different file and is not passed to the expert.
+void run_model_layer() {
+    strata::core::ModelGeometry g;
+    if (g.n_embd != 2560 || g.n_expert != 512 || g.n_ff != 640 || g.hc != 4 || g.hc_lr != 320 ||
+        g.qsa_interval != 4 || g.n_layers != 48 || g.ssm_state_size != 128 || g.ssm_k_heads != 16 ||
+        g.ssm_v_heads != 48 || g.ssm_d_conv != 4 || g.ssm_conv_channels != 10240 || g.ssm_value_dim != 6144) {
+        throw MetalError("model geometry defaults moved");
+    }
+    g.n_layers = 1;
+    const IqExpert shape{kIq4Xs, kQ2_0, g.n_embd, g.n_ff};
+    const size_t blob_n = iq_expert_bytes(shape);
+    if (blob_n != 2201600) throw MetalError("model expert blob is not 2201600");
+    const int n_expert = (int) g.n_expert;
+    const uint16_t scale = strata::kernels::f16_from_f32(0.02f);
+    const uint32_t word = bf_word(0.01f);
+
+    std::printf("one model layer from a pack index\n");
+    Tmp dir;
+    std::vector<uint8_t> role = model_expert_blob(shape, 9001);
+    {
+        Built b;
+        add_gr_router(b, g, 0, word);
+        add_gdn_planes(b, g, 0, scale, word);
+        add_shexp2(b, g, 0, scale, word);
+        add_role_span(b, role);
+        write_pack(dir, b);
+    }
+    const auto experts_path = dir.path / "experts.bin";
+    {
+        std::FILE* f = std::fopen(experts_path.c_str(), "wb");
+        if (!f) throw MetalError("cannot write experts.bin");
+        std::vector<char> buf(8u << 20);
+        std::setvbuf(f, buf.data(), _IOFBF, buf.size());
+        for (int e = 0; e < n_expert; ++e) {
+            const std::vector<uint8_t> blob = model_expert_blob(shape, (uint32_t) (1000 + e));
+            if (std::fwrite(blob.data(), 1, blob.size(), f) != blob.size()) {
+                std::fclose(f);
+                throw MetalError("short expert write");
+            }
+        }
+        if (std::fclose(f) != 0) throw MetalError("experts.bin did not close");
+    }
+    const uint64_t file_n = (uint64_t) n_expert * (uint64_t) blob_n;
+    const std::string native = native_v3(n_expert, file_n, kIq4Xs, kQ2_0, blob_n);
+    write_bytes(dir.path / "native_experts.txt", native.data(), native.size());
+
+    PackTable table = PackTable::load(dir.path.string());
+    const PackTensor* qkv = table.find(tn(0, "attn_qkv.weight"));
+    const PackTensor* gate = table.find(tn(0, "attn_gate.weight"));
+    const PackTensor* ssm = table.find(tn(0, "ssm_out.weight"));
+    const PackTensor* router = table.find(tn(0, "ffn_gate_inp.weight"));
+    const PackTensor* shexp = table.find(tn(0, "ffn_down_shexp.weight"));
+    const PackTensor* role_row = table.find("blk.0.ffn_gate_exps.weight");
+    std::string err;
+    const bool schedule = check_pack_layer(table, g, 0, err);
+    const bool shapes = schedule && qkv && gate && ssm && router && shexp && role_row && qkv->codes && ssm->codes &&
+                        shexp->codes && router->values && role_row->values && qkv->ne0 == g.n_embd &&
+                        qkv->ne1 == g.ssm_conv_channels && qkv->code_bits == 4 && qkv->act_kind == 1 &&
+                        gate->ne0 == g.n_embd && gate->ne1 == g.ssm_value_dim && gate->code_bits == 4 &&
+                        ssm->ne0 == g.ssm_value_dim && ssm->ne1 == g.n_embd && ssm->code_bits == 8 &&
+                        router->kind == strata::core::WeightKind::Bf16InF32 && router->ne0 == g.n_embd &&
+                        router->ne1 == g.n_expert && router->values->size() == (uint64_t) g.n_embd * (uint64_t) g.n_expert * 2 &&
+                        shexp->code_bits == 2 && shexp->group_elems == 64 && shexp->code_bias == -1 && !shexp->has_offset &&
+                        shexp->ne0 == g.n_ff && shexp->ne1 == g.n_embd && role_row->file_id == 3 &&
+                        role_row->values->size() == role.size() &&
+                        std::memcmp(role_row->values->data(), role.data(), role.size()) == 0 &&
+                        !strata::core::is_qsa_layer(g, 0);
+    char shape_detail[160];
+    std::snprintf(shape_detail, sizeof shape_detail, "tensors %zu, n_embd %lld, experts %d", table.size(),
+                  (long long) g.n_embd, n_expert);
+    verdict("one pack layer passes the name check", shapes, shapes ? shape_detail : err);
+
+    std::string outside;
+    const bool second = !check_pack_layer(table, g, 1, outside) && outside.find("outside") != std::string::npos;
+    verdict("a second layer is outside this pack", second, outside);
+
+    PackLayer layer{};
+    std::string bind_err = err;
+    bool bound = false;
+    if (shapes) {
+        try {
+            layer = bind_layer(table, g, 0);
+            std::vector<const void*> ptrs;
+            collect(layer, ptrs);
+            bound = !layer.qsa_layer && layer.gdn.qkv.codes && layer.gdn.qkv.codes->data() == qkv->codes->data() &&
+                    layer.gdn.qkv.form.code_bits == 4 && layer.gdn.ssm_out.codes &&
+                    layer.gdn.ssm_out.codes->data() == ssm->codes->data() && layer.gdn.ssm_out.form.code_bits == 8 &&
+                    layer.router && layer.router->data() == router->values->data() && layer.gdn.alpha &&
+                    layer.attn.down && layer.ffn.down && layer.qsa.q.codes == nullptr &&
+                    !aliased(shexp->codes->data(), ptrs) && !aliased(role_row->values->data(), ptrs);
+        } catch (const MetalError& e) {
+            bind_err = e.what();
+        }
+    }
+    verdict("one pack layer binds", bound, bound ? "GDN planes, router, residual" : bind_err);
+
+    const int n = (int) g.n_embd;
+    const int guard = 1;
+    bool repeat = false;
+    bool moved = false;
+    std::string gdn_detail = bind_err;
+    std::string move_detail = bind_err;
+    if (bound) {
+        try {
+            const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4), state_b(state_n * 4), conv_b(conv_n * 4);
+            Bytes state_z(state_n * 4), conv_z(conv_n * 4);
+            std::memset(state.data(), 0, (size_t) state.size());
+            std::memset(conv.data(), 0, (size_t) conv.size());
+            std::memset(state_b.data(), 0, (size_t) state_b.size());
+            std::memset(conv_b.data(), 0, (size_t) conv_b.size());
+            std::memset(state_z.data(), 0, (size_t) state_z.size());
+            std::memset(conv_z.data(), 0, (size_t) conv_z.size());
+            Bytes x((uint64_t) n * 4);
+            auto* xp = static_cast<float*>(x.data());
+            for (int i = 0; i < n; ++i) xp[i] = (float) ((i * 17) % 29) * 0.01f - 0.1f;
+            Bytes y((uint64_t) (n + guard) * 4);
+            Bytes y2((uint64_t) (n + guard) * 4);
+            Bytes yz((uint64_t) (n + guard) * 4);
+            std::fill_n(static_cast<float*>(y.data()), (size_t) (n + guard), 7.f);
+            std::fill_n(static_cast<float*>(y2.data()), (size_t) (n + guard), 7.f);
+            std::fill_n(static_cast<float*>(yz.data()), (size_t) (n + guard), 7.f);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            GdnLayerState st{&state, &conv};
+            GdnLayerState st_b{&state_b, &conv_b};
+            GdnLayerState st_z{&state_z, &conv_z};
+            gdn_layer(lg, layer.gdn, st, sc, x, y);
+            gdn_layer(lg, layer.gdn, st_b, sc, x, y2);
+            Bytes zero((uint64_t) n * 4);
+            std::memset(zero.data(), 0, (size_t) zero.size());
+            gdn_layer(lg, layer.gdn, st_z, sc, zero, yz);
+            const float* yp = static_cast<const float*>(y.data());
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const int again = differ_floats(yp, y2p, n);
+            const int apart = differ_floats(yp, yzp, n);
+            const double rel = rel_l1(yp, yzp, n);
+            const bool guard_held = yp[n] == 7.f && y2p[n] == 7.f && yzp[n] == 7.f;
+            const bool live = all_finite(yp, n) && all_finite(y2p, n) && all_finite(yzp, n) && !still_seven(yp, n);
+            repeat = again == 0 && live && guard_held;
+            moved = apart > 0 && live && guard_held && std::isfinite(rel);
+            char buf[192];
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            gdn_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, n, rel * 100.0);
+            move_detail = buf;
+        } catch (const MetalError& e) {
+            gdn_detail = e.what();
+            move_detail = e.what();
+        }
+    }
+    verdict("one pack GDN step repeats", repeat, gdn_detail);
+    verdict("a zero activation moves that step", moved, move_detail);
+
+    const uint64_t on_disk = std::filesystem::file_size(experts_path);
+    int stamps = 0;
+    {
+        std::FILE* f = std::fopen(experts_path.c_str(), "rb");
+        if (!f) throw MetalError("cannot reopen experts.bin");
+        for (int e = 0; e < n_expert; ++e) {
+            if (fseeko(f, (off_t) e * (off_t) blob_n, SEEK_SET) != 0) {
+                std::fclose(f);
+                throw MetalError("experts.bin seek failed");
+            }
+            uint8_t b[4] = {};
+            if (std::fread(b, 1, 4, f) != 4) {
+                std::fclose(f);
+                throw MetalError("experts.bin stamp read failed");
+            }
+            const uint32_t s = (uint32_t) (1000 + e);
+            if (b[0] != 0x00 || b[1] != 0x3c || b[2] != (uint8_t) s || b[3] != (uint8_t) (s >> 8)) ++stamps;
+        }
+        std::fclose(f);
+    }
+
+    Bytes x((uint64_t) n * 4);
+    auto* xp = static_cast<float*>(x.data());
+    for (int i = 0; i < n; ++i) xp[i] = (float) ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes xq(iq_q8_1_bytes(g.n_embd));
+    iq_quantize_q8_1(x, g.n_embd, xq);
+    auto filled = [&]() {
+        Bytes y((uint64_t) (n + guard) * 4);
+        std::fill_n(static_cast<float*>(y.data()), (size_t) (n + guard), 7.f);
+        return y;
+    };
+    const int sample[] = {0, 1, 256, 511};
+    int sample_diff = 0;
+    bool sample_guard = true;
+    std::vector<float> y0((size_t) n, 0.f), y511((size_t) n, 0.f);
+    bool experts_ran = false;
+    std::string expert_err;
+    try {
+        for (int id : sample) {
+            const std::vector<uint8_t> file_blob = read_at_path(experts_path, (uint64_t) id * blob_n, blob_n);
+            const std::vector<uint8_t> made = model_expert_blob(shape, (uint32_t) (1000 + id));
+            if (file_blob != made) throw MetalError("expert " + std::to_string(id) + " bytes are not the written blob");
+            Bytes got = filled();
+            Bytes ref = filled();
+            run_routed_expert(table, dir.path.string(), g, 0, id, xq, got);
+            Bytes copied(file_blob.size());
+            std::memcpy(copied.data(), file_blob.data(), file_blob.size());
+            iq_expert(copied, xq, shape, 1, ref);
+            const float* gp = static_cast<const float*>(got.data());
+            sample_diff += differ_floats(gp, static_cast<const float*>(ref.data()), n);
+            if (gp[n] != 7.f || static_cast<const float*>(ref.data())[n] != 7.f) sample_guard = false;
+            if (!all_finite(gp, n) || still_seven(gp, n)) throw MetalError("expert " + std::to_string(id) + " was not live");
+            if (id == 0) std::memcpy(y0.data(), gp, (size_t) n * 4);
+            if (id == 511) std::memcpy(y511.data(), gp, (size_t) n * 4);
+        }
+        experts_ran = true;
+    } catch (const MetalError& e) {
+        expert_err = e.what();
+    }
+    const int between = experts_ran ? differ_floats(y0.data(), y511.data(), n) : 0;
+    const double between_rel = experts_ran ? rel_l1(y0.data(), y511.data(), n) : 0;
+    Bytes via_role = filled();
+    {
+        Bytes copied(role.size());
+        std::memcpy(copied.data(), role.data(), role.size());
+        iq_expert(copied, xq, shape, 1, via_role);
+    }
+    const int role_diff = experts_ran ? differ_floats(y0.data(), static_cast<const float*>(via_role.data()), n) : 0;
+    const double role_rel = experts_ran ? rel_l1(y0.data(), static_cast<const float*>(via_role.data()), n) : 0;
+    const bool role_held = role_row && role_row->values &&
+                           std::memcmp(role_row->values->data(), role.data(), role.size()) == 0;
+    const bool blobs_ok = experts_ran && on_disk == file_n && stamps == 0 && sample_diff == 0 && sample_guard &&
+                          between > 0 && role_diff > 0 && role_held;
+    char blob_detail[320];
+    if (!expert_err.empty()) {
+        std::snprintf(blob_detail, sizeof blob_detail, "%s", expert_err.c_str());
+    } else {
+        std::snprintf(blob_detail, sizeof blob_detail,
+                      "blob %zu, file %llu, stamps %d, %d differ, expert 511 %.2f%% apart", blob_n,
+                      (unsigned long long) on_disk, stamps, sample_diff, between_rel * 100.0);
+    }
+    verdict("512 expert blobs match the copied bytes", blobs_ok, blob_detail);
+
+    char role_detail[160];
+    std::snprintf(role_detail, sizeof role_detail, "%d of %d differ, %.2f%% apart", role_diff, n, role_rel * 100.0);
+    verdict("the role span is not that expert", blobs_ok && role_diff > 0, experts_ran ? role_detail : expert_err);
+
+    {
+        Bytes out = filled();
+        std::string got;
+        const bool thrown = threw("outside", [&] { run_routed_expert(table, dir.path.string(), g, 0, n_expert, xq, out); },
+                                  got);
+        const bool held = still_seven(static_cast<const float*>(out.data()), n + guard);
+        verdict("an expert past 511 is refused", thrown && held, got);
+    }
+}
+
+int q2_dp4a(int a, int b, int c) {
+    int s = c;
+    for (int i = 0; i < 4; ++i) {
+        int sa = (a >> (8 * i)) & 0xFF;
+        int sb = (b >> (8 * i)) & 0xFF;
+        if (sa >= 128) sa -= 256;
+        if (sb >= 128) sb -= 256;
+        s += sa * sb;
+    }
+    return s;
+}
+
+int q2_pack_byte(unsigned byte) {
+    int r = 0;
+    for (int c = 0; c < 4; ++c) {
+        const int sym = (int) ((byte >> (2 * c)) & 3u) - 1;
+        r |= (sym & 0xFF) << (8 * c);
+    }
+    return r;
+}
+
+int q2_ld(const uint8_t* p) {
+    const uint32_t u = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+    return (int) u;
+}
+
+float q2_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const uint8_t* qs = blk + 2;
+    const uint8_t* x = x0 + iqs * 36;
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        const unsigned b0 = qs[8 * iqs + 2 * j];
+        const unsigned b1 = qs[8 * iqs + 2 * j + 1];
+        sumi = q2_dp4a(q2_pack_byte(b0), q2_ld(x + 4 + 4 * (j * 2)), sumi);
+        sumi = q2_dp4a(q2_pack_byte(b1), q2_ld(x + 4 + 4 * (j * 2 + 1)), sumi);
+    }
+    uint16_t hs = 0, hd = 0;
+    std::memcpy(&hs, blk, 2);
+    std::memcpy(&hd, x, 2);
+    const float d = strata::kernels::f32_from_f16(hs) * strata::kernels::f32_from_f16(hd);
+    return d * (float) sumi;
+}
+
+float q2_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 64) * 2;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 2;
+        const int iqs = k % 2;
+        lane[k & 31] += q2_partial(row + (size_t) kbx * 18, col + (size_t) kbx * 2 * 36, iqs);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q2_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 64) * 18;
+    for (int r = 0; r < n_out; ++r) y[r] = q2_row(w + (size_t) r * row, x, n_in);
+}
+
+// Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
+// The loader does not open the GGUF. A missing directory skips this section.
+void run_q2_layer() {
+    const char* env = std::getenv("STRATA_Q2_LAYER");
+    const bool asked = env != nullptr && env[0] != '\0';
+    const std::filesystem::path dir =
+        asked ? std::filesystem::path(env) : std::filesystem::path("/Users/kamp/Developer/Strata-data/extract/q2_0-layer0");
+    if (!std::filesystem::is_regular_file(dir / "index.txt")) {
+        if (asked) throw MetalError("STRATA_Q2_LAYER has no index.txt");
+        return;
+    }
+    strata::core::ModelGeometry g;
+    if (g.n_embd != 2560 || g.n_expert != 512 || g.n_ff != 640 || g.hc != 4 || g.hc_lr != 320 ||
+        g.qsa_interval != 4 || g.n_layers != 48 || g.ssm_state_size != 128 || g.ssm_k_heads != 16 ||
+        g.ssm_v_heads != 48 || g.ssm_d_conv != 4 || g.ssm_conv_channels != 10240 || g.ssm_value_dim != 6144) {
+        throw MetalError("model geometry defaults moved");
+    }
+    g.n_layers = 1;
+
+    std::printf("\none Q2_0 layer from the extracted pack\n");
+    const PackTable table = PackTable::load(dir.string());
+    std::string shape_err;
+    const bool named = check_pack_layer(table, g, 0, shape_err);
+    verdict("one Q2_0 layer passes the name check", named, named ? "n_embd 2560, layer 0" : shape_err);
+    if (!named) return;
+
+    const PackTensor* qkv = table.find("blk.0.attn_qkv.weight");
+    const bool qkv_bytes = qkv && qkv->values && qkv->values->size() == 13926400 && qkv->code_bits == 0;
+    std::string bind_got;
+    const bool refused = threw("Q8_K", [&] { bind_layer(table, g, 0); }, bind_got);
+    const bool qkv_msg = bind_got.find("attn_qkv.weight") != std::string::npos &&
+                         bind_got.find("code_bits 0") != std::string::npos;
+    verdict("the Q2_0 query projection is not Q8_K", qkv_bytes && refused && qkv_msg,
+            qkv_bytes && refused ? "IQ4_XS, 13926400 B, " + bind_got : bind_got);
+
+    const PackTensor* router = table.find("blk.0.ffn_gate_inp.weight");
+    const int n_in = 2560;
+    const int n_out = 512;
+    const bool router_bytes =
+        router && router->values && router->kind == strata::core::WeightKind::Bf16InF32 && router->code_bits == 0 &&
+        router->values->size() == (uint64_t) n_in * n_out * 2;
+    std::vector<uint16_t> xh((size_t) n_in);
+    std::vector<float> want((size_t) n_out), got((size_t) n_out), zero((size_t) n_out);
+    bool router_ok = false;
+    int moved = 0;
+    bool zero_clear = false;
+    if (router_bytes) {
+        for (int i = 0; i < n_in; ++i) {
+            const float v = ((i * 17) % 29) * 0.01f - 0.1f;
+            xh[(size_t) i] = strata::kernels::bf16_from_f32(v);
+        }
+        const uint16_t* w = static_cast<const uint16_t*>(router->values->data());
+        for (int o = 0; o < n_out; ++o) {
+            double acc = 0;
+            const uint16_t* row = w + (size_t) o * n_in;
+            for (int i = 0; i < n_in; ++i)
+                acc += (double) strata::kernels::f32_from_bf16(xh[(size_t) i]) *
+                       (double) strata::kernels::f32_from_bf16(row[i]);
+            want[(size_t) o] = (float) acc;
+        }
+        Bytes dx((uint64_t) n_in * 2);
+        Bytes dy((uint64_t) n_out * 4);
+        std::memcpy(dx.data(), xh.data(), dx.size());
+        bf16_gemv(dx, *router->values, dy, n_in, n_out);
+        std::memcpy(got.data(), dy.data(), got.size() * 4);
+        Bytes zx((uint64_t) n_in * 2);
+        std::memset(zx.data(), 0, zx.size());
+        bf16_gemv(zx, *router->values, dy, n_in, n_out);
+        std::memcpy(zero.data(), dy.data(), zero.size() * 4);
+        zero_clear = true;
+        for (int i = 0; i < n_out; ++i) {
+            if (zero[(size_t) i] != 0.f) zero_clear = false;
+            if (got[(size_t) i] != zero[(size_t) i]) ++moved;
+        }
+        router_ok = all_finite(got.data(), n_out) && rel_l1(want.data(), got.data(), n_out) <= 1e-5;
+    }
+    char router_detail[120];
+    std::snprintf(router_detail, sizeof router_detail, "rel %.3e, %d of %d differ from zero",
+                  router_bytes ? rel_l1(want.data(), got.data(), n_out) : 1.0, moved, n_out);
+    verdict("the router matches the file bytes", router_ok, router_bytes ? router_detail : "router bytes");
+    verdict("a zero activation moves the router", router_ok && zero_clear && moved == n_out, router_detail);
+
+    const auto experts = dir / "experts.bin";
+    const auto blob = read_at_path(experts, 0, 1382400);
+    const bool blob_n = blob.size() == 1382400;
+    std::vector<float> x((size_t) n_in);
+    for (int i = 0; i < n_in; ++i) x[(size_t) i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes dxf((uint64_t) n_in * 4);
+    std::memcpy(dxf.data(), x.data(), dxf.size());
+    Bytes xq(iq_q8_1_bytes(n_in));
+    iq_quantize_q8_1(dxf, n_in, xq);
+    std::vector<uint8_t> xqb((size_t) xq.size());
+    std::memcpy(xqb.data(), xq.data(), xqb.size());
+
+    auto role = [&](uint64_t off, int role_in, int role_out, const Bytes& xin, const uint8_t* xbytes,
+                    std::vector<float>& y) {
+        const size_t nbytes = (size_t) role_out * (size_t) (role_in / 64) * 18;
+        Bytes dw(nbytes);
+        std::memcpy(dw.data(), blob.data() + off, nbytes);
+        Bytes dy((uint64_t) role_out * 4);
+        iq_mmvq(kQ2_0, dw, 0, xin, role_in, role_out, 1, dy);
+        y.resize((size_t) role_out);
+        std::memcpy(y.data(), dy.data(), y.size() * 4);
+        std::vector<float> host((size_t) role_out);
+        q2_ref(blob.data() + off, xbytes, role_in, role_out, host.data());
+        return rel_l1(host.data(), y.data(), role_out);
+    };
+    std::vector<float> xdown((size_t) g.n_ff);
+    for (int i = 0; i < (int) g.n_ff; ++i) xdown[(size_t) i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes dxdown((uint64_t) g.n_ff * 4);
+    std::memcpy(dxdown.data(), xdown.data(), dxdown.size());
+    Bytes xqdown(iq_q8_1_bytes(g.n_ff));
+    iq_quantize_q8_1(dxdown, g.n_ff, xqdown);
+    std::vector<uint8_t> xqdownb((size_t) xqdown.size());
+    std::memcpy(xqdownb.data(), xqdown.data(), xqdownb.size());
+    std::vector<float> gate_y, up_y, down_y;
+    const double gate_rel = role(0, n_in, (int) g.n_ff, xq, xqb.data(), gate_y);
+    const double up_rel = role(460800, n_in, (int) g.n_ff, xq, xqb.data(), up_y);
+    const double down_rel = role(921600, (int) g.n_ff, n_in, xqdown, xqdownb.data(), down_y);
+    const bool gate_ok = all_finite(gate_y.data(), (int) gate_y.size()) && gate_rel <= 1e-5;
+    const bool up_ok = all_finite(up_y.data(), (int) up_y.size()) && up_rel <= 1e-5;
+    const bool down_ok = all_finite(down_y.data(), (int) down_y.size()) && down_rel <= 1e-5;
+    char gemv_detail[160];
+    std::snprintf(gemv_detail, sizeof gemv_detail, "gate rel %.3e, up rel %.3e, down rel %.3e", gate_rel, up_rel,
+                  down_rel);
+    verdict("expert 0 Q2_0 rows match", blob_n && gate_ok && up_ok && down_ok, gemv_detail);
+
+    std::vector<uint8_t> flipped(blob.begin(), blob.begin() + 460800);
+    flipped[20] ^= 0x1;
+    Bytes df(flipped.size());
+    std::memcpy(df.data(), flipped.data(), df.size());
+    Bytes y2((uint64_t) g.n_ff * 4);
+    iq_mmvq(kQ2_0, df, 0, xq, n_in, g.n_ff, 1, y2);
+    int code_moved = 0;
+    const float* y2p = static_cast<const float*>(y2.data());
+    for (int i = 0; i < (int) g.n_ff; ++i)
+        if (y2p[i] != gate_y[(size_t) i]) ++code_moved;
+    char code_detail[80];
+    std::snprintf(code_detail, sizeof code_detail, "%d of %d differ", code_moved, (int) g.n_ff);
+    verdict("a changed Q2_0 code moves the gate", gate_ok && code_moved > 0, code_detail);
+
+    Bytes refused_y((uint64_t) g.n_embd * 4);
+    std::string expert_got;
+    const bool expert_refused =
+        threw("down quant", [&] { run_routed_expert(table, dir.string(), g, 0, 0, xq, refused_y); }, expert_got);
+    char expert_detail[200];
+    std::snprintf(expert_detail, sizeof expert_detail, "blob %zu, %s", blob.size(), expert_got.c_str());
+    verdict("a Q2_0 gate is refused", blob_n && expert_refused, expert_detail);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2401,7 +2926,7 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
-        "one routed expert, one 2-bit query, one stack token\n\n");
+        "one routed expert, one 2-bit query, one stack token, one model layer\n\n");
     try {
         run_conversions();
         run_refusals();
@@ -2412,6 +2937,8 @@ int main(int argc, char** argv) {
         run_experts();
         run_attn();
         run_stack();
+        run_model_layer();
+        run_q2_layer();
     } catch (const strata::metal::MetalError& e) {
         std::fprintf(stderr, "pack: %s\n", e.what());
         return 2;
