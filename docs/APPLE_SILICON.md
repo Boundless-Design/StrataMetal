@@ -404,7 +404,15 @@ every cell, 0 differ. The pool differed on 1 key value and 5 value values, of 40
 table was 80.20% apart. Leaving K unrotated was 52.16% apart on the attention output. The gate's first
 half was 15.73% apart. Mapping a query head with modulo instead of integer division was 28.77% apart.
 16 words past the end stayed put. A negative position was refused. An embedding that is not a multiple
-of 256 was refused.
+of 256 was refused. The same block at the model embedding, n_embd 2560 and indexer dim 128, kept
+64 rotated values, 8 cells, 24 heads, 2 kv heads, head dim 256, 4 indexer heads, block 4, top-k 2,
+page size 4, and rope base 100. The norm weights past those 64 rotated values are 0 on the head
+and on the indexer row. Worst relative error 1.660e-07. The selected ids matched on every cell,
+0 differ. The pool differed on 0 key values and 4 value values, of 4096. Ignoring the page table
+was 82.45% apart. Leaving K unrotated was 12.37% apart on the attention output. The gate's first
+half was 91.60% apart. Mapping a query head with modulo instead of integer division was 25.44%
+apart. 16 words past the end stayed put. The weights are synthetic. The artifact's top-k is 2048,
+and this check is not that. No GGUF was loaded. This is not a loaded model. There is no token rate.
 
 `strata-metal-token` draws one greedy id. The embedding row replaces every residual stream. One block
 is the attention gated residual, the QSA attention block, the write, the feed-forward gated residual,
@@ -587,7 +595,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. The QSA attention block at n_embd 2560. The GDN layer runs at that width, with 16 key heads and 48 value heads, on synthetic weights. That is not a loaded model. This loop does not read a GGUF.
+1. One greedy token at n_embd 2560. The QSA block runs at that width, with indexer dim 128 and 64 rotated values. Top-k in that check is 2. That is not a loaded model. This loop does not read a GGUF.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP

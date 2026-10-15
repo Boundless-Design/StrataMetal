@@ -376,36 +376,28 @@ double worst_rel(const std::vector<float>& want, const float* got) {
     return worst;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--selftest") != 0)) {
-        std::fprintf(stderr, "usage: strata-metal-qsa-layer [--selftest]\n");
-        return 2;
-    }
-    std::printf("qsa layer: one attention block, fp16 cache, synthetic weights\n\n");
-    try {
-        QsaLayerGeom g;
-        g.n_embd = 256;
-        g.max_cells = 8;
-        g.qsa.n_head = 24;
-        g.qsa.n_head_kv = 2;
-        g.qsa.head_dim = 256;
-        g.qsa.n_rot = 64;
-        g.qsa.idx_n_head = 4;
-        g.qsa.idx_dim = 64;
-        g.qsa.idx_block = 4;
-        g.qsa.idx_top_k = 2;
-        g.qsa.page_size = 4;
-        const int n_embd = 256;
-        const int n_head = 24;
-        const int n_head_kv = 2;
-        const int head_dim = 256;
-        const int n_rot = 64;
-        const int idx_n_head = 4;
-        const int idx_dim = 64;
-        const int r = 4;
+// The first call is the block already measured. The second is the model embedding and the
+// model indexer width. Top-k stays 2: eight cells do not exercise the artifact's 2048.
+void check_block(const char* title, int n_embd, int idx_dim, bool refusals) {
+    std::printf("%s  n_embd %d  idx_dim %d\n", title, n_embd, idx_dim);
+    QsaLayerGeom g;
+    g.n_embd = n_embd;
+    g.max_cells = 8;
+    g.qsa.n_head = 24;
+    g.qsa.n_head_kv = 2;
+    g.qsa.head_dim = 256;
+    g.qsa.n_rot = 64;
+    g.qsa.idx_n_head = 4;
+    g.qsa.idx_dim = idx_dim;
+    g.qsa.idx_block = 4;
+    g.qsa.idx_top_k = 2;
+    g.qsa.page_size = 4;
+    const int n_head = 24;
+    const int n_head_kv = 2;
+    const int head_dim = 256;
+    const int n_rot = 64;
+    const int idx_n_head = 4;
+    const int r = 4;
         const int top_k = 2;
         const int page_size = 4;
         const int tokens = 8;
@@ -436,6 +428,12 @@ int main(int argc, char** argv) {
         }
         for (float& v : w_ik) v = 1.0f + 0.1f * gauss(rng);
         for (float& v : w_iq) v = 1.0f + 0.1f * gauss(rng);
+        // The model indexer row is 128 wide and this block rotates 64. Zero the tail so the
+        // dot sits in the rotated pairs. The 64-wide fixture has no tail.
+        for (int d = n_rot; d < idx_dim; ++d) {
+            w_ik[(size_t) d] = 0;
+            w_iq[(size_t) d] = 0;
+        }
 
         std::vector<float> cos_tab((size_t) table_rows * (size_t) pairs), sin_tab(cos_tab.size());
         // 1e7 barely turns across eight consecutive positions, so a skipped rotation stays under the
@@ -616,18 +614,34 @@ int main(int argc, char** argv) {
         verdict("kv head modulo is observable", rel_l1(last_attn, last_mod) > 0.05,
                 pct(rel_l1(last_attn, last_mod)));
 
-        verdict("a negative position is refused",
-                throws_metal([&] {
-                    Bytes x(16), o(16);
-                    qsa_layer(g, w, st, sc, -1, 0, x, o);
-                }),
-                "");
-        QsaLayerGeom bad = g;
-        bad.n_embd = 200;
-        verdict("an embedding that is not a multiple of 256 is refused",
-                throws_metal([&] { make_qsa_layer_scratch(bad); }), "");
+        if (refusals) {
+            verdict("a negative position is refused",
+                    throws_metal([&] {
+                        Bytes x(16), o(16);
+                        qsa_layer(g, w, st, sc, -1, 0, x, o);
+                    }),
+                    "");
+            QsaLayerGeom bad = g;
+            bad.n_embd = 200;
+            verdict("an embedding that is not a multiple of 256 is refused",
+                    throws_metal([&] { make_qsa_layer_scratch(bad); }), "");
+        }
+        std::printf("\n");
+}
 
-        std::printf("\nqsa layer: %d failures\n", g_fail);
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--selftest") != 0)) {
+        std::fprintf(stderr, "usage: strata-metal-qsa-layer [--selftest]\n");
+        return 2;
+    }
+    std::printf("qsa layer: one attention block, fp16 cache, synthetic weights\n\n");
+    try {
+        check_block("reduced", 256, 64, true);
+        check_block("model width", 2560, 128, false);
+        std::printf("qsa layer: %d failures\n", g_fail);
         if (g_fail) return 1;
     } catch (const MetalError& e) {
         std::fprintf(stderr, "Metal error: %s\n", e.what());
