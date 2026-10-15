@@ -21,15 +21,16 @@ constexpr int kIq2S = 22;
 constexpr int kIq4Xs = 23;
 constexpr int kQ2_0 = 42;
 // ggml blocks that are not a Coder expert type. The dense gate is Q4_K and the dense output is Q5_K.
-// The shared-expert up row is Q3_K and the shared-expert down row is Q5_0. iq_mmvq dispatches them.
-// iq_type_supported stays false, so iq_expert still refuses them.
+// The shared-expert up row is Q3_K. Layer 0's shared down is Q5_0. Layer 2's shared down is Q4_0.
+// iq_mmvq dispatches them. iq_type_supported stays false, so iq_expert still refuses them.
+constexpr int kQ4_0 = 2;
 constexpr int kQ4_K = 12;
 constexpr int kQ5_K = 13;
 constexpr int kQ3_K = 11;
 constexpr int kQ5_0 = 6;
 
 bool iq_type_supported(int ggml_type) noexcept;
-// Values in one block. IQ4_NL is 32, Q2_0 is 64, the others are 256.
+// Values in one block. IQ4_NL, Q4_0, and Q5_0 are 32. Q2_0 is 64. The others are 256.
 int iq_block_values(int ggml_type);
 size_t iq_block_bytes(int ggml_type);
 // `n` values, a multiple of the block. Throws MetalError on an unknown type or a bad multiple.

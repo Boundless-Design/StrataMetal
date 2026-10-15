@@ -3236,6 +3236,70 @@ void q50_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* 
     }
 }
 
+// Q4_0 is 18 bytes and 32 values. Same integer dot as iq_mmvq_q4_0. Bias is 8, and the
+// nibbles start at byte 2. There is no high-bit word.
+float q40_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const uint8_t* qs = blk + 2;
+    int sumi = 0;
+    int suma = 0;
+    for (int i = 0; i < 2; ++i) {
+        const int vl = q2_ld(qs + 4 * (iqs + i));
+        const int u0 = q2_ld(x0 + 4 + 4 * (iqs + i));
+        const int u1 = q2_ld(x0 + 4 + 4 * (iqs + i + 4));
+        const int vi0 = vl & 0x0F0F0F0F;
+        const int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        sumi = q2_dp4a(vi0, u0, sumi);
+        sumi = q2_dp4a(vi1, u1, sumi);
+        suma = q2_dp4a(0x01010101, u0, suma);
+        suma = q2_dp4a(0x01010101, u1, suma);
+    }
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(blk)) *
+                    strata::kernels::f32_from_f16((uint16_t) k_u16(x0));
+    return d * (float) (sumi - 8 * suma);
+}
+
+float q40_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 32) * 2;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 2;
+        lane[k & 31] += q40_partial(row + (size_t) kbx * 18, col + (size_t) kbx * 36, 2 * (k % 2));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q40_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 32) * 18;
+    for (int r = 0; r < n_out; ++r) y[r] = q40_row(w + (size_t) r * row, x, n_in);
+}
+
+void dequant_q40(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block));
+    const uint8_t* qs = block + 2;
+    for (int j = 0; j < 16; ++j) {
+        out[j] = (float) ((int) (qs[j] & 0x0F) - 8) * d;
+        out[j + 16] = (float) ((int) (qs[j] >> 4) - 8) * d;
+    }
+}
+
+void q40_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    std::vector<float> act((size_t) n_in), rowv((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 32) * 18;
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 32; ++b) dequant_q40(src + (size_t) b * 18, rowv.data() + (size_t) b * 32);
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) rowv[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
 using RowRef = void (*)(const uint8_t*, const uint8_t*, int, int, float*);
 
 void check_rows(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
@@ -3328,7 +3392,7 @@ void run_kquant() {
     check_k("a Q5_K block matches the dequant", "a changed Q5_K code moves that block", q5.data(), q5.size(), n_in,
             n_out, true, 48);
 
-    std::printf("\nQ3_K and Q5_0 ggml blocks\n");
+    std::printf("\nQ3_K, Q5_0, and Q4_0 ggml blocks\n");
     const int q3_in = 512;
     const int q3_out = 8;
     const int q50_in = 128;
@@ -3349,6 +3413,21 @@ void run_kquant() {
                q3_out, kQ3_K, 32, q3_ref, q3_scalar);
     check_rows("a Q5_0 block matches the dequant", "a changed Q5_0 code moves that block", q50.data(), q50.size(),
                q50_in, q50_out, kQ5_0, 6, q50_ref, q50_scalar);
+
+    const int q40_in = 128;
+    const int q40_out = 8;
+    std::vector<uint8_t> q40((size_t) q40_out * (q40_in / 32) * 18);
+    for (uint8_t& b : q40) b = (uint8_t) rng();
+    for (size_t off = 0; off < q40.size(); off += 18) {
+        q40[off + 0] = 0x00;
+        q40[off + 1] = 0x3C;
+    }
+    check_rows("a Q4_0 block matches the dequant", "a changed Q4_0 code moves that block", q40.data(), q40.size(),
+               q40_in, q40_out, kQ4_0, 2, q40_ref, q40_scalar);
+    std::string q40got;
+    const bool q40_refused =
+        threw("not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kIq4Xs, kQ4_0, 2560, 640}); }, q40got);
+    verdict("a Q4_0 down is refused", q40_refused, q40got);
 }
 
 // One GDN step from a zero state. The projections are the ggml dots. The middle is the
@@ -7434,7 +7513,8 @@ void run_layer2_gdn(const strata::core::ModelGeometry& g) {
 }
 
 // Layer 2's ten routed experts on the attention residual above. The shared expert is not added.
-// Its down plane is Q4_0, and this tree has no Q4_0 product. Layer 1's PLE was not applied.
+// Its down plane is Q4_0. iq_mmvq dispatches that product. This pass still leaves the shared
+// expert out. Layer 1's PLE was not applied.
 void run_layer2_routed(const PackTable& table, const strata::core::ModelGeometry& g) {
     layer2_ffn_residual.clear();
     std::printf("\nlayer 2 routed experts, shared expert not added, layer 1 PLE not applied\n");
@@ -9206,7 +9286,7 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
+        "one Q4_K gate, one Q5_K output, one Q4_0 product, one GDN step, one attention half, one feed-forward half, "
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
         "one shared expert on that residual, one router selection on that residual, "
         "one routed ten on that residual, one carried state into a second token, "

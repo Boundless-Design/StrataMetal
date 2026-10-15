@@ -71,6 +71,7 @@ const char* mmvq_kernel(int t) {
         case kQ5_K: return "iq_mmvq_q5_k";
         case kQ3_K: return "iq_mmvq_q3_k";
         case kQ5_0: return "iq_mmvq_q5_0";
+        case kQ4_0: return "iq_mmvq_q4_0";
         default: return nullptr;
     }
 }
@@ -87,12 +88,14 @@ const Bytes& mmvq_grid(int t) {
 
 bool iq_type_supported(int ggml_type) noexcept {
     // These have a matrix-vector product. They are not a Coder expert gate or down.
-    if (ggml_type == kQ4_K || ggml_type == kQ5_K || ggml_type == kQ3_K || ggml_type == kQ5_0) return false;
+    if (ggml_type == kQ4_K || ggml_type == kQ5_K || ggml_type == kQ3_K || ggml_type == kQ5_0 ||
+        ggml_type == kQ4_0)
+        return false;
     return mmvq_kernel(ggml_type) != nullptr;
 }
 
 int iq_block_values(int ggml_type) {
-    if (ggml_type == kIq4Nl || ggml_type == kQ5_0) return 32;
+    if (ggml_type == kIq4Nl || ggml_type == kQ5_0 || ggml_type == kQ4_0) return 32;
     if (ggml_type == kQ2_0) return 64;
     if (ggml_type == kQ4_K || ggml_type == kQ5_K || ggml_type == kQ3_K) return 256;
     if (iq_type_supported(ggml_type)) return 256;
@@ -111,6 +114,7 @@ size_t iq_block_bytes(int ggml_type) {
         case kQ5_K: return 176;
         case kQ3_K: return 110;
         case kQ5_0: return 22;
+        case kQ4_0: return 18;
         default: return 0;
     }
 }
