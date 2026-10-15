@@ -1,6 +1,7 @@
 // The pack index, loaded into the kernels that already pass. One stack token is drawn from a pack.
 #include "strata/metal/pack.hpp"
 #include "strata/metal/moe_combine.hpp"
+#include "strata/metal/router.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -4824,6 +4825,306 @@ void run_shared_on_layer(const PackTable& table, const strata::core::ModelGeomet
     verdict("dropping the shared expert moves that layer", bytes && sh_dropped, sh_drop_detail);
 }
 
+// Softmax, strict top k, lower index on a tie, then divide by the clamped sum.
+// The same reference the router parity uses. k is the caller's width.
+void route_ref(const float* logits, int n_expert, int k, int* ids, float* w) {
+    double mx = (double) logits[0];
+    for (int e = 1; e < n_expert; ++e) mx = std::max(mx, (double) logits[e]);
+    std::vector<double> p((size_t) n_expert);
+    double sum = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        p[(size_t) e] = std::exp((double) logits[e] - mx);
+        sum += p[(size_t) e];
+    }
+    for (int e = 0; e < n_expert; ++e) p[(size_t) e] /= sum;
+    std::vector<int> idx((size_t) n_expert);
+    for (int e = 0; e < n_expert; ++e) idx[(size_t) e] = e;
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return p[(size_t) a] > p[(size_t) b]; });
+    double chosen = 0;
+    for (int i = 0; i < k; ++i) {
+        ids[i] = idx[(size_t) i];
+        w[i] = (float) p[(size_t) idx[(size_t) i]];
+        chosen += p[(size_t) idx[(size_t) i]];
+    }
+    chosen = std::max(chosen, 6.103515625e-05);
+    for (int i = 0; i < k; ++i) w[i] = (float) ((double) w[i] / chosen);
+}
+
+// Token 7971's layer-0 router logits, then router_top10. k is qwen4exp.expert_used_count.
+// The selected experts are not loaded. This is not a token.
+void run_layer_route(const PackTable& table, const strata::core::ModelGeometry& g,
+                     const std::vector<uint8_t>& blob) {
+    std::printf("\ntoken 7971 layer-0 router selection\n");
+    const int n_embd = (int) g.n_embd;
+    const int n_ff = (int) g.n_ff;
+    const int n_expert = (int) g.n_expert;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const int token = 7971;
+    const int k = 10;
+    const size_t emb_row_n = (size_t) (n_embd / 256) * 110;
+    auto need = [&](const char* name, uint64_t nbytes) -> const PackTensor* {
+        const PackTensor* t = table.find(name);
+        if (!t || !t->values || t->values->size() != nbytes) return nullptr;
+        return t;
+    };
+    const PackTensor* qkv = need("blk.0.attn_qkv.weight", 13926400);
+    const PackTensor* attn_gate = need("blk.0.attn_gate.weight", 8847360);
+    const PackTensor* ssm = need("blk.0.ssm_out.weight", 10813440);
+    const PackTensor* conv_w = need("blk.0.ssm_conv1d.weight", 163840);
+    const PackTensor* alpha_w = need("blk.0.ssm_alpha.weight", 245760);
+    const PackTensor* beta_w = need("blk.0.ssm_beta.weight", 245760);
+    const PackTensor* ssm_a = need("blk.0.ssm_a", 192);
+    const PackTensor* dt_w = need("blk.0.ssm_dt.bias", 192);
+    const PackTensor* ssm_norm = need("blk.0.ssm_norm.weight", 512);
+    const PackTensor* attn_down = need("blk.0.hc_attn_down.weight", (uint64_t) hc_lr * (uint64_t) hc_dim * 2);
+    const PackTensor* attn_up = need("blk.0.hc_attn_up.weight", (uint64_t) hc_dim * (uint64_t) hc_lr * 2);
+    const PackTensor* attn_inj = need("blk.0.hc_attn_inject.weight", (uint64_t) hc * (uint64_t) hc_dim * 2);
+    const PackTensor* attn_norm = need("blk.0.hc_attn_norm.weight", (uint64_t) hc_dim * 4);
+    const PackTensor* ffn_down = need("blk.0.hc_ffn_down.weight", (uint64_t) hc_lr * (uint64_t) hc_dim * 2);
+    const PackTensor* ffn_up = need("blk.0.hc_ffn_up.weight", (uint64_t) hc_dim * (uint64_t) hc_lr * 2);
+    const PackTensor* ffn_inj = need("blk.0.hc_ffn_inject.weight", (uint64_t) hc * (uint64_t) hc_dim * 2);
+    const PackTensor* ffn_norm = need("blk.0.hc_ffn_norm.weight", (uint64_t) hc_dim * 4);
+    const PackTensor* router = need("blk.0.ffn_gate_inp.weight", (uint64_t) n_embd * (uint64_t) n_expert * 2);
+    const PackTensor* emb = table.find("token_embd.weight");
+    const bool emb_ok = emb && emb->values && emb->code_bits == 0 && emb->ne0 == n_embd && emb->ne1 == 248320 &&
+                        emb->values->size() == (uint64_t) 248320 * emb_row_n &&
+                        (uint64_t) token * emb_row_n + emb_row_n <= emb->values->size();
+    const bool bytes = qkv && qkv->code_bits == 0 && attn_gate && ssm && conv_w && alpha_w && beta_w && ssm_a &&
+                       dt_w && ssm_norm && attn_down && attn_up && attn_inj && attn_norm && ffn_down && ffn_up &&
+                       ffn_inj && ffn_norm && router && emb_ok && n_expert == 512 && k <= n_expert && hc > 0;
+    bool rt_ok = false;
+    bool rt_repeat = false;
+    bool rt_moved = false;
+    bool rt_flipped = false;
+    std::string rt_detail = "bytes";
+    std::string rt_repeat_detail = "bytes";
+    std::string rt_move_detail = "bytes";
+    std::string rt_flip_detail = "bytes";
+    if (bytes) {
+        try {
+            const uint8_t* emb_src = static_cast<const uint8_t*>(emb->values->data()) + (size_t) token * emb_row_n;
+            std::vector<float> emb_row((size_t) n_embd);
+            for (int b = 0; b < n_embd / 256; ++b)
+                dequant_q3(emb_src + (size_t) b * 110, emb_row.data() + (size_t) b * 256);
+            double emb_ms = 0;
+            for (int i = 0; i < n_embd; ++i) {
+                if (!std::isfinite(emb_row[(size_t) i])) throw MetalError("embedding row is not finite");
+                emb_ms += (double) emb_row[(size_t) i] * (double) emb_row[(size_t) i];
+            }
+            if (emb_ms == 0) throw MetalError("embedding row is zero");
+
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, attn_gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = ssm_norm->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4);
+            Bytes R((uint64_t) hc_dim * 4);
+            auto* Rp = static_cast<float*>(R.data());
+            for (int c = 0; c < hc; ++c)
+                std::memcpy(Rp + (size_t) c * n_embd, emb_row.data(), (size_t) n_embd * sizeof(float));
+            Bytes zero_r((uint64_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            const int guard = 1;
+            Bytes mid((uint64_t) (hc_dim + guard) * 4), block((uint64_t) (n_embd + guard) * 4);
+            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4);
+            Bytes x_bf16((uint64_t) n_embd * 2), route((uint64_t) (n_expert + guard) * 4);
+            Bytes ids((uint64_t) (k + guard) * 4), weights((uint64_t) (k + guard) * 4);
+            Bytes ids2((uint64_t) (k + guard) * 4), weights2((uint64_t) (k + guard) * 4);
+            Bytes idsz((uint64_t) (k + guard) * 4), weightsz((uint64_t) (k + guard) * 4);
+            Bytes idsf((uint64_t) (k + guard) * 4), weightsf((uint64_t) (k + guard) * 4);
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto run_pass = [&](const Bytes& residual, Bytes& id_out, Bytes& w_out) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(mid.data()), (size_t) (hc_dim + guard), 7.f);
+                std::fill_n(static_cast<float*>(block.data()), (size_t) (n_embd + guard), 7.f);
+                std::fill_n(static_cast<float*>(route.data()), (size_t) (n_expert + guard), 7.f);
+                std::fill_n(static_cast<int*>(id_out.data()), (size_t) (k + guard), 7);
+                std::fill_n(static_cast<float*>(w_out.data()), (size_t) (k + guard), 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, *attn_norm->values, *attn_down->values, *attn_up->values, attn_inj->values.get(),
+                        1e-6f, false, gr, mixed, inject);
+                gdn_layer_iq(lg, w, st, sc, mixed, block);
+                gr_write(gs, residual, block, inject, mid);
+                gr_read(gs, mid, *ffn_norm->values, *ffn_down->values, *ffn_up->values, ffn_inj->values.get(), 1e-6f,
+                        false, gr, mixed, inject);
+                f32_to_bf16_bulk(mixed, x_bf16, n_embd);
+                bf16_gemv(x_bf16, *router->values, route, n_embd, n_expert);
+                router_top10(route, 1, n_expert, k, id_out, w_out);
+            };
+
+            run_pass(R, ids, weights);
+            std::vector<float> got_mixed((size_t) n_embd), got_route((size_t) n_expert);
+            std::memcpy(got_mixed.data(), mixed.data(), got_mixed.size() * 4);
+            std::memcpy(got_route.data(), route.data(), got_route.size() * 4);
+            const bool route_guard = static_cast<const float*>(route.data())[n_expert] == 7.f;
+            std::vector<int> host_ids((size_t) k);
+            std::vector<float> host_w((size_t) k);
+            route_ref(got_route.data(), n_expert, k, host_ids.data(), host_w.data());
+            std::vector<float> rounded((size_t) n_embd), host_logits((size_t) n_expert);
+            for (int i = 0; i < n_embd; ++i) rounded[(size_t) i] = round_bf16(got_mixed[(size_t) i]);
+            const uint16_t* rw = static_cast<const uint16_t*>(router->values->data());
+            for (int o = 0; o < n_expert; ++o)
+                host_logits[(size_t) o] = bf16_dot(rounded.data(), rw + (size_t) o * n_embd, n_embd);
+
+            int chain_id_bad = -1;
+            double chain_w_rel = std::nan("");
+            bool chain_ran = false;
+            if (blob.size() == 1382400 && all_finite(got_mixed.data(), n_embd)) {
+                const AttnHalf host_attn = layer0_attn_host(
+                    Rp, static_cast<const float*>(attn_norm->values->data()),
+                    static_cast<const uint16_t*>(attn_down->values->data()),
+                    static_cast<const uint16_t*>(attn_up->values->data()),
+                    static_cast<const uint16_t*>(attn_inj->values->data()),
+                    static_cast<const uint8_t*>(qkv->values->data()),
+                    static_cast<const uint8_t*>(attn_gate->values->data()),
+                    static_cast<const uint8_t*>(ssm->values->data()),
+                    static_cast<const uint16_t*>(alpha_w->values->data()),
+                    static_cast<const uint16_t*>(beta_w->values->data()),
+                    static_cast<const float*>(conv_w->values->data()),
+                    static_cast<const float*>(ssm_norm->values->data()),
+                    static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                    n_embd, hc, hc_lr, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+                if (all_finite(host_attn.out.data(), hc_dim)) {
+                    const FfnHalf host_ffn = layer0_ffn_host(
+                        host_attn.out.data(), static_cast<const float*>(ffn_norm->values->data()),
+                        static_cast<const uint16_t*>(ffn_down->values->data()),
+                        static_cast<const uint16_t*>(ffn_up->values->data()),
+                        static_cast<const uint16_t*>(ffn_inj->values->data()), rw, blob.data(), n_embd, n_ff,
+                        n_expert, hc, hc_lr);
+                    if (all_finite(host_ffn.router.data(), n_expert)) {
+                        std::vector<int> chain_ids((size_t) k);
+                        std::vector<float> chain_w((size_t) k);
+                        route_ref(host_ffn.router.data(), n_expert, k, chain_ids.data(), chain_w.data());
+                        chain_id_bad = 0;
+                        for (int i = 0; i < k; ++i)
+                            if (chain_ids[(size_t) i] != static_cast<const int*>(ids.data())[i]) ++chain_id_bad;
+                        chain_w_rel = rel_l1(chain_w.data(), static_cast<const float*>(weights.data()), k);
+                        chain_ran = true;
+                    }
+                }
+            }
+
+            run_pass(R, ids2, weights2);
+            run_pass(zero_r, idsz, weightsz);
+            std::vector<uint8_t> row_copy(emb_row_n);
+            auto launch_flip = [&](int local) {
+                std::memcpy(row_copy.data(), emb_src, emb_row_n);
+                row_copy[(size_t) local] ^= 1u;
+                std::vector<float> flipped_row((size_t) n_embd);
+                for (int b = 0; b < n_embd / 256; ++b)
+                    dequant_q3(row_copy.data() + (size_t) b * 110, flipped_row.data() + (size_t) b * 256);
+                Bytes Rf((uint64_t) hc_dim * 4);
+                auto* Rfp = static_cast<float*>(Rf.data());
+                for (int c = 0; c < hc; ++c)
+                    std::memcpy(Rfp + (size_t) c * n_embd, flipped_row.data(), (size_t) n_embd * sizeof(float));
+                run_pass(Rf, idsf, weightsf);
+            };
+            int flip_local = 32;
+            launch_flip(flip_local);
+
+            const int* ip = static_cast<const int*>(ids.data());
+            const int* i2p = static_cast<const int*>(ids2.data());
+            const int* izp = static_cast<const int*>(idsz.data());
+            const int* ifp = static_cast<const int*>(idsf.data());
+            const float* wp = static_cast<const float*>(weights.data());
+            const float* w2p = static_cast<const float*>(weights2.data());
+            const float* wzp = static_cast<const float*>(weightsz.data());
+            const float* wfp = static_cast<const float*>(weightsf.data());
+            auto id_diff = [&](const int* a) {
+                int n = 0;
+                for (int i = 0; i < k; ++i)
+                    if (a[i] != ip[i]) ++n;
+                return n;
+            };
+            int flipped_ids = id_diff(ifp);
+            int flipped_w = differ_floats(wp, wfp, k);
+            if (flipped_ids == 0 && flipped_w == 0) {
+                for (int i = 0; i < (int) emb_row_n; ++i) {
+                    if (i == 32) continue;
+                    launch_flip(i);
+                    flipped_ids = id_diff(ifp);
+                    flipped_w = differ_floats(wp, wfp, k);
+                    if (flipped_ids > 0 || flipped_w > 0) {
+                        flip_local = i;
+                        break;
+                    }
+                }
+            }
+            const int flip_at = (int) ((size_t) token * emb_row_n + (size_t) flip_local);
+            int id_bad = 0;
+            bool ids_in_range = true;
+            for (int i = 0; i < k; ++i) {
+                if (ip[i] != host_ids[(size_t) i]) ++id_bad;
+                if (ip[i] < 0 || ip[i] >= n_expert) ids_in_range = false;
+            }
+            int expert0 = 0;
+            for (int i = 0; i < k; ++i)
+                if (ip[i] == 0) ++expert0;
+            double wsum = 0;
+            for (int i = 0; i < k; ++i) wsum += (double) wp[i];
+            const double sum_err = std::fabs(wsum - 1.0);
+            const bool guard_held = ip[k] == 7 && i2p[k] == 7 && izp[k] == 7 && ifp[k] == 7 && wp[k] == 7.f &&
+                                    w2p[k] == 7.f && wzp[k] == 7.f && wfp[k] == 7.f && route_guard;
+            const bool live = all_finite(got_mixed.data(), n_embd) && all_finite(got_route.data(), n_expert) &&
+                              all_finite(host_logits.data(), n_expert) && all_finite(wp, k) && all_finite(w2p, k) &&
+                              all_finite(wzp, k) && all_finite(wfp, k) && all_finite(host_w.data(), k) &&
+                              ids_in_range && !still_seven(got_route.data(), n_expert) && !still_seven(wp, k);
+            const double logit_rel = rel_l1(host_logits.data(), got_route.data(), n_expert);
+            const double weight_rel = rel_l1(host_w.data(), wp, k);
+            const int again_ids = id_diff(i2p);
+            const int again_w = differ_floats(wp, w2p, k);
+            const int apart_ids = id_diff(izp);
+            const int apart_w = differ_floats(wp, wzp, k);
+            rt_ok = live && guard_held && logit_rel <= 1e-5 && id_bad == 0 && weight_rel <= 1e-5 && sum_err <= 1e-5;
+            rt_repeat = live && guard_held && again_ids == 0 && again_w == 0;
+            rt_moved = live && guard_held && (apart_ids > 0 || apart_w > 0);
+            rt_flipped = live && guard_held && (flipped_ids > 0 || flipped_w > 0);
+            std::string id_list;
+            for (int i = 0; i < k; ++i) {
+                if (i) id_list += ' ';
+                id_list += std::to_string(ip[i]);
+            }
+            char buf[512];
+            std::snprintf(buf, sizeof buf,
+                          "k %d, logits %.3e, ids %d, weights %.3e, sum %.3e, expert0 %d, chain ids %d, "
+                          "chain weights %.3e, experts %s",
+                          k, logit_rel, id_bad, weight_rel, sum_err, expert0, chain_ran ? chain_id_bad : -1,
+                          chain_w_rel, id_list.c_str());
+            rt_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again_ids + again_w, guard_held ? 1 : 0);
+            rt_repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "ids %d, weights %d of %d differ", apart_ids, apart_w, k);
+            rt_move_detail = buf;
+            std::snprintf(buf, sizeof buf, "ids %d, weights %d of %d differ, byte %d", flipped_ids, flipped_w, k,
+                          flip_at);
+            rt_flip_detail = buf;
+        } catch (const MetalError& e) {
+            rt_detail = e.what();
+            rt_repeat_detail = e.what();
+            rt_move_detail = e.what();
+            rt_flip_detail = e.what();
+        }
+    }
+    verdict("the layer-0 router selection matches", bytes && rt_ok, rt_detail);
+    verdict("that router selection repeats", bytes && rt_repeat, rt_repeat_detail);
+    verdict("a zero residual moves that selection", bytes && rt_moved, rt_move_detail);
+    verdict("a changed embedding byte moves that selection", bytes && rt_flipped, rt_flip_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -6147,6 +6448,7 @@ void run_q2_layer() {
     verdict("a changed embedding byte moves that layer head", head_bytes && lh_flipped, lh_flip_detail);
 
     run_shared_on_layer(table, g, blob);
+    run_layer_route(table, g, blob);
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -6166,7 +6468,7 @@ int main(int argc, char** argv) {
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
         "one layer-0 pass, one embedding through that pass, one layer residual through the head, "
-        "one shared expert on that residual, "
+        "one shared expert on that residual, one router selection on that residual, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
