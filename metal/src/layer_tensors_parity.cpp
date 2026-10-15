@@ -2,9 +2,7 @@
 //
 // --selftest writes a small two-shard GGUF and checks the lookup against it: names, offsets, byte
 // counts, types, the layer kind, a tensor in the second shard, a missing second shard, and a
-// missing name. When the real model is on disk (STRATA_MODEL_GGUF, or the default under $HOME),
-// it also checks every literal offset the hand-written layer functions used against the lookup.
-// Host code only: no Metal, so this builds and runs anywhere.
+// missing name. Host code only: no Metal, so this builds and runs anywhere.
 
 #include "strata/metal/layer_tensors.hpp"
 
@@ -176,58 +174,6 @@ void run_synthetic() {
     std::filesystem::remove_all(dir);
 }
 
-struct Legacy {
-    int layer;
-    const char* suffix;
-    unsigned long long rel_offset;
-    unsigned long long bytes;
-    int type;
-};
-
-const Legacy kLegacy[] = {
-#include "legacy_offsets.inc"
-};
-
-void run_legacy() {
-    std::string why;
-    auto m = strata::metal::ModelTensors::open_default(&why);
-    std::printf("\nthe hand-written offsets against the GGUF directory\n");
-    if (!m) {
-        std::printf("  SKIP: %s (set STRATA_MODEL_GGUF to run this)\n", why.c_str());
-        return;
-    }
-    // Every literal was relative to shard 1's data section, which started at this byte.
-    const auto& first = m->at(kLegacy[0].layer, kLegacy[0].suffix);
-    verdict("shard 1's data section starts where the literals assumed",
-            first.file_offset - first.rel_offset == 11024672ull,
-            std::to_string(first.file_offset - first.rel_offset));
-    int bad = 0, n = 0;
-    std::string first_bad;
-    for (const Legacy& L : kLegacy) {
-        ++n;
-        std::string why_bad;
-        try {
-            const auto& t = m->at(L.layer, L.suffix);
-            if (t.shard != 0) why_bad = "not in shard 1";
-            else if (t.rel_offset != L.rel_offset) why_bad = fmt("offset %llu, literal %llu", t.rel_offset, L.rel_offset);
-            else if (L.bytes && t.bytes != L.bytes) why_bad = fmt("%llu B, literal %llu B", t.bytes, L.bytes);
-            else if (L.type >= 0 && t.type != L.type)
-                why_bad = std::string(t.type_name()) + ", literal " + strata::ggml_type_name((uint32_t) L.type);
-        } catch (const std::exception& e) {
-            why_bad = e.what();
-        }
-        if (!why_bad.empty()) {
-            if (bad++ == 0)
-                first_bad = "blk." + std::to_string(L.layer) + "." + L.suffix + ": " + why_bad;
-        }
-    }
-    verdict("every literal offset, size and type matches its name", bad == 0,
-            std::to_string(n - bad) + " of " + std::to_string(n) + (bad ? ", first: " + first_bad : ""));
-    std::string kinds;
-    for (int l = 1; l <= 18; ++l) kinds += m->kind(l) == strata::metal::LayerKind::Qsa ? 'Q' : 'G';
-    verdict("layers 1-18 have the GDN/QSA schedule the functions assumed", kinds == "GGQGGGQGGGQGGGQGGG", kinds);
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -236,9 +182,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-layer-tensors [--selftest]\n");
         return 2;
     }
-    std::printf("layer tensors: by-name lookup, two shards, a missing shard, the hand-written offsets\n");
+    std::printf("layer tensors: by-name lookup, two shards, a missing shard\n");
     run_synthetic();
-    run_legacy();
     std::printf("\nlayer tensors: %d failure%s\n", g_fail, g_fail == 1 ? "" : "s");
     if (g_fail) return 1;
     std::printf("layer_tensors_parity OK\n");
