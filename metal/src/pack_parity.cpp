@@ -3474,6 +3474,7 @@ void q80_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* 
 }
 
 using RowRef = void (*)(const uint8_t*, const uint8_t*, int, int, float*);
+RowRef host_ref(int type);
 
 void check_rows(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
                 int ggml, int flip_at, RowRef iref, RowRef sref) {
@@ -3694,6 +3695,7 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
     if (qkv_type == kIq4Xs) xs_ref(qkv_w, xqb.data(), n_embd, C, qkv.data());
     else if (qkv_type == kQ3_K) q3_ref(qkv_w, xqb.data(), n_embd, C, qkv.data());
     else if (qkv_type == kQ2_0) q2_ref(qkv_w, xqb.data(), n_embd, C, qkv.data());
+    else if (RowRef ref = host_ref(qkv_type)) ref(qkv_w, xqb.data(), n_embd, C, qkv.data());
     else throw MetalError("gdn host query quant is not one of these");
     std::vector<float> conv_state((size_t) C * (d_conv - 1), 0.f);
     if (conv_io) {
@@ -3758,6 +3760,7 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
         else if (type == kQ2_0) q2_ref(w, x, n_in, n_out, y);
         else if (type == kQ4_K) scalar_ref(w, x, n_in, n_out, false, y);
         else if (type == kQ5_K) scalar_ref(w, x, n_in, n_out, true, y);
+        else if (RowRef ref = host_ref(type)) ref(w, x, n_in, n_out, y);
         else throw MetalError("gdn host quant is not one of these");
     };
     std::vector<float> z((size_t) V);
@@ -7669,15 +7672,18 @@ QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t
         else if (key_type == kQ4_K) k_ref(kw, qb, n_embd, kv, false, kval.data());
         else if (key_type == kQ5_K) k_ref(kw, qb, n_embd, kv, true, kval.data());
         else if (key_type == kIq4Xs) xs_ref(kw, qb, n_embd, kv, kval.data());
+        else if (RowRef ref = host_ref(key_type)) ref(kw, qb, n_embd, kv, kval.data());
         else throw MetalError("qsa host key type");
         if (value_type == kQ5_K) k_ref(vw, qb, n_embd, kv, true, vval.data());
         else if (value_type == kQ4_K) k_ref(vw, qb, n_embd, kv, false, vval.data());
         else if (value_type == kQ3_K) q3_ref(vw, qb, n_embd, kv, vval.data());
         else if (value_type == kIq4Xs) xs_ref(vw, qb, n_embd, kv, vval.data());
+        else if (RowRef ref = host_ref(value_type)) ref(vw, qb, n_embd, kv, vval.data());
         else throw MetalError("qsa host value type");
         if (query_type == kQ2_0) q2_ref(qw, qb, n_embd, q_full_n, qfull.data());
         else if (query_type == kQ3_K) q3_ref(qw, qb, n_embd, q_full_n, qfull.data());
         else if (query_type == kIq4Xs) xs_ref(qw, qb, n_embd, q_full_n, qfull.data());
+        else if (RowRef ref = host_ref(query_type)) ref(qw, qb, n_embd, q_full_n, qfull.data());
         else throw MetalError("qsa host query type");
         qsa_rms_rows(kval, kn, n_head_kv, head_dim);
         qsa_rope_rows(kval, n_head_kv, head_dim, n_rot, t, cos_tab, sin_tab);
@@ -7706,6 +7712,7 @@ QsaHost qsa_iq_host(const float* x, int n_embd, const uint8_t* qw, const uint8_t
         if (out_type == kQ4_K) k_ref(ow, static_cast<const uint8_t*>(gq.data()), q_n, n_embd, false, y.data());
         else if (out_type == kQ5_K) k_ref(ow, static_cast<const uint8_t*>(gq.data()), q_n, n_embd, true, y.data());
         else if (out_type == kQ6_K) q6_ref(ow, static_cast<const uint8_t*>(gq.data()), q_n, n_embd, y.data());
+        else if (RowRef ref = host_ref(out_type)) ref(ow, static_cast<const uint8_t*>(gq.data()), q_n, n_embd, y.data());
         else throw MetalError("qsa host output type");
         if (t == 0) host.y0 = std::move(y);
         else host.y1 = std::move(y);
@@ -9106,7 +9113,7 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
 //
 // Layer 1 still runs through run_layer1_gdn and run_layer1_ffn, which feed it. Each layer here is: the attention
 // half (a GDN step, or the QSA products, block and write), then the routed ten alone, then routed + shared, whose
-// output is the next layer's input. STRATA_WALK_LAST sets the last layer walked (default 25). The walk stops
+// output is the next layer's input. STRATA_WALK_LAST sets the last layer walked (default 26). The walk stops
 // early at the first layer whose attention half did not write.
 void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g) {
     std::string why;
@@ -9115,7 +9122,7 @@ void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g
         std::printf("\nlayer walk skipped: %s (set STRATA_MODEL_GGUF)\n", why.c_str());
         return;
     }
-    int last = 25;
+    int last = 26;
     if (const char* env = std::getenv("STRATA_WALK_LAST"); env && env[0]) last = std::atoi(env);
     const int n_layers = m->n_layers() > 0 ? m->n_layers() : (int) g.n_layers;
     if (last > n_layers - 1) last = n_layers - 1;
