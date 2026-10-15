@@ -6,6 +6,7 @@
 #include "strata/metal/device.hpp"
 #include "strata/metal/elementwise.hpp"
 #include "strata/metal/gdn.hpp"
+#include "strata/metal/iq.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -119,6 +120,56 @@ void gdn_layer(const GdnLayerGeom& g, const GdnLayerWeights& w, GdnLayerState& s
 
     quantize_q8_k(sc.y, d.V, sc.y_q8k);
     s_gemv_q8k_split(sc.y_q8k, *w.ssm_out.codes, *w.ssm_out.scales, out_off, out, d.V, g.n_embd, w.ssm_out.form);
+}
+
+void gdn_layer_iq(const GdnLayerGeom& g, const GdnIqWeights& w, GdnLayerState& st, GdnLayerScratch& sc,
+                  const Bytes& x, Bytes& out) {
+    check_geom(g);
+    const Dims d = dims_of(g);
+    need("state", st.state);
+    need("conv state", st.conv_state);
+    need("conv weight", w.conv);
+    need("ssm_norm", w.ssm_norm);
+    need("dt", w.dt);
+    need("ssm_a", w.ssm_a);
+    need("alpha weight", w.alpha);
+    need("beta weight", w.beta);
+    need("attn_qkv weights", w.qkv.weights);
+    need("attn_gate weights", w.attn_gate.weights);
+    need("ssm_out weights", w.ssm_out.weights);
+
+    // q8_1 is 36 bytes a block. The scratch slots are Q8_K and are the wrong width.
+    Bytes xq(iq_q8_1_bytes(g.n_embd));
+    iq_quantize_q8_1(x, g.n_embd, xq);
+    iq_mmvq(w.qkv.type, *w.qkv.weights, 0, xq, g.n_embd, d.C, 1, sc.qkv);
+
+    gdn_conv_step(*st.conv_state, sc.qkv, *w.conv, sc.conv_out, d.C, g.d_conv);
+    silu_inplace(sc.conv_out, d.C);
+
+    const float* conv = static_cast<const float*>(sc.conv_out.data());
+    std::memcpy(sc.q.data(), conv, (size_t) d.qk * sizeof(float));
+    std::memcpy(sc.k.data(), conv + d.qk, (size_t) d.qk * sizeof(float));
+    std::memcpy(sc.v.data(), conv + 2 * d.qk, (size_t) d.V * sizeof(float));
+
+    gdn_l2_norm(sc.q, g.h_k, g.S, kRmsEps);
+    gdn_l2_norm(sc.k, g.h_k, g.S, kRmsEps);
+    scale_inplace(sc.q, d.qk, 1.0f / std::sqrt((float) g.S));
+
+    f32_to_bf16_bulk(x, sc.x_bf16, g.n_embd);
+    bf16_gemv_split(sc.x_bf16, *w.alpha, sc.alpha, g.n_embd, g.h_v, kThreadsPerRow);
+    bf16_gemv_split(sc.x_bf16, *w.beta, sc.beta, g.n_embd, g.h_v, kThreadsPerRow);
+    gdn_beta_gate(sc.beta, g.h_v);
+    gdn_gate(sc.alpha, *w.dt, *w.ssm_a, sc.gate, 1, g.h_v);
+
+    const GdnShapes sh{g.S, g.h_k, g.h_v};
+    gdn_step(*st.state, sc.q, sc.k, sc.v, sc.gate, sc.beta, sc.o, sh);
+
+    iq_mmvq(w.attn_gate.type, *w.attn_gate.weights, 0, xq, g.n_embd, d.V, 1, sc.z);
+    gdn_out_norm(sc.o, sc.z, *w.ssm_norm, sc.y, g.h_v, g.S, kRmsEps);
+
+    Bytes yq(iq_q8_1_bytes(d.V));
+    iq_quantize_q8_1(sc.y, d.V, yq);
+    iq_mmvq(w.ssm_out.type, *w.ssm_out.weights, 0, yq, d.V, g.n_embd, 1, out);
 }
 
 }  // namespace strata::metal

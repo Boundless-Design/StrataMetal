@@ -3087,6 +3087,131 @@ void run_kquant() {
             n_out, true, 48);
 }
 
+// One GDN step from a zero state. The projections are the ggml dots. The middle is the
+// same transcription as the S-form layer: conv, SiLU, L2, 1/sqrt(S) on q, sigmoid beta,
+// softplus gate, head h % h_k, and sigmoid on z.
+float gdn_silu(float v) { return v / (1.0f + std::exp(-v)); }
+
+float gdn_sigmoid(float v) { return 1.0f / (1.0f + std::exp(-v)); }
+
+float gdn_softplus(float x) {
+    if (x > 20.0f) return x;
+    const float y = std::exp(x);
+    const float u = 1.0f + y;
+    if (u == 1.0f) return y;
+    return std::log(u) * (y / (u - 1.0f));
+}
+
+void gdn_l2_rows(std::vector<float>& x, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        double acc = 0;
+        float* p = x.data() + (size_t) r * cols;
+        for (int i = 0; i < cols; ++i) acc += (double) p[i] * (double) p[i];
+        const float inv = (float) (1.0 / std::sqrt(acc + 1e-6));
+        for (int i = 0; i < cols; ++i) p[i] *= inv;
+    }
+}
+
+void gdn_bf16_gemv(const float* x, const uint16_t* w, int n_in, int n_out, float* y) {
+    std::vector<uint16_t> xb((size_t) n_in);
+    for (int i = 0; i < n_in; ++i) xb[(size_t) i] = strata::kernels::bf16_from_f32(x[i]);
+    for (int row = 0; row < n_out; ++row) {
+        double acc = 0;
+        const uint16_t* wr = w + (size_t) row * n_in;
+        for (int i = 0; i < n_in; ++i)
+            acc += (double) strata::kernels::f32_from_bf16(xb[(size_t) i]) *
+                   (double) strata::kernels::f32_from_bf16(wr[i]);
+        y[row] = (float) acc;
+    }
+}
+
+std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8_t* gate_w, const uint8_t* out_w,
+                               const uint16_t* alpha_w, const uint16_t* beta_w, const float* conv_w,
+                               const float* norm, const float* dt, const float* ssm_a, int n_embd, int S, int h_k,
+                               int h_v, int d_conv) {
+    const int qk = S * h_k;
+    const int V = S * h_v;
+    const int C = qk + qk + V;
+    Bytes xf((uint64_t) n_embd * 4);
+    std::memcpy(xf.data(), x, xf.size());
+    Bytes xq(iq_q8_1_bytes(n_embd));
+    iq_quantize_q8_1(xf, n_embd, xq);
+    std::vector<uint8_t> xqb((size_t) xq.size());
+    std::memcpy(xqb.data(), xq.data(), xqb.size());
+
+    std::vector<float> qkv((size_t) C);
+    xs_ref(qkv_w, xqb.data(), n_embd, C, qkv.data());
+    std::vector<float> conv_state((size_t) C * (d_conv - 1), 0.f);
+    std::vector<float> mixed((size_t) C, 0.f);
+    for (int c = 0; c < C; ++c) {
+        float* st = conv_state.data() + (size_t) c * (d_conv - 1);
+        const float* cw = conv_w + (size_t) c * d_conv;
+        double acc = 0;
+        for (int i = 0; i < d_conv - 1; ++i) acc += (double) st[i] * (double) cw[i];
+        acc += (double) qkv[(size_t) c] * (double) cw[d_conv - 1];
+        mixed[(size_t) c] = (float) acc;
+        for (int i = 0; i < d_conv - 2; ++i) st[i] = st[i + 1];
+        st[d_conv - 2] = qkv[(size_t) c];
+    }
+    for (float& v : mixed) v = gdn_silu(v);
+
+    std::vector<float> q(mixed.begin(), mixed.begin() + qk);
+    std::vector<float> k(mixed.begin() + qk, mixed.begin() + 2 * qk);
+    std::vector<float> vv(mixed.begin() + 2 * qk, mixed.end());
+    gdn_l2_rows(q, h_k, S);
+    gdn_l2_rows(k, h_k, S);
+    const float qs = 1.0f / std::sqrt((float) S);
+    for (float& v : q) v *= qs;
+
+    std::vector<float> alpha((size_t) h_v), beta((size_t) h_v), gate((size_t) h_v);
+    gdn_bf16_gemv(x, alpha_w, n_embd, h_v, alpha.data());
+    gdn_bf16_gemv(x, beta_w, n_embd, h_v, beta.data());
+    for (float& v : beta) v = gdn_sigmoid(v);
+    for (int h = 0; h < h_v; ++h) gate[(size_t) h] = gdn_softplus(alpha[(size_t) h] + dt[h]) * ssm_a[h];
+
+    std::vector<double> state((size_t) S * h_v * S, 0.0);
+    std::vector<float> o((size_t) V, 0.f);
+    for (int h = 0; h < h_v; ++h) {
+        const int src = h % h_k;
+        const double dec = std::exp((double) gate[(size_t) h]);
+        const double b = (double) beta[(size_t) h];
+        for (int j = 0; j < S; ++j) {
+            auto at = [&](int i) -> double& { return state[(size_t) (i * h_v + h) * S + j]; };
+            for (int i = 0; i < S; ++i) at(i) *= dec;
+            double sk = 0;
+            for (int i = 0; i < S; ++i) sk += at(i) * (double) k[(size_t) src * S + i];
+            const double delta = ((double) vv[(size_t) h * S + j] - sk) * b;
+            double dot = 0;
+            for (int i = 0; i < S; ++i) {
+                at(i) += (double) k[(size_t) src * S + i] * delta;
+                dot += at(i) * (double) q[(size_t) src * S + i];
+            }
+            o[(size_t) h * S + j] = (float) dot;
+        }
+    }
+
+    std::vector<float> z((size_t) V);
+    scalar_ref(gate_w, xqb.data(), n_embd, V, false, z.data());
+    std::vector<float> y((size_t) V, 0.f);
+    for (int h = 0; h < h_v; ++h) {
+        const float* po = o.data() + (size_t) h * S;
+        double acc = 0;
+        for (int i = 0; i < S; ++i) acc += (double) po[i] * (double) po[i];
+        const float inv = (float) (1.0 / std::sqrt(acc / (double) S + 1e-6));
+        for (int i = 0; i < S; ++i)
+            y[(size_t) h * S + i] = po[i] * inv * norm[i] * gdn_sigmoid(z[(size_t) h * S + i]);
+    }
+    Bytes yf((uint64_t) V * 4);
+    std::memcpy(yf.data(), y.data(), yf.size());
+    Bytes yq(iq_q8_1_bytes(V));
+    iq_quantize_q8_1(yf, V, yq);
+    std::vector<uint8_t> yqb((size_t) yq.size());
+    std::memcpy(yqb.data(), yq.data(), yqb.size());
+    std::vector<float> out((size_t) n_embd);
+    scalar_ref(out_w, yqb.data(), V, n_embd, true, out.data());
+    return out;
+}
+
 // Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
 // The loader does not open the GGUF. A missing directory skips this section.
 void run_q2_layer() {
@@ -3286,6 +3411,142 @@ void run_q2_layer() {
     char expert_detail[200];
     std::snprintf(expert_detail, sizeof expert_detail, "blob %zu, %s", blob.size(), expert_got.c_str());
     verdict("a Q2_0 gate is refused", blob_n && expert_refused, expert_detail);
+
+    const PackTensor* conv_w = table.find("blk.0.ssm_conv1d.weight");
+    const PackTensor* alpha_w = table.find("blk.0.ssm_alpha.weight");
+    const PackTensor* beta_w = table.find("blk.0.ssm_beta.weight");
+    const PackTensor* ssm_a = table.find("blk.0.ssm_a");
+    const PackTensor* dt_w = table.find("blk.0.ssm_dt.bias");
+    const PackTensor* norm_w = table.find("blk.0.ssm_norm.weight");
+    const bool step_bytes = qkv_bytes && gate && gate->values && gate->values->size() == 8847360 && ssm &&
+                            ssm->values && ssm->values->size() == 10813440 && conv_w && conv_w->values &&
+                            conv_w->values->size() == 163840 && alpha_w && alpha_w->values &&
+                            alpha_w->values->size() == 245760 && beta_w && beta_w->values &&
+                            beta_w->values->size() == 245760 && ssm_a && ssm_a->values && ssm_a->values->size() == 192 &&
+                            dt_w && dt_w->values && dt_w->values->size() == 192 && norm_w && norm_w->values &&
+                            norm_w->values->size() == 512;
+    const int n_embd = 2560;
+    const int guard = 1;
+    const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+    bool step_ok = false;
+    bool step_repeat = false;
+    bool step_moved = false;
+    bool step_flipped = false;
+    std::string step_detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string move_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (step_bytes) {
+        try {
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, qkv->values.get()};
+            w.attn_gate = GdnIqPlane{kQ4_K, gate->values.get()};
+            w.ssm_out = GdnIqPlane{kQ5_K, ssm->values.get()};
+            w.alpha = alpha_w->values.get();
+            w.beta = beta_w->values.get();
+            w.conv = conv_w->values.get();
+            w.ssm_norm = norm_w->values.get();
+            w.dt = dt_w->values.get();
+            w.ssm_a = ssm_a->values.get();
+
+            const uint64_t state_n = (uint64_t) lg.S * (uint64_t) lg.h_v * (uint64_t) lg.S;
+            const uint64_t conv_n = (uint64_t) g.ssm_conv_channels * (uint64_t) (lg.d_conv - 1);
+            Bytes state(state_n * 4), conv(conv_n * 4), state_b(state_n * 4), conv_b(conv_n * 4);
+            Bytes state_z(state_n * 4), conv_z(conv_n * 4), state_f(state_n * 4), conv_f(conv_n * 4);
+            std::memset(state.data(), 0, (size_t) state.size());
+            std::memset(conv.data(), 0, (size_t) conv.size());
+            std::memset(state_b.data(), 0, (size_t) state_b.size());
+            std::memset(conv_b.data(), 0, (size_t) conv_b.size());
+            std::memset(state_z.data(), 0, (size_t) state_z.size());
+            std::memset(conv_z.data(), 0, (size_t) conv_z.size());
+            std::memset(state_f.data(), 0, (size_t) state_f.size());
+            std::memset(conv_f.data(), 0, (size_t) conv_f.size());
+            Bytes x((uint64_t) n_embd * 4);
+            auto* xp = static_cast<float*>(x.data());
+            for (int i = 0; i < n_embd; ++i) xp[i] = ((i * 17) % 29) * 0.02f - 0.2f;
+            Bytes y((uint64_t) (n_embd + guard) * 4);
+            Bytes y2((uint64_t) (n_embd + guard) * 4);
+            Bytes yz((uint64_t) (n_embd + guard) * 4);
+            Bytes yf((uint64_t) (n_embd + guard) * 4);
+            std::fill_n(static_cast<float*>(y.data()), (size_t) (n_embd + guard), 7.f);
+            std::fill_n(static_cast<float*>(y2.data()), (size_t) (n_embd + guard), 7.f);
+            std::fill_n(static_cast<float*>(yz.data()), (size_t) (n_embd + guard), 7.f);
+            std::fill_n(static_cast<float*>(yf.data()), (size_t) (n_embd + guard), 7.f);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            GdnLayerState st{&state, &conv};
+            GdnLayerState st_b{&state_b, &conv_b};
+            GdnLayerState st_z{&state_z, &conv_z};
+            GdnLayerState st_f{&state_f, &conv_f};
+            gdn_layer_iq(lg, w, st, sc, x, y);
+            gdn_layer_iq(lg, w, st_b, sc, x, y2);
+            const std::vector<float> host = gdn_iq_host(
+                xp, static_cast<const uint8_t*>(qkv->values->data()),
+                static_cast<const uint8_t*>(gate->values->data()), static_cast<const uint8_t*>(ssm->values->data()),
+                static_cast<const uint16_t*>(alpha_w->values->data()),
+                static_cast<const uint16_t*>(beta_w->values->data()),
+                static_cast<const float*>(conv_w->values->data()), static_cast<const float*>(norm_w->values->data()),
+                static_cast<const float*>(dt_w->values->data()), static_cast<const float*>(ssm_a->values->data()),
+                n_embd, (int) lg.S, (int) lg.h_k, (int) lg.h_v, (int) lg.d_conv);
+            Bytes zero((uint64_t) n_embd * 4);
+            std::memset(zero.data(), 0, (size_t) zero.size());
+            gdn_layer_iq(lg, w, st_z, sc, zero, yz);
+            // Row 0's first code changes the query product and does not reach this output.
+            // The query channel with the largest last tap carries one code bit through the step.
+            const float* cw = static_cast<const float*>(conv_w->values->data());
+            int channel = 0;
+            float best_tap = 0.f;
+            const int q_channels = (int) (lg.S * lg.h_k);
+            for (int c = 0; c < q_channels; ++c) {
+                const float tap = std::fabs(cw[(size_t) c * lg.d_conv + (lg.d_conv - 1)]);
+                if (tap > best_tap) {
+                    best_tap = tap;
+                    channel = c;
+                }
+            }
+            const int flip_at = channel * (int) iq_row_bytes(kIq4Xs, n_embd) + 8;
+            Bytes flipped(qkv->values->size());
+            std::memcpy(flipped.data(), qkv->values->data(), flipped.size());
+            static_cast<uint8_t*>(flipped.data())[flip_at] ^= 1u;
+            GdnIqWeights wf = w;
+            wf.qkv.weights = &flipped;
+            gdn_layer_iq(lg, wf, st_f, sc, x, yf);
+
+            const float* yp = static_cast<const float*>(y.data());
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const float* yfp = static_cast<const float*>(yf.data());
+            const bool guard_held = yp[n_embd] == 7.f && y2p[n_embd] == 7.f && yzp[n_embd] == 7.f && yfp[n_embd] == 7.f;
+            const bool live = all_finite(yp, n_embd) && all_finite(y2p, n_embd) && all_finite(yzp, n_embd) &&
+                              all_finite(yfp, n_embd) && all_finite(host.data(), n_embd) && !still_seven(yp, n_embd);
+            const double rel = rel_l1(host.data(), yp, n_embd);
+            const int again = differ_floats(yp, y2p, n_embd);
+            const int apart = differ_floats(yp, yzp, n_embd);
+            const int flipped_n = differ_floats(yp, yfp, n_embd);
+            const double apart_rel = rel_l1(yp, yzp, n_embd);
+            step_ok = live && guard_held && rel <= 1e-5;
+            step_repeat = live && guard_held && again == 0;
+            step_moved = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            step_flipped = live && guard_held && flipped_n > 0;
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "rel %.3e, %d rows", rel, n_embd);
+            step_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, n_embd, apart_rel * 100.0);
+            move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, channel %d", flipped_n, n_embd, channel);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            step_detail = e.what();
+            repeat_detail = e.what();
+            move_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("one Q2_0 GDN step matches", step_bytes && step_ok, step_detail);
+    verdict("that GDN step repeats", step_bytes && step_repeat, repeat_detail);
+    verdict("a zero activation moves that GDN step", step_bytes && step_moved, move_detail);
+    verdict("a changed query code moves that GDN step", step_bytes && step_flipped, flip_detail);
 }
 
 }  // namespace
@@ -3299,7 +3560,7 @@ int main(int argc, char** argv) {
     std::printf(
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
-        "one Q4_K gate, one Q5_K output\n\n");
+        "one Q4_K gate, one Q5_K output, one GDN step\n\n");
     try {
         run_conversions();
         run_refusals();
