@@ -6886,6 +6886,30 @@ Bytes read_named(const strata::metal::ModelTensors& m, int layer, const char* su
     }
 }
 
+// The named tensor must be `n` bytes. This does not copy it.
+void require_named(const strata::metal::ModelTensors& m, int layer, const char* suffix, uint64_t n) {
+    try {
+        const strata::metal::LayerTensor& t = m.at(layer, suffix);
+        if (t.bytes != n) throw MetalError(t.name + " is " + std::to_string(t.bytes) + " bytes");
+    } catch (const MetalError&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw MetalError(e.what());
+    }
+}
+
+// `n` bytes at `off` inside a named tensor. One expert's rows, for example.
+std::vector<uint8_t> read_named_span(const strata::metal::ModelTensors& m, int layer, const char* suffix,
+                                     uint64_t off, uint64_t n) {
+    try {
+        return m.read(m.at(layer, suffix), off, n);
+    } catch (const MetalError&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw MetalError(e.what());
+    }
+}
+
 // Layer 1's GDN step on token 1's layer-0 residual. The six blk.1.ple_* tensors are not added.
 // Layer 1 is the only layer that carries them, and that update sits in front of this read.
 // The planes are blk.1.* by name. The walk's GDN step prints a different detail line, so this check stays.
@@ -7051,6 +7075,8 @@ void run_layer1_gdn(const strata::core::ModelGeometry& g) {
 
 // Layer 1's routed experts and its Q2_0 shared expert, on the attention residual above.
 // The six blk.1.ple_* tensors are not added. This is not the model residual.
+// The planes are blk.1.* by name. The walk splits this into a routed-only pass and a shared pass
+// and names them differently, so this check stays.
 void run_layer1_ffn(const PackTable& table, const strata::core::ModelGeometry& g) {
     layer1_ffn_residual.clear();
     std::printf("\nlayer 1 routed experts on the attention residual, PLE not applied\n");
@@ -7062,20 +7088,7 @@ void run_layer1_ffn(const PackTable& table, const strata::core::ModelGeometry& g
     const int hc_dim = hc * n_embd;
     const int n_vocab = 248320;
     const int k = 10;
-    const uint64_t k_data = 11024672;
-    const uint64_t k_down = 1519445376;
-    const uint64_t k_down_s = 1755374976;
-    const uint64_t k_gate = 1755835776;
-    const uint64_t k_router = 1991765376;
-    const uint64_t k_ginp = 1994386816;
-    const uint64_t k_gate_s = 1994391936;
-    const uint64_t k_up = 1994852736;
-    const uint64_t k_up_s = 2230782336;
-    const uint64_t k_ffn_down = 2244473216;
-    const uint64_t k_ffn_inj = 2251026816;
-    const uint64_t k_ffn_norm = 2251108736;
-    const uint64_t k_ffn_up = 2251149696;
-    const std::filesystem::path shard = strata::metal::default_model_shard();
+    const auto model = strata::metal::ModelTensors::open_default();
     const size_t out_row_n = (size_t) (n_embd / 256) * 176;
     const size_t stride = (n_embd > 0 && n_ff > 0) ? (size_t) n_ff * iq_row_bytes(kQ2_0, n_embd) : 0;
     const bool stride_ok = stride == 460800 && (size_t) n_embd * iq_row_bytes(kQ2_0, n_ff) == stride;
@@ -7099,7 +7112,7 @@ void run_layer1_ffn(const PackTable& table, const strata::core::ModelGeometry& g
         head_norm->ne0 == hc_dim && head_norm->ne1 == 1 && head_norm->values->size() == (uint64_t) hc_dim * 4 &&
         head_out->values->size() == (uint64_t) n_vocab * out_row_n;
     const bool bytes = stride_ok && head_ok && n_expert == 512 && hc > 0 && n_ff == 640 &&
-                       (int) layer1_attn_residual.size() == hc_dim && std::filesystem::is_regular_file(shard);
+                       (int) layer1_attn_residual.size() == hc_dim && model != nullptr;
     bool l1_mix_ok = false;
     bool l1_logits_ok = false;
     bool l1_repeat = false;
@@ -7114,21 +7127,20 @@ void run_layer1_ffn(const PackTable& table, const strata::core::ModelGeometry& g
     std::string l1_drop_detail = "bytes";
     if (bytes) {
         try {
-            auto load = [&](uint64_t off, uint64_t n) {
-                const auto raw = read_at_path(shard, k_data + off, (size_t) n);
-                Bytes b(n);
-                std::memcpy(b.data(), raw.data(), (size_t) n);
-                return b;
-            };
-            Bytes ffn_down = load(k_ffn_down, 6553600);
-            Bytes ffn_up = load(k_ffn_up, 6553600);
-            Bytes ffn_inj = load(k_ffn_inj, 81920);
-            Bytes ffn_norm = load(k_ffn_norm, 40960);
-            Bytes router = load(k_router, 2621440);
-            Bytes ginp = load(k_ginp, 5120);
-            Bytes sgate = load(k_gate_s, 460800);
-            Bytes sup = load(k_up_s, 460800);
-            Bytes sdown = load(k_down_s, 460800);
+            auto load = [&](const char* suffix, uint64_t n) { return read_named(*model, 1, suffix, n); };
+            Bytes ffn_down = load("hc_ffn_down.weight", 6553600);
+            Bytes ffn_up = load("hc_ffn_up.weight", 6553600);
+            Bytes ffn_inj = load("hc_ffn_inject.weight", 81920);
+            Bytes ffn_norm = load("hc_ffn_norm.weight", 40960);
+            Bytes router = load("ffn_gate_inp.weight", 2621440);
+            Bytes ginp = load("ffn_gate_inp_shexp.weight", 5120);
+            Bytes sgate = load("ffn_gate_shexp.weight", 460800);
+            Bytes sup = load("ffn_up_shexp.weight", 460800);
+            Bytes sdown = load("ffn_down_shexp.weight", 460800);
+            const uint64_t pool = (uint64_t) n_expert * stride;
+            require_named(*model, 1, "ffn_gate_exps.weight", pool);
+            require_named(*model, 1, "ffn_up_exps.weight", pool);
+            require_named(*model, 1, "ffn_down_exps.weight", pool);
             const GrShapes gs{n_embd, hc, hc_lr};
             const int guard = 1;
             const int guard_n = hc_dim + guard;
@@ -7162,9 +7174,9 @@ void run_layer1_ffn(const PackTable& table, const strata::core::ModelGeometry& g
                 if (id < 0 || id >= n_expert) throw MetalError("routed expert id is outside the pool");
                 dst.resize(stride * 3);
                 const uint64_t base = (uint64_t) id * stride;
-                const auto gate_b = read_at_path(shard, k_data + k_gate + base, stride);
-                const auto up_b = read_at_path(shard, k_data + k_up + base, stride);
-                const auto down_b = read_at_path(shard, k_data + k_down + base, stride);
+                const auto gate_b = read_named_span(*model, 1, "ffn_gate_exps.weight", base, stride);
+                const auto up_b = read_named_span(*model, 1, "ffn_up_exps.weight", base, stride);
+                const auto down_b = read_named_span(*model, 1, "ffn_down_exps.weight", base, stride);
                 std::memcpy(dst.data(), gate_b.data(), stride);
                 std::memcpy(dst.data() + stride, up_b.data(), stride);
                 std::memcpy(dst.data() + stride * 2, down_b.data(), stride);
