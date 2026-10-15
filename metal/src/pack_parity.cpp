@@ -3546,6 +3546,7 @@ std::vector<float> gdn_iq_host(const float* x, const uint8_t* qkv_w, const uint8
 
     auto project_rows = [&](int type, const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
         if (type == kIq4Xs) xs_ref(w, x, n_in, n_out, y);
+        else if (type == kQ3_K) q3_ref(w, x, n_in, n_out, y);
         else if (type == kQ4_K) scalar_ref(w, x, n_in, n_out, false, y);
         else if (type == kQ5_K) scalar_ref(w, x, n_in, n_out, true, y);
         else throw MetalError("gdn host quant is not one of these");
@@ -5910,6 +5911,8 @@ std::vector<float> layer3_attn_residual;
 std::vector<float> layer3_ffn_residual;
 // Layer 3's feed-forward residual with the shared expert added. Layer 1's PLE was not applied.
 std::vector<float> layer3_shared_residual;
+// Layer 4's attention residual. State started at zero. Layer 1's PLE was not applied.
+std::vector<float> layer4_attn_residual;
 
 // Token 7971 from a zero state, then token 1 from that convolution and recurrent state.
 // Token 1 is a fixed row. It is not an argmax. The other 47 layers are not loaded.
@@ -10108,6 +10111,181 @@ void run_layer3_shared(const PackTable& table, const strata::core::ModelGeometry
     verdict("dropping the shared expert moves that layer-3 pass", bytes && dropped_ok, drop_detail);
 }
 
+// Layer 4's GDN step on layer 3's shared residual. State starts at zero.
+// Query is IQ4_XS, gate is Q3_K, output is IQ4_XS. Layer 1's PLE was not applied.
+// This does not load layers 5 through 47.
+void run_layer4_gdn(const strata::core::ModelGeometry& g) {
+    layer4_attn_residual.clear();
+    std::printf("\nlayer 4 GDN step on layer 3's shared residual, query IQ4_XS, gate Q3_K, output IQ4_XS, state starts at zero, layer 1 PLE not applied\n");
+    const int n_embd = (int) g.n_embd;
+    const int hc = (int) g.hc;
+    const int hc_lr = (int) g.hc_lr;
+    const int hc_dim = hc * n_embd;
+    const uint64_t k_data = 11024672;
+    const std::filesystem::path shard =
+        "/Users/kamp/Developer/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf";
+    const bool plane_bytes = n_embd == 2560 &&
+                             (size_t) 10240 * iq_row_bytes(kIq4Xs, n_embd) == 13926400 &&
+                             (size_t) 6144 * iq_row_bytes(kQ3_K, n_embd) == 6758400 &&
+                             (size_t) n_embd * iq_row_bytes(kIq4Xs, 6144) == 8355840;
+    const bool bytes = plane_bytes && (int) layer3_shared_residual.size() == hc_dim && g.ssm_state_size == 128 &&
+                       g.ssm_k_heads == 16 && g.ssm_v_heads == 48 && g.ssm_d_conv == 4 &&
+                       g.ssm_conv_channels == 10240 && std::filesystem::is_regular_file(shard);
+    bool step_ok = false, repeat_ok = false, moved_ok = false, flipped_ok = false;
+    std::string step_detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string move_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (bytes) {
+        try {
+            auto load = [&](uint64_t off, uint64_t n) {
+                const auto raw = read_at_path(shard, k_data + off, (size_t) n);
+                Bytes b(n);
+                std::memcpy(b.data(), raw.data(), (size_t) n);
+                return b;
+            };
+            Bytes qkv = load(3826230400, 13926400);
+            Bytes gate = load(3819472000, 6758400);
+            Bytes ssm = load(4579070976, 8355840);
+            Bytes conv_w = load(4578906432, 163840);
+            Bytes alpha_w = load(4578414912, 245760);
+            Bytes beta_w = load(4578660672, 245760);
+            Bytes ssm_a = load(4578414720, 192);
+            Bytes dt_w = load(4579070272, 192);
+            Bytes ssm_norm = load(4579070464, 512);
+            Bytes attn_down = load(4551954560, 6553600);
+            Bytes attn_up = load(4558631040, 6553600);
+            Bytes attn_inj = load(4558508160, 81920);
+            Bytes attn_norm = load(4558590080, 40960);
+            GdnIqWeights w;
+            w.qkv = GdnIqPlane{kIq4Xs, &qkv};
+            w.attn_gate = GdnIqPlane{kQ3_K, &gate};
+            w.ssm_out = GdnIqPlane{kIq4Xs, &ssm};
+            w.alpha = &alpha_w;
+            w.beta = &beta_w;
+            w.conv = &conv_w;
+            w.ssm_norm = &ssm_norm;
+            w.dt = &dt_w;
+            w.ssm_a = &ssm_a;
+            const GrShapes gs{n_embd, hc, hc_lr};
+            const GdnLayerGeom lg{g.n_embd, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads, g.ssm_d_conv};
+            const int state_n = (int) lg.S * (int) lg.h_v * (int) lg.S;
+            const int conv_n = (int) g.ssm_conv_channels * (int) (lg.d_conv - 1);
+            const int guard = 1;
+            const int guard_n = hc_dim + guard;
+            Bytes state((uint64_t) state_n * 4), conv((uint64_t) conv_n * 4);
+            Bytes mixed((uint64_t) n_embd * 4), inject((uint64_t) hc * 4), gdn_y((uint64_t) n_embd * 4);
+            Bytes out((uint64_t) guard_n * 4), out2((uint64_t) guard_n * 4), outz((uint64_t) guard_n * 4);
+            Bytes outf((uint64_t) guard_n * 4);
+            Bytes R((uint64_t) hc_dim * 4), zero_r((uint64_t) hc_dim * 4);
+            std::memcpy(R.data(), layer3_shared_residual.data(), (size_t) hc_dim * 4);
+            std::memset(zero_r.data(), 0, (size_t) zero_r.size());
+            GrScratch gr = make_gr_scratch(gs);
+            GdnLayerScratch sc = make_gdn_layer_scratch(lg);
+            auto step = [&](const Bytes& residual, Bytes& y) {
+                std::memset(state.data(), 0, (size_t) state.size());
+                std::memset(conv.data(), 0, (size_t) conv.size());
+                std::fill_n(static_cast<float*>(gdn_y.data()), (size_t) n_embd, 7.f);
+                std::fill_n(static_cast<float*>(y.data()), (size_t) guard_n, 7.f);
+                GdnLayerState st{&state, &conv};
+                gr_read(gs, residual, attn_norm, attn_down, attn_up, &attn_inj, 1e-6f, false, gr, mixed, inject);
+                gdn_layer_iq(lg, w, st, sc, mixed, gdn_y);
+                gr_write(gs, residual, gdn_y, inject, y);
+            };
+            step(R, out);
+            layer4_attn_residual.assign(static_cast<const float*>(out.data()),
+                                        static_cast<const float*>(out.data()) + hc_dim);
+            std::vector<float> gpu_state((size_t) state_n), gpu_conv((size_t) conv_n), gpu_mixed((size_t) n_embd);
+            std::vector<float> gpu_block((size_t) n_embd), gpu_inj((size_t) hc);
+            std::memcpy(gpu_state.data(), state.data(), (size_t) state_n * 4);
+            std::memcpy(gpu_conv.data(), conv.data(), (size_t) conv_n * 4);
+            std::memcpy(gpu_mixed.data(), mixed.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_block.data(), gdn_y.data(), (size_t) n_embd * 4);
+            std::memcpy(gpu_inj.data(), inject.data(), (size_t) hc * 4);
+            std::vector<float> host_state((size_t) state_n, 0.f), host_conv((size_t) conv_n, 0.f);
+            const std::vector<float> host_block = gdn_iq_host(
+                gpu_mixed.data(), static_cast<const uint8_t*>(qkv.data()), static_cast<const uint8_t*>(gate.data()),
+                static_cast<const uint8_t*>(ssm.data()), static_cast<const uint16_t*>(alpha_w.data()),
+                static_cast<const uint16_t*>(beta_w.data()), static_cast<const float*>(conv_w.data()),
+                static_cast<const float*>(ssm_norm.data()), static_cast<const float*>(dt_w.data()),
+                static_cast<const float*>(ssm_a.data()), n_embd, (int) lg.S, (int) lg.h_k, (int) lg.h_v,
+                (int) lg.d_conv, &host_conv, &host_state, kQ3_K, kIq4Xs);
+            std::vector<float> host_write((size_t) hc_dim);
+            const float* Rp = static_cast<const float*>(R.data());
+            for (int c = 0; c < hc; ++c) {
+                const float scale = 2.0f * gdn_sigmoid(gpu_inj[(size_t) c] / (float) hc);
+                for (int d = 0; d < n_embd; ++d)
+                    host_write[(size_t) c * n_embd + d] = Rp[(size_t) c * n_embd + d] + gpu_block[(size_t) d] * scale;
+            }
+            const double state_rel = rel_l1(host_state.data(), gpu_state.data(), state_n);
+            const double conv_rel = rel_l1(host_conv.data(), gpu_conv.data(), conv_n);
+            const double block_rel = rel_l1(host_block.data(), gpu_block.data(), n_embd);
+            const double write_rel = rel_l1(host_write.data(), static_cast<const float*>(out.data()), hc_dim);
+            std::vector<float> zeros_s((size_t) state_n, 0.f), zeros_c((size_t) conv_n, 0.f);
+            const int state_moved = differ_floats(gpu_state.data(), zeros_s.data(), state_n);
+            const int conv_moved = differ_floats(gpu_conv.data(), zeros_c.data(), conv_n);
+            step(R, out2);
+            step(zero_r, outz);
+            const int candidates[] = {32, 2, 8, 136, 1360, 588 * 1360};
+            int flip_at = -1;
+            int flip_n = 0;
+            Bytes flipped((uint64_t) qkv.size());
+            for (int local : candidates) {
+                if (local < 0 || (uint64_t) local >= qkv.size()) continue;
+                std::memcpy(flipped.data(), qkv.data(), qkv.size());
+                static_cast<uint8_t*>(flipped.data())[local] ^= 1u;
+                w.qkv = GdnIqPlane{kIq4Xs, &flipped};
+                step(R, outf);
+                flip_n = differ_floats(static_cast<const float*>(out.data()), static_cast<const float*>(outf.data()), hc_dim);
+                if (flip_n > 0) {
+                    flip_at = local;
+                    break;
+                }
+            }
+            w.qkv = GdnIqPlane{kIq4Xs, &qkv};
+            const float* op = static_cast<const float*>(out.data());
+            const float* o2 = static_cast<const float*>(out2.data());
+            const float* oz = static_cast<const float*>(outz.data());
+            const float* of = static_cast<const float*>(outf.data());
+            const bool guard_held = op[hc_dim] == 7.f && o2[hc_dim] == 7.f && oz[hc_dim] == 7.f &&
+                                    (flip_at < 0 || of[hc_dim] == 7.f);
+            const bool live = all_finite(op, hc_dim) && all_finite(o2, hc_dim) && all_finite(oz, hc_dim) &&
+                              all_finite(host_block.data(), n_embd) && all_finite(host_write.data(), hc_dim) &&
+                              all_finite(gpu_state.data(), state_n) && all_finite(host_state.data(), state_n) &&
+                              !still_seven(op, hc_dim);
+            const int again = differ_floats(op, o2, hc_dim);
+            const int apart = differ_floats(op, oz, hc_dim);
+            const double apart_rel = rel_l1(op, oz, hc_dim);
+            step_ok = live && guard_held && block_rel <= 1e-5 && state_rel <= 1e-5 && conv_rel <= 1e-5 &&
+                      write_rel <= 1e-4 && state_moved > 0 && conv_moved > 0;
+            repeat_ok = live && guard_held && again == 0;
+            moved_ok = live && guard_held && apart > 0 && std::isfinite(apart_rel);
+            flipped_ok = live && guard_held && flip_n > 0;
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "block %.3e, state %.3e, conv %.3e, write %.3e, state moved %d, conv moved %d, "
+                          "gate Q3_K, state starts at zero, layer 1 PLE not applied",
+                          block_rel, state_rel, conv_rel, write_rel, state_moved, conv_moved);
+            step_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, %.2f%% apart", apart, hc_dim, apart_rel * 100.0);
+            move_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flip_n, hc_dim, flip_at);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            step_detail = e.what();
+            repeat_detail = e.what();
+            move_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("the layer-4 GDN step matches", bytes && step_ok, step_detail);
+    verdict("that layer-4 step repeats", bytes && repeat_ok, repeat_detail);
+    verdict("a zero residual moves that layer-4 step", bytes && moved_ok, move_detail);
+    verdict("a changed query byte moves that layer-4 step", bytes && flipped_ok, flip_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -11444,6 +11622,7 @@ void run_q2_layer() {
     run_layer3_write(g);
     run_layer3_routed(table, g);
     run_layer3_shared(table, g);
+    run_layer4_gdn(g);
     run_shared_rows(table, g);
     run_vocab_rows(table, g);
     run_output_mix(table, g);
@@ -11468,7 +11647,7 @@ int main(int argc, char** argv) {
         "one layer-1 GDN step on that residual, one layer-1 routed expert pass on that residual, "
         "one layer-2 GDN step on that residual, one layer-2 routed expert pass on that residual, "
         "one layer-2 shared expert on that residual, "
-        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, one layer-3 QSA block, one layer-3 attention write, one layer-3 routed expert pass, one layer-3 shared expert, "
+        "one layer-3 query, one layer-3 key, one layer-3 value, one layer-3 output, one layer-3 QSA block, one layer-3 attention write, one layer-3 routed expert pass, one layer-3 shared expert, one layer-4 GDN step, "
         "one shared expert, one Q3_K embedding, "
         "one output weight, one output mixer, one head\n\n");
     try {
