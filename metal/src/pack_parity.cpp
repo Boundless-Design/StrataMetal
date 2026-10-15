@@ -3061,6 +3061,246 @@ void check_k(const char* match_name, const char* move_name, const uint8_t* w, ui
     verdict(move_name, ok && moved > 0 && zero_clear && from_zero == n_out, move_detail);
 }
 
+int q3_vsub4(int a, int b) {
+    int r = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int ba = (a >> (8 * i)) & 0xFF;
+        const int bb = (b >> (8 * i)) & 0xFF;
+        r |= ((ba - bb) & 0xFF) << (8 * i);
+    }
+    return r;
+}
+
+// Q3_K is 110 bytes and 256 values. Same integer dot as iq_mmvq_q3_k.
+float q3_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const int bq8_offset = 4 * (iqs / 8);
+    const int scale_offset = iqs - (iqs % 8) + (iqs % 8) / 4;
+    const uint8_t* scales = blk + 96;
+    const int vl = q2_ld(blk + 32 + 4 * iqs);
+    const uint32_t vh = (~(uint32_t) q2_ld(blk + 4 * (iqs % 8))) >> bq8_offset;
+    float sumf = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+        const int sc_high = ((scales[8 + (isc % 4)] >> (2 * (isc / 4))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = (int) (((vh >> i) << 2) & 0x04040404u);
+        const uint8_t* bq8 = x0 + (size_t) (bq8_offset + i) * 36;
+        const float d8 = strata::kernels::f32_from_f16((uint16_t) k_u16(bq8));
+        sumf += d8 * (float) (q2_dp4a(q3_vsub4(vil, vih), q2_ld(bq8 + 4 + 4 * (iqs % 8)), 0) * sc);
+    }
+    return strata::kernels::f32_from_f16((uint16_t) k_u16(blk + 108)) * sumf;
+}
+
+float q3_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 256) * 16;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 16;
+        lane[k & 31] += q3_partial(row + (size_t) kbx * 110, col + (size_t) kbx * 8 * 36, k % 16);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q3_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 256) * 110;
+    for (int r = 0; r < n_out; ++r) y[r] = q3_row(w + (size_t) r * row, x, n_in);
+}
+
+void dequant_q3(const uint8_t* block, float* out) {
+    const uint8_t* hm = block;
+    const uint8_t* qq = block + 32;
+    const float d_all = strata::kernels::f32_from_f16((uint16_t) k_u16(block + 108));
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4] = {0, 0, 0, 0};
+    std::memcpy(aux, block + 96, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+    float* y = out;
+    int is = 0;
+    uint8_t m = 1;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            const float d0 = d_all * (float) (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l)
+                *y++ = d0 * (float) ((int) ((qq[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            const float d1 = d_all * (float) (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l)
+                *y++ = d1 * (float) ((int) ((qq[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            shift += 2;
+            m = (uint8_t) (m << 1);
+        }
+        qq += 32;
+    }
+}
+
+void q3_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    std::vector<float> act((size_t) n_in), rowv((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 256) * 110;
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 256; ++b) dequant_q3(src + (size_t) b * 110, rowv.data() + (size_t) b * 256);
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) rowv[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
+// Q5_0 is 22 bytes and 32 values. Same integer dot as iq_mmvq_q5_0.
+float q50_partial(const uint8_t* blk, const uint8_t* x0, int iqs) {
+    const uint8_t* qs = blk + 6;
+    int sumi = 0;
+    int suma = 0;
+    for (int i = 0; i < 2; ++i) {
+        const int vl = q2_ld(qs + 4 * (iqs + i));
+        const uint32_t vh = (uint32_t) q2_ld(blk + 2) >> (4 * (iqs + i));
+        const int u0 = q2_ld(x0 + 4 + 4 * (iqs + i));
+        const int u1 = q2_ld(x0 + 4 + 4 * (iqs + i + 4));
+        int vi0 = vl & 0x0F0F0F0F;
+        vi0 |= (int) ((vh << 4) & 0x00000010u);
+        vi0 |= (int) ((vh << 11) & 0x00001000u);
+        vi0 |= (int) ((vh << 18) & 0x00100000u);
+        vi0 |= (int) ((vh << 25) & 0x10000000u);
+        int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        vi1 |= (int) ((vh >> 12) & 0x00000010u);
+        vi1 |= (int) ((vh >> 5) & 0x00001000u);
+        vi1 |= (int) ((vh << 2) & 0x00100000u);
+        vi1 |= (int) ((vh << 9) & 0x10000000u);
+        sumi = q2_dp4a(vi0, u0, sumi);
+        sumi = q2_dp4a(vi1, u1, sumi);
+        suma = q2_dp4a(0x01010101, u0, suma);
+        suma = q2_dp4a(0x01010101, u1, suma);
+    }
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(blk)) *
+                    strata::kernels::f32_from_f16((uint16_t) k_u16(x0));
+    return d * (float) (sumi - 16 * suma);
+}
+
+float q50_row(const uint8_t* row, const uint8_t* col, int n_in) {
+    float lane[32] = {};
+    const int npart = (n_in / 32) * 2;
+    for (int k = 0; k < npart; ++k) {
+        const int kbx = k / 2;
+        lane[k & 31] += q50_partial(row + (size_t) kbx * 22, col + (size_t) kbx * 36, 2 * (k % 2));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float nxt[32];
+        for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ o];
+        std::memcpy(lane, nxt, sizeof lane);
+    }
+    return lane[0];
+}
+
+void q50_ref(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    const size_t row = (size_t) (n_in / 32) * 22;
+    for (int r = 0; r < n_out; ++r) y[r] = q50_row(w + (size_t) r * row, x, n_in);
+}
+
+void dequant_q50(const uint8_t* block, float* out) {
+    const float d = strata::kernels::f32_from_f16((uint16_t) k_u16(block));
+    const uint32_t h = (uint32_t) q2_ld(block + 2);
+    const uint8_t* qs = block + 6;
+    for (int j = 0; j < 16; ++j) {
+        const int x0 = (int) (qs[j] & 0x0F) | (int) (((h >> j) & 1u) << 4);
+        const int x1 = (int) (qs[j] >> 4) | (int) (((h >> (j + 16)) & 1u) << 4);
+        out[j] = (float) (x0 - 16) * d;
+        out[j + 16] = (float) (x1 - 16) * d;
+    }
+}
+
+void q50_scalar(const uint8_t* w, const uint8_t* x, int n_in, int n_out, float* y) {
+    std::vector<float> act((size_t) n_in), rowv((size_t) n_in);
+    q8_dequant(x, n_in, act.data());
+    const size_t bytes = (size_t) (n_in / 32) * 22;
+    for (int r = 0; r < n_out; ++r) {
+        const uint8_t* src = w + (size_t) r * bytes;
+        for (int b = 0; b < n_in / 32; ++b) dequant_q50(src + (size_t) b * 22, rowv.data() + (size_t) b * 32);
+        double acc = 0;
+        for (int i = 0; i < n_in; ++i) acc += (double) rowv[(size_t) i] * (double) act[(size_t) i];
+        y[r] = (float) acc;
+    }
+}
+
+using RowRef = void (*)(const uint8_t*, const uint8_t*, int, int, float*);
+
+void check_rows(const char* match_name, const char* move_name, const uint8_t* w, uint64_t nbytes, int n_in, int n_out,
+                int ggml, int flip_at, RowRef iref, RowRef sref) {
+    size_t row = 0;
+    bool layout = false;
+    if (w && n_in > 0 && n_out > 0) {
+        row = iq_row_bytes(ggml, n_in);
+        layout = nbytes == (uint64_t) n_out * row;
+    }
+    std::vector<float> x((size_t) n_in);
+    for (int i = 0; i < n_in; ++i) x[(size_t) i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    Bytes xf((uint64_t) n_in * 4);
+    if (n_in > 0) std::memcpy(xf.data(), x.data(), xf.size());
+    Bytes xq(n_in > 0 ? iq_q8_1_bytes(n_in) : 0);
+    if (n_in > 0) iq_quantize_q8_1(xf, n_in, xq);
+    std::vector<uint8_t> xqb((size_t) xq.size());
+    if (!xqb.empty()) std::memcpy(xqb.data(), xq.data(), xqb.size());
+    std::vector<float> got((size_t) n_out), host((size_t) n_out), scalar((size_t) n_out);
+    double rel = 1, irel = 1;
+    bool ok = false;
+    if (layout) {
+        Bytes dw(nbytes);
+        std::memcpy(dw.data(), w, nbytes);
+        Bytes dy((uint64_t) n_out * 4);
+        iq_mmvq(ggml, dw, 0, xq, n_in, n_out, 1, dy);
+        std::memcpy(got.data(), dy.data(), got.size() * 4);
+        iref(w, xqb.data(), n_in, n_out, host.data());
+        irel = rel_l1(host.data(), got.data(), n_out);
+        if (sref) {
+            sref(w, xqb.data(), n_in, n_out, scalar.data());
+            rel = rel_l1(scalar.data(), got.data(), n_out);
+        }
+        ok = all_finite(got.data(), n_out) && irel <= 1e-5 && (!sref || rel <= 1e-5);
+    }
+    char detail[120];
+    if (sref) std::snprintf(detail, sizeof detail, "rel %.3e, integer %.3e, %d rows", rel, irel, n_out);
+    else std::snprintf(detail, sizeof detail, "rel %.3e, %d rows", irel, n_out);
+    verdict(match_name, layout && ok, layout ? detail : "bytes");
+
+    int moved = 0;
+    bool zero_clear = false;
+    int from_zero = 0;
+    if (ok) {
+        Bytes dw(nbytes);
+        std::memcpy(dw.data(), w, nbytes);
+        static_cast<uint8_t*>(dw.data())[flip_at] ^= 1u;
+        Bytes dy((uint64_t) n_out * 4);
+        iq_mmvq(ggml, dw, 0, xq, n_in, n_out, 1, dy);
+        const float* yp = static_cast<const float*>(dy.data());
+        for (int i = 0; i < n_out; ++i)
+            if (yp[i] != got[(size_t) i]) ++moved;
+        Bytes zx(xq.size());
+        std::memset(zx.data(), 0, zx.size());
+        iq_mmvq(ggml, dw, 0, zx, n_in, n_out, 1, dy);
+        const float* zp = static_cast<const float*>(dy.data());
+        zero_clear = true;
+        for (int i = 0; i < n_out; ++i) {
+            if (zp[i] != 0.f) zero_clear = false;
+            if (got[(size_t) i] != 0.f) ++from_zero;
+        }
+    }
+    char move_detail[80];
+    std::snprintf(move_detail, sizeof move_detail, "%d of %d differ, zero %d", moved, n_out, from_zero);
+    verdict(move_name, ok && moved > 0 && zero_clear && from_zero == n_out, move_detail);
+}
+
 void run_kquant() {
     std::printf("\nQ4_K and Q5_K ggml blocks\n");
     std::mt19937 rng(20261014);
@@ -3085,6 +3325,28 @@ void run_kquant() {
             n_out, false, 16);
     check_k("a Q5_K block matches the dequant", "a changed Q5_K code moves that block", q5.data(), q5.size(), n_in,
             n_out, true, 48);
+
+    std::printf("\nQ3_K and Q5_0 ggml blocks\n");
+    const int q3_in = 512;
+    const int q3_out = 8;
+    const int q50_in = 128;
+    const int q50_out = 8;
+    std::vector<uint8_t> q3((size_t) q3_out * (q3_in / 256) * 110);
+    std::vector<uint8_t> q50((size_t) q50_out * (q50_in / 32) * 22);
+    for (uint8_t& b : q3) b = (uint8_t) rng();
+    for (uint8_t& b : q50) b = (uint8_t) rng();
+    for (size_t off = 0; off < q3.size(); off += 110) {
+        q3[off + 108] = 0x00;
+        q3[off + 109] = 0x3C;
+    }
+    for (size_t off = 0; off < q50.size(); off += 22) {
+        q50[off + 0] = 0x00;
+        q50[off + 1] = 0x3C;
+    }
+    check_rows("a Q3_K block matches the dequant", "a changed Q3_K code moves that block", q3.data(), q3.size(), q3_in,
+               q3_out, kQ3_K, 32, q3_ref, q3_scalar);
+    check_rows("a Q5_0 block matches the dequant", "a changed Q5_0 code moves that block", q50.data(), q50.size(),
+               q50_in, q50_out, kQ5_0, 6, q50_ref, q50_scalar);
 }
 
 // One GDN step from a zero state. The projections are the ggml dots. The middle is the
@@ -3376,6 +3638,225 @@ FfnHalf layer0_ffn_host(const float* R, const float* norm_w, const uint16_t* dow
 
 // Layer 0 of the Q2_0 extract. The other 47 layers are not in the directory.
 // The loader does not open the GGUF. A missing directory skips this section.
+// Gate is IQ4_XS, up is Q3_K, down is Q5_0, and the scalar is one bf16 row.
+// The layer-0 pass does not read these rows. The S-form runner still refuses code_bits 0.
+void run_shared_rows(const PackTable& table, const strata::core::ModelGeometry& g) {
+    std::printf("\nshared-expert rows from the extracted pack\n");
+    const int n_embd = (int) g.n_embd;
+    const int n_ff = (int) g.n_ff;
+    auto plane = [&](const char* name, uint64_t nbytes, int64_t ne0, int64_t ne1) -> const PackTensor* {
+        const PackTensor* t = table.find(name);
+        if (!t || !t->values || t->code_bits != 0 || t->ne0 != ne0 || t->ne1 != ne1 || t->values->size() != nbytes)
+            return nullptr;
+        return t;
+    };
+    const PackTensor* gate = plane("blk.0.ffn_gate_shexp.weight", 870400, n_embd, n_ff);
+    const PackTensor* up = plane("blk.0.ffn_up_shexp.weight", 704000, n_embd, n_ff);
+    const PackTensor* down = plane("blk.0.ffn_down_shexp.weight", 1126400, n_ff, n_embd);
+    const PackTensor* ginp = table.find("blk.0.ffn_gate_inp_shexp.weight");
+    const bool ginp_ok = ginp && ginp->values && ginp->kind == strata::core::WeightKind::Bf16InF32 &&
+                         ginp->code_bits == 0 && ginp->ne0 == n_embd && ginp->ne1 == 1 &&
+                         ginp->values->size() == (uint64_t) n_embd * 2;
+    check_rows("the IQ4_XS shared gate rows match", "a changed IQ4_XS code moves the shared gate",
+               gate ? static_cast<const uint8_t*>(gate->values->data()) : nullptr, gate ? gate->values->size() : 0,
+               n_embd, n_ff, kIq4Xs, 8, xs_ref, nullptr);
+    check_rows("the Q3_K shared up rows match", "a changed Q3_K code moves the shared up",
+               up ? static_cast<const uint8_t*>(up->values->data()) : nullptr, up ? up->values->size() : 0, n_embd,
+               n_ff, kQ3_K, 32, q3_ref, q3_scalar);
+    check_rows("the Q5_0 shared down rows match", "a changed Q5_0 code moves the shared down",
+               down ? static_cast<const uint8_t*>(down->values->data()) : nullptr, down ? down->values->size() : 0,
+               n_ff, n_embd, kQ5_0, 6, q50_ref, q50_scalar);
+
+    Bytes x((uint64_t) n_embd * 4);
+    auto* xp = static_cast<float*>(x.data());
+    for (int i = 0; i < n_embd; ++i) xp[i] = ((i * 17) % 29) * 0.02f - 0.2f;
+    std::string sgot = "bytes";
+    bool srefused = false;
+    bool sheld = false;
+    if (gate && up && down && ginp_ok) {
+        Bytes out((uint64_t) (n_embd + 1) * 4);
+        std::fill_n(static_cast<float*>(out.data()), (size_t) (n_embd + 1), 7.f);
+        srefused = threw("S2/S4/S8", [&] { run_shared_expert(table, g, 0, x, out); }, sgot);
+        sheld = still_seven(static_cast<const float*>(out.data()), n_embd + 1);
+    }
+    verdict("the S-form shared expert refuses these rows", srefused && sheld, sgot);
+
+    std::string egot;
+    const bool erefused = threw(
+        "not a Coder expert type", [&] { iq_expert_bytes(IqExpert{kQ3_K, kQ5_0, n_embd, n_ff}); }, egot);
+    verdict("a Q3_K gate is refused", erefused, egot);
+
+    const bool rows = gate && up && down && ginp_ok;
+    bool ok = false;
+    bool repeat = false;
+    bool cleared = false;
+    bool flipped = false;
+    std::string detail = "bytes";
+    std::string repeat_detail = "bytes";
+    std::string zero_detail = "bytes";
+    std::string flip_detail = "bytes";
+    if (rows) {
+        try {
+            struct SeN {
+                int n;
+                int pad0;
+                int pad1;
+                int pad2;
+            };
+            static_assert(sizeof(SeN) == 16, "SeN must match the shader");
+            const int guard = 1;
+            Bytes gate_y((uint64_t) n_ff * 4), up_y((uint64_t) n_ff * 4), down_y((uint64_t) n_embd * 4);
+            Bytes hq(iq_q8_1_bytes(n_ff)), scalar(4);
+            Bytes y((uint64_t) (n_embd + guard) * 4), y2((uint64_t) (n_embd + guard) * 4);
+            Bytes yz((uint64_t) (n_embd + guard) * 4), yf((uint64_t) (n_embd + guard) * 4);
+            auto forward = [&](const Bytes& act, const Bytes& down_w, Bytes& out) {
+                Bytes xq(iq_q8_1_bytes(n_embd));
+                iq_quantize_q8_1(act, n_embd, xq);
+                iq_mmvq(kIq4Xs, *gate->values, 0, xq, n_embd, n_ff, 1, gate_y);
+                iq_mmvq(kQ3_K, *up->values, 0, xq, n_embd, n_ff, 1, up_y);
+                iq_swiglu_q8(gate_y, up_y, n_ff, hq);
+                iq_mmvq(kQ5_0, down_w, 0, hq, n_ff, n_embd, 1, down_y);
+                std::fill_n(static_cast<float*>(out.data()), (size_t) (n_embd + guard), 7.f);
+                std::memcpy(out.data(), down_y.data(), (size_t) n_embd * 4);
+                Bytes x_bf16((uint64_t) n_embd * 2);
+                f32_to_bf16_bulk(act, x_bf16, n_embd);
+                bf16_gemv(x_bf16, *ginp->values, scalar, n_embd, 1);
+                const SeN dim{n_embd, 0, 0, 0};
+                const uint32_t groups = (uint32_t) ((n_embd + 255) / 256);
+                const Bytes* sc[] = {&out, &scalar};
+                launch("se_sigmoid_scale", sc, 2, &dim, sizeof dim, Grid{groups, 1, 1, 256, 1, 1});
+            };
+            forward(x, *down->values, y);
+            std::vector<float> got_gate((size_t) n_ff), got_up((size_t) n_ff), got_down((size_t) n_embd);
+            std::vector<float> got_y((size_t) n_embd);
+            std::vector<uint8_t> got_hq((size_t) hq.size());
+            std::memcpy(got_gate.data(), gate_y.data(), got_gate.size() * 4);
+            std::memcpy(got_up.data(), up_y.data(), got_up.size() * 4);
+            std::memcpy(got_down.data(), down_y.data(), got_down.size() * 4);
+            std::memcpy(got_y.data(), y.data(), got_y.size() * 4);
+            std::memcpy(got_hq.data(), hq.data(), got_hq.size());
+            const float got_s = static_cast<const float*>(scalar.data())[0];
+
+            Bytes xq(iq_q8_1_bytes(n_embd));
+            iq_quantize_q8_1(x, n_embd, xq);
+            std::vector<uint8_t> xqb((size_t) xq.size());
+            std::memcpy(xqb.data(), xq.data(), xqb.size());
+            const uint8_t* gate_b = static_cast<const uint8_t*>(gate->values->data());
+            const uint8_t* up_b = static_cast<const uint8_t*>(up->values->data());
+            const uint8_t* down_b = static_cast<const uint8_t*>(down->values->data());
+            std::vector<float> host_gate((size_t) n_ff), host_up((size_t) n_ff), host_down((size_t) n_embd);
+            xs_ref(gate_b, xqb.data(), n_embd, n_ff, host_gate.data());
+            q3_ref(up_b, xqb.data(), n_embd, n_ff, host_up.data());
+            q50_ref(down_b, got_hq.data(), n_ff, n_embd, host_down.data());
+            std::vector<float> rounded((size_t) n_embd);
+            for (int i = 0; i < n_embd; ++i) rounded[(size_t) i] = round_bf16(xp[i]);
+            const float host_s = bf16_dot(rounded.data(), static_cast<const uint16_t*>(ginp->values->data()), n_embd);
+            const float sig = gdn_sigmoid(host_s);
+            std::vector<float> host_y((size_t) n_embd);
+            for (int i = 0; i < n_embd; ++i) host_y[(size_t) i] = host_down[(size_t) i] * sig;
+
+            std::vector<float> hidden((size_t) n_ff);
+            for (int i = 0; i < n_ff; ++i) hidden[(size_t) i] = gdn_silu(host_gate[(size_t) i]) * host_up[(size_t) i];
+            Bytes hf((uint64_t) n_ff * 4);
+            std::memcpy(hf.data(), hidden.data(), hf.size());
+            Bytes hqq(iq_q8_1_bytes(n_ff));
+            iq_quantize_q8_1(hf, n_ff, hqq);
+            std::vector<uint8_t> hqb((size_t) hqq.size());
+            std::memcpy(hqb.data(), hqq.data(), hqb.size());
+            std::vector<float> chain_down((size_t) n_embd), chain((size_t) n_embd);
+            q50_ref(down_b, hqb.data(), n_ff, n_embd, chain_down.data());
+            for (int i = 0; i < n_embd; ++i) chain[(size_t) i] = chain_down[(size_t) i] * sig;
+
+            const double gate_rel = rel_l1(host_gate.data(), got_gate.data(), n_ff);
+            const double up_rel = rel_l1(host_up.data(), got_up.data(), n_ff);
+            const double down_rel = rel_l1(host_down.data(), got_down.data(), n_embd);
+            const double scale_rel = rel_l1(&host_s, &got_s, 1);
+            const double write_rel = rel_l1(host_y.data(), got_y.data(), n_embd);
+            const double chain_rel = rel_l1(chain.data(), got_y.data(), n_embd);
+
+            forward(x, *down->values, y2);
+            Bytes zero_x((uint64_t) n_embd * 4);
+            std::memset(zero_x.data(), 0, (size_t) zero_x.size());
+            forward(zero_x, *down->values, yz);
+
+            int flip_at = 6;
+            Bytes down_flip(down->values->size());
+            std::memcpy(down_flip.data(), down->values->data(), down_flip.size());
+            static_cast<uint8_t*>(down_flip.data())[flip_at] ^= 1u;
+            forward(x, down_flip, yf);
+            int flipped_n = differ_floats(got_y.data(), static_cast<const float*>(yf.data()), n_embd);
+            if (flipped_n == 0) {
+                const size_t drow = iq_row_bytes(kQ5_0, n_ff);
+                std::vector<uint8_t> one(drow);
+                bool found = false;
+                for (int r = 0; r < n_embd && !found; ++r) {
+                    const uint8_t* src = down_b + (size_t) r * drow;
+                    const float base = q50_row(src, got_hq.data(), n_ff);
+                    for (int b = 0; b < (int) drow; ++b) {
+                        if (b % 22 < 6) continue;
+                        std::memcpy(one.data(), src, drow);
+                        one[(size_t) b] ^= 1u;
+                        if (q50_row(one.data(), got_hq.data(), n_ff) != base) {
+                            flip_at = r * (int) drow + b;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) {
+                    std::memcpy(down_flip.data(), down->values->data(), down_flip.size());
+                    static_cast<uint8_t*>(down_flip.data())[flip_at] ^= 1u;
+                    forward(x, down_flip, yf);
+                    flipped_n = differ_floats(got_y.data(), static_cast<const float*>(yf.data()), n_embd);
+                }
+            }
+
+            const float* y2p = static_cast<const float*>(y2.data());
+            const float* yzp = static_cast<const float*>(yz.data());
+            const float* yfp = static_cast<const float*>(yf.data());
+            const bool guard_held = static_cast<const float*>(y.data())[n_embd] == 7.f && y2p[n_embd] == 7.f &&
+                                    yzp[n_embd] == 7.f && yfp[n_embd] == 7.f;
+            int zeros = 0;
+            for (int i = 0; i < n_embd; ++i)
+                if (yzp[i] == 0.f) ++zeros;
+            const int again = differ_floats(got_y.data(), y2p, n_embd);
+            const int apart = differ_floats(got_y.data(), yzp, n_embd);
+            const double apart_rel = rel_l1(got_y.data(), yzp, n_embd);
+            const bool live = all_finite(got_gate.data(), n_ff) && all_finite(got_up.data(), n_ff) &&
+                              all_finite(got_down.data(), n_embd) && all_finite(got_y.data(), n_embd) &&
+                              std::isfinite(got_s) && std::isfinite(host_s) && all_finite(host_y.data(), n_embd) &&
+                              all_finite(chain.data(), n_embd) && all_finite(y2p, n_embd) && all_finite(yzp, n_embd) &&
+                              all_finite(yfp, n_embd) && !still_seven(got_y.data(), n_embd);
+            ok = live && guard_held && gate_rel <= 1e-5 && up_rel <= 1e-5 && down_rel <= 1e-5 && scale_rel <= 1e-4 &&
+                 write_rel <= 1e-4;
+            repeat = live && guard_held && again == 0;
+            cleared = live && guard_held && zeros == n_embd && apart > 0 && std::isfinite(apart_rel);
+            flipped = live && guard_held && flipped_n > 0;
+            char buf[240];
+            std::snprintf(buf, sizeof buf,
+                          "gate %.3e, up %.3e, down %.3e, scale %.3e, write %.3e, chain %.3e", gate_rel, up_rel,
+                          down_rel, scale_rel, write_rel, chain_rel);
+            detail = buf;
+            std::snprintf(buf, sizeof buf, "%d differ, guard %d", again, guard_held ? 1 : 0);
+            repeat_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d are zero, %d differ, %.2f%% apart", zeros, n_embd, apart,
+                          apart_rel * 100.0);
+            zero_detail = buf;
+            std::snprintf(buf, sizeof buf, "%d of %d differ, byte %d", flipped_n, n_embd, flip_at);
+            flip_detail = buf;
+        } catch (const MetalError& e) {
+            detail = e.what();
+            repeat_detail = e.what();
+            zero_detail = e.what();
+            flip_detail = e.what();
+        }
+    }
+    verdict("the shared expert matches", rows && ok, detail);
+    verdict("that shared expert repeats", rows && repeat, repeat_detail);
+    verdict("a zero activation clears the shared expert", rows && cleared, zero_detail);
+    verdict("a changed down code moves the shared expert", rows && flipped, flip_detail);
+}
+
 void run_q2_layer() {
     const char* env = std::getenv("STRATA_Q2_LAYER");
     const bool asked = env != nullptr && env[0] != '\0';
@@ -4188,6 +4669,8 @@ void run_q2_layer() {
     verdict("that layer-0 pass repeats", pass_bytes && pass_repeat, pass_repeat_detail);
     verdict("a zero residual moves the layer-0 pass", pass_bytes && pass_moved, pass_move_detail);
     verdict("a changed query code moves the layer-0 pass", pass_bytes && pass_flipped, pass_flip_detail);
+
+    run_shared_rows(table, g);
 }
 
 }  // namespace
@@ -4202,7 +4685,7 @@ int main(int argc, char** argv) {
         "pack: index conversions, one product on loaded bytes, name checks, one embedding row, one shared expert, "
         "one routed expert, one 2-bit query, one stack token, one model layer, one IQ4_XS query, "
         "one Q4_K gate, one Q5_K output, one GDN step, one attention half, one feed-forward half, "
-        "one layer-0 pass\n\n");
+        "one layer-0 pass, one shared expert\n\n");
     try {
         run_conversions();
         run_refusals();

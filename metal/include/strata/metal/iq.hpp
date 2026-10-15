@@ -20,9 +20,13 @@ constexpr int kIq3S = 21;
 constexpr int kIq2S = 22;
 constexpr int kIq4Xs = 23;
 constexpr int kQ2_0 = 42;
-// ggml super-blocks. The dense gate is Q4_K and the dense output is Q5_K. These are not S-form rows.
+// ggml blocks that are not a Coder expert type. The dense gate is Q4_K and the dense output is Q5_K.
+// The shared-expert up row is Q3_K and the shared-expert down row is Q5_0. iq_mmvq dispatches them.
+// iq_type_supported stays false, so iq_expert still refuses them.
 constexpr int kQ4_K = 12;
 constexpr int kQ5_K = 13;
+constexpr int kQ3_K = 11;
+constexpr int kQ5_0 = 6;
 
 bool iq_type_supported(int ggml_type) noexcept;
 // Values in one block. IQ4_NL is 32, Q2_0 is 64, the others are 256.
