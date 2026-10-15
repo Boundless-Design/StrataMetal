@@ -7775,33 +7775,99 @@ Bytes load_tensor(const ModelTensors& m, const LayerTensor& t) {
     return b;
 }
 
+// Where the quant codes sit inside one ggml block. `lo`/`hi` is the code span and `probe` is the byte
+// check_product flips. A scale byte can change the host product's fp16 and still vanish once the value is
+// stored as fp16, so the search prefers this span.
+struct FlipWin {
+    int lo = 0;
+    int hi = 0;
+    int probe = -1;
+};
+
+FlipWin flip_win(int type) {
+    switch (type) {
+    case kIq4Xs: return {8, 136, 8};
+    case kQ3_K: return {32, 96, 32};
+    case kQ2_0: return {2, 18, 2};
+    case kQ4_K: return {16, 144, 16};
+    case kQ5_K: return {16, 176, 48};
+    case kQ4_0: return {2, 18, 2};
+    case kQ5_0: return {2, 22, 6};
+    case kQ8_0: return {2, 34, 2};
+    case kQ6_K: return {0, 210, 0};
+    case kIq4Nl: return {2, 18, 2};
+    default: return {};
+    }
+}
+
 // Up to `want` byte offsets inside `plane` whose one-bit flip changes that row's host product once rounded to
-// fp16, searched from row `row0` for `rows` rows. A flip that rounds away in fp16 cannot move a GPU result that
-// is stored as fp16, so it is not worth a GPU pass. `xq` is a Q8_1 activation of `n_in` values.
+// fp16. Rows are spread across `[row0, row0 + rows)` and each candidate is the flip with the largest host
+// change on its row, so a dead first row is not the only one offered to the GPU. A flip that rounds away in
+// fp16 cannot move a GPU result that is stored as fp16. `xq` is a Q8_1 activation of `n_in` values.
 std::vector<int64_t> moving_bytes(int type, const uint8_t* plane, uint64_t plane_bytes, int n_in, int64_t row0,
                                   int64_t rows, const uint8_t* xq, size_t want) {
     std::vector<int64_t> out;
     const RowRef ref = host_ref(type);
     const size_t rb = row_bytes_or_0(type, n_in);
-    if (!ref || rb == 0) return out;
-    for (int64_t r = row0; r < row0 + rows && out.size() < want; ++r) {
+    if (!ref || rb == 0 || rows <= 0 || want == 0) return out;
+    const size_t bs = iq_block_bytes(type);
+    const FlipWin win = flip_win(type);
+    std::vector<size_t> probes;
+    auto addp = [&](size_t o) {
+        if (o < rb && std::find(probes.begin(), probes.end(), o) == probes.end()) probes.push_back(o);
+    };
+    if (win.probe >= 0 && bs > 0 && rb >= bs) {
+        const size_t nblk = rb / bs;
+        const size_t picks[] = {0, 1, nblk / 2, nblk - 1};
+        for (size_t b : picks) {
+            if (b >= nblk) continue;
+            addp(b * bs + (size_t) win.probe);
+            if (win.probe + 16 < win.hi) addp(b * bs + (size_t) win.probe + 16);
+        }
+        // IQ4_XS byte 2 is the extra scale. On a query row a code nibble dies in the norm and this byte does not.
+        if (type == kIq4Xs) {
+            addp(2);
+            addp((nblk / 2) * bs + 2);
+        }
+    }
+    const size_t frac[] = {rb / 2, rb / 3, (rb * 2) / 3, rb / 5, (rb * 3) / 4, rb / 7, rb > 0 ? rb - 1 : 0, rb / 9};
+    for (size_t o : frac) addp(o);
+
+    struct Hit {
+        int64_t at = 0;
+        float mag = 0.f;
+    };
+    std::vector<Hit> hits;
+    const int64_t scan_n = std::min(rows, (int64_t) 48);
+    for (int64_t i = 0; i < scan_n; ++i) {
+        const int64_t r = row0 + (scan_n == rows ? i : (i * rows) / scan_n);
         if ((uint64_t) (r + 1) * rb > plane_bytes) break;
         const uint8_t* rowp = plane + (size_t) r * rb;
         float base = 0.f;
         ref(rowp, xq, n_in, 1, &base);
+        if (!std::isfinite(base)) continue;
         const uint16_t base16 = strata::kernels::f16_from_f32(base);
         std::vector<uint8_t> tmp(rowp, rowp + rb);
-        const size_t probes[] = {rb / 2, rb / 3, (rb * 2) / 3, rb / 5, (rb * 3) / 4, rb / 7, rb - 1, rb / 9};
+        Hit best;
+        bool any = false;
         for (size_t off : probes) {
             tmp[off] ^= 1u;
             float alt = 0.f;
             ref(tmp.data(), xq, n_in, 1, &alt);
             tmp[off] ^= 1u;
-            if (std::isfinite(alt) && strata::kernels::f16_from_f32(alt) != base16) {
-                out.push_back(r * (int64_t) rb + (int64_t) off);
-                break;
+            if (!std::isfinite(alt) || strata::kernels::f16_from_f32(alt) == base16) continue;
+            const float mag = std::fabs(alt - base);
+            if (!any || mag > best.mag) {
+                best = Hit{r * (int64_t) rb + (int64_t) off, mag};
+                any = true;
             }
         }
+        if (any) hits.push_back(best);
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.mag > b.mag; });
+    for (const Hit& h : hits) {
+        if (out.size() >= want) break;
+        out.push_back(h.at);
     }
     return out;
 }
@@ -7979,7 +8045,8 @@ void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core
             const int conv_moved = differ_floats(gpu_conv.data(), zeros_c.data(), conv_n);
             step(R, out2);
             step(zero_r, outz);
-            // Flip quant bytes on value rows first, then key rows: an early query-row flip dies in the norm.
+            // Value rows, then key rows, then query rows. A query-row code nibble often dies in the norm, so it
+            // is tried only after the value and key candidates.
             const int qk = (int) (lg.S * lg.h_k);
             const Bytes xq = q8_of(gpu_mixed.data(), n_embd);
             const std::vector<uint8_t> xqb = bytes_of(xq);
@@ -7988,7 +8055,10 @@ void walk_gdn(const ModelTensors& m, int L, const char* from, const strata::core
                              (int64_t) g.ssm_conv_channels - 2 * qk, xqb.data(), 6);
             const std::vector<int64_t> key_rows =
                 moving_bytes(qkv_ty, static_cast<const uint8_t*>(qkv.data()), qkv.size(), n_embd, qk, qk, xqb.data(), 4);
+            const std::vector<int64_t> query_rows =
+                moving_bytes(qkv_ty, static_cast<const uint8_t*>(qkv.data()), qkv.size(), n_embd, 0, qk, xqb.data(), 4);
             candidates.insert(candidates.end(), key_rows.begin(), key_rows.end());
+            candidates.insert(candidates.end(), query_rows.begin(), query_rows.end());
             int64_t flip_at = -1;
             int flip_n = 0;
             Bytes flipped((uint64_t) qkv.size());
