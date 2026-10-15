@@ -5,8 +5,11 @@
 // routed experts, the 2-bit shared expert, the combine, and the write. The output mix is a
 // gated residual with no injection, then a Q8_K projection. The sampler draws the id.
 //
-// This is one block. It is not the 48-layer model, and it does not start the draft model
-// or the Python server.
+// draft_token is a different call. It pairs one caller residual with the next token, builds
+// the layer residual, and then runs that same block. It is one cell. It is not a loaded
+// MTP runtime.
+//
+// This is one block. It is not the 48-layer model, and it does not start the Python server.
 #pragma once
 
 #include "strata/metal/gr.hpp"
@@ -62,6 +65,21 @@ struct TokenWeights {
     QsaPlane out;
 };
 
+// One square projection. The activation is Q8_0. The norm is stored already as 1 + w.
+// embedding.norm has n_embd values. hidden.norm has hc * n_embd values.
+struct DraftFc {
+    SForm form;
+    const Bytes* codes = nullptr;
+    const Bytes* scales = nullptr;
+    const Bytes* offset = nullptr;
+    const Bytes* norm = nullptr;
+};
+
+struct DraftWeights {
+    DraftFc embedding;
+    DraftFc hidden;
+};
+
 struct TokenState {
     Bytes* R = nullptr;  // hc * n_embd floats
     QsaLayerState qsa;
@@ -91,6 +109,11 @@ struct TokenScratch {
     Bytes head_q8k;
     Bytes logits;
     Bytes sampled;
+    Bytes draft_hidden;
+    Bytes draft_row;
+    Bytes draft_e;
+    Bytes draft_h;
+    Bytes draft_q8;
 };
 
 TokenScratch make_token_scratch(const TokenGeom& g);
@@ -108,5 +131,18 @@ void lm_head_logits(const TokenGeom& g, const TokenWeights& w, TokenState& st, T
 // Embed, one block, the output projection, one sample. Returns the id.
 int generate_token(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenScratch& sc, int token, int pos,
                    int pos_base, const SamplerParams& sp, const Bytes* history, int history_len);
+
+// One draft step. `residual` is the caller's final multi-stream residual at this cell and is
+// not written. `token` is the token at the next position. Rope position is pos_base + pos.
+// The layer's own K/V is st.qsa. The sampled id is the draft for the position after that.
+//
+// The embedding row is normalized and projected. The whole residual is normalized, then each
+// stream is projected by the same hidden weight. The layer residual is that projection plus
+// the embedding projection on every stream. One block and the output projection follow.
+// The two projections are 4-bit or 8-bit S-form with a Q8_0 activation. The shared expert
+// is the 2-bit function. This is one cell, not a loaded MTP runtime.
+int draft_token(const TokenGeom& g, const TokenWeights& w, const DraftWeights& d, const Bytes& residual,
+                TokenState& st, TokenScratch& sc, int token, int pos, int pos_base, const SamplerParams& sp,
+                const Bytes* history, int history_len);
 
 }  // namespace strata::metal

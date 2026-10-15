@@ -89,7 +89,7 @@ struct PlaneBuf {
     Bytes offs;
 };
 
-PlaneBuf make_plane(int n_in, int n_out, std::mt19937& rng) {
+PlaneBuf make_plane(int n_in, int n_out, std::mt19937& rng, float scale = 0.01f) {
     const int per_byte = 2;
     std::vector<uint8_t> codes((size_t) n_out * (size_t) (n_in / per_byte));
     for (uint8_t& v : codes) v = (uint8_t) (rng() & 0xFF);
@@ -97,7 +97,7 @@ PlaneBuf make_plane(int n_in, int n_out, std::mt19937& rng) {
     std::vector<float> scales((size_t) n_out * (size_t) n_groups);
     std::vector<float> offs(scales.size());
     std::normal_distribution<float> g(0.0f, 1.0f);
-    for (float& v : scales) v = 0.01f + 0.001f * (float) (rng() % 20);
+    for (float& v : scales) v = scale + 0.001f * (float) (rng() % 20);
     for (float& v : offs) v = 0.02f * g(rng);
     return PlaneBuf{affine4(), upload(codes.data(), codes.size()), upload(scales.data(), scales.size() * 4u),
                     upload(offs.data(), offs.size() * 4u)};
@@ -188,17 +188,8 @@ TokenState bind_state(Owned& o, const Bytes& table) {
     return st;
 }
 
-void run_spec(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenScratch& sc, int token, int pos,
-              int pos_base, Trap trap) {
-    embedding_gather(*w.emb_codes, *w.emb_scales, w.emb_offsets, g.n_embd, g.emb_code_bits, g.emb_code_bias,
-                     g.emb_group, token, sc.emb, 0);
-    auto* R = static_cast<float*>(st.R->data());
-    const auto* emb = static_cast<const float*>(sc.emb.data());
-    const int streams = trap == Trap::OneStream ? 1 : (int) g.hc;
-    for (int c = 0; c < (int) g.hc; ++c) {
-        if (c < streams) std::memcpy(R + (size_t) c * (size_t) g.n_embd, emb, (size_t) g.n_embd * 4u);
-        else std::memset(R + (size_t) c * (size_t) g.n_embd, 0, (size_t) g.n_embd * 4u);
-    }
+void run_block_spec(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenScratch& sc, int pos,
+                    int pos_base, Trap trap) {
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     gr_read(gs, *st.R, *w.attn.norm, *w.attn.down, *w.attn.up, w.attn.inject, 1e-6f, false, sc.gr, sc.mixed,
             sc.inject);
@@ -237,6 +228,94 @@ void run_spec(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenSc
     s_gemv_q8k_split(sc.head_q8k, *w.out.codes, *w.out.scales, off, sc.logits, g.n_embd, g.n_vocab, w.out.form);
 }
 
+void run_spec(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenScratch& sc, int token, int pos,
+              int pos_base, Trap trap) {
+    embedding_gather(*w.emb_codes, *w.emb_scales, w.emb_offsets, g.n_embd, g.emb_code_bits, g.emb_code_bias,
+                     g.emb_group, token, sc.emb, 0);
+    auto* R = static_cast<float*>(st.R->data());
+    const auto* emb = static_cast<const float*>(sc.emb.data());
+    const int streams = trap == Trap::OneStream ? 1 : (int) g.hc;
+    for (int c = 0; c < (int) g.hc; ++c) {
+        if (c < streams) std::memcpy(R + (size_t) c * (size_t) g.n_embd, emb, (size_t) g.n_embd * 4u);
+        else std::memset(R + (size_t) c * (size_t) g.n_embd, 0, (size_t) g.n_embd * 4u);
+    }
+    run_block_spec(g, w, st, sc, pos, pos_base, trap);
+}
+
+enum class DraftTrap { None, OneStream, SkipHidden };
+
+void run_draft_spec(const TokenGeom& g, const TokenWeights& w, const DraftWeights& d, const Bytes& residual,
+                    TokenState& st, TokenScratch& sc, int token, int pos, int pos_base, DraftTrap trap) {
+    const int64_t n = g.n_embd;
+    const uint64_t nbytes = (uint64_t) g.hc * (uint64_t) n * 4u;
+    embedding_gather(*w.emb_codes, *w.emb_scales, w.emb_offsets, g.n_embd, g.emb_code_bits, g.emb_code_bias,
+                     g.emb_group, token, sc.emb, 0);
+    rms_norm_weighted(sc.emb, d.embedding.norm, 1, n, 1e-6f);
+    Bytes q8(q8_0_bytes(n));
+    Bytes ebuf((uint64_t) n * 4u);
+    quantize_q8_0(sc.emb, n, q8);
+    const Bytes* eoff = d.embedding.form.has_offset ? d.embedding.offset : nullptr;
+    s_gemv_q8_0_split(q8, *d.embedding.codes, *d.embedding.scales, eoff, ebuf, n, n, d.embedding.form);
+
+    Bytes hidden(nbytes);
+    std::memcpy(hidden.data(), residual.data(), (size_t) nbytes);
+    rms_norm_weighted(hidden, d.hidden.norm, 1, g.hc * n, 1e-6f);
+
+    Bytes row((uint64_t) n * 4u);
+    Bytes hbuf((uint64_t) n * 4u);
+    auto* R = static_cast<float*>(st.R->data());
+    const auto* src = static_cast<const float*>(hidden.data());
+    const auto* e = static_cast<const float*>(ebuf.data());
+    for (int64_t c = 0; c < g.hc; ++c) {
+        const float* h = e;
+        if (trap != DraftTrap::SkipHidden) {
+            std::memcpy(row.data(), src + c * n, (size_t) n * 4u);
+            quantize_q8_0(row, n, q8);
+            const Bytes* hoff = d.hidden.form.has_offset ? d.hidden.offset : nullptr;
+            s_gemv_q8_0_split(q8, *d.hidden.codes, *d.hidden.scales, hoff, hbuf, n, n, d.hidden.form);
+            h = static_cast<const float*>(hbuf.data());
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            const float add = (trap == DraftTrap::OneStream && c > 0) ? 0.0f : e[i];
+            R[c * n + i] = (trap == DraftTrap::SkipHidden ? 0.0f : h[i]) + add;
+        }
+    }
+    run_block_spec(g, w, st, sc, pos, pos_base, Trap::None);
+}
+
+void fill_residual(Bytes& b, int kind, int64_t hc, int64_t n) {
+    auto* r = static_cast<float*>(b.data());
+    std::memset(r, 0, (size_t) hc * (size_t) n * sizeof(float));
+    if (kind == 0) {
+        for (int64_t c = 0; c < hc; ++c) {
+            float* s = r + c * n;
+            const float sign = (c % 2 == 0) ? 1.0f : -1.0f;
+            for (int i = 0; i < 32; ++i) s[(int) c * 8 + i] = sign;
+        }
+    } else if (kind == 1) {
+        float* s = r + n;
+        for (int i = 0; i < 16; ++i) s[i] = 1.0f;
+        for (int i = 64; i < 96; ++i) s[i] = -0.5f;
+    }
+}
+
+int n_differ(const float* a, const float* b, int n) {
+    int d = 0;
+    for (int i = 0; i < n; ++i)
+        if (a[i] != b[i]) ++d;
+    return d;
+}
+
+template <class F>
+bool throws_with(F&& fn, const char* needle) {
+    try {
+        fn();
+        return false;
+    } catch (const strata::metal::MetalError& e) {
+        return std::strstr(e.what(), needle) != nullptr;
+    }
+}
+
 }  // namespace
 
 using namespace strata::metal;
@@ -247,7 +326,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-metal-token [--selftest]\n");
         return 2;
     }
-    std::printf("token: one block, one greedy sample, synthetic weights\n\n");
+    std::printf("token: one block, one greedy sample, one draft step, synthetic weights\n\n");
     try {
         const int n_embd = 256;
         const int hc = 4;
@@ -505,6 +584,126 @@ int main(int argc, char** argv) {
         bad.qsa.n_embd = 200;
         verdict("an embedding that is not a multiple of 256 is refused",
                 throws_metal([&] { make_token_scratch(bad); }), "");
+
+        PlaneBuf fc_e = make_plane(n_embd, n_embd, rng);
+        PlaneBuf fc_h = make_plane(n_embd, n_embd, rng, 0.4f);
+        std::vector<float> nemb((size_t) n_embd), nhid((size_t) hc * (size_t) n_embd);
+        for (float& v : nemb) v = 1.0f + 0.05f * gauss(rng);
+        for (float& v : nhid) v = 1.0f + 0.05f * gauss(rng);
+        Bytes b_nemb = upload(nemb.data(), nemb.size() * 4u);
+        Bytes b_nhid = upload(nhid.data(), nhid.size() * 4u);
+        DraftWeights dw;
+        dw.embedding = DraftFc{fc_e.form, &fc_e.codes, &fc_e.scales, &fc_e.offs, &b_nemb};
+        dw.hidden = DraftFc{fc_h.form, &fc_h.codes, &fc_h.scales, &fc_h.offs, &b_nhid};
+
+        Bytes res_a((uint64_t) hc * (uint64_t) n_embd * 4u);
+        Bytes res_b((uint64_t) hc * (uint64_t) n_embd * 4u);
+        fill_residual(res_a, 0, hc, n_embd);
+        fill_residual(res_b, 1, hc, n_embd);
+        std::vector<float> res_saved((size_t) hc * (size_t) n_embd);
+        std::memcpy(res_saved.data(), res_a.data(), res_saved.size() * 4u);
+
+        Owned d_prod = make_owned();
+        Owned d_spec = make_owned();
+        Owned d_trap = make_owned();
+        Owned d_fresh = make_owned();
+        zero_owned(d_prod);
+        zero_owned(d_spec);
+        zero_owned(d_trap);
+        zero_owned(d_fresh);
+        TokenState dst_prod = bind_state(d_prod, b_table);
+        TokenState dst_spec = bind_state(d_spec, b_table);
+        TokenState dst_trap = bind_state(d_trap, b_table);
+        TokenState dst_fresh = bind_state(d_fresh, b_table);
+        fill_guard(sc_prod.logits);
+        fill_guard(sc_spec.logits);
+        fill_guard(sc_trap.logits);
+
+        const int draft_tok = 3;
+        const int draft_id = draft_token(g, w, dw, res_a, dst_prod, sc_prod, draft_tok, 0, 0, sp, nullptr, 0);
+        run_draft_spec(g, w, dw, res_a, dst_spec, sc_spec, draft_tok, 0, 0, DraftTrap::None);
+        const float* dgot = static_cast<const float*>(sc_prod.logits.data());
+        const float* dwant = static_cast<const float*>(sc_spec.logits.data());
+        const int draft_bad = n_differ(dgot, dwant, n_vocab);
+        int draft_guard = 0;
+        for (int i = 0; i < guard; ++i)
+            if (dgot[n_vocab + i] != 7.0f) ++draft_guard;
+        const int draft_argmax = argmax(dwant, n_vocab);
+        std::vector<float> draft_good(dwant, dwant + n_vocab);
+        verdict("one draft matches the kernel sequence", draft_bad == 0 && draft_id == draft_argmax,
+                "id " + std::to_string(draft_id) + ", " + std::to_string(draft_bad) + " of " +
+                    std::to_string(n_vocab));
+        verdict("16 words past the draft logits stayed put", draft_guard == 0,
+                std::to_string(draft_guard) + " changed");
+        const bool residual_kept = std::memcmp(res_a.data(), res_saved.data(), res_saved.size() * 4u) == 0;
+        verdict("the caller's residual stayed put", residual_kept, "");
+
+        const int cell_id = draft_token(g, w, dw, res_b, dst_prod, sc_prod, 5, 1, 0, sp, nullptr, 0);
+        run_draft_spec(g, w, dw, res_b, dst_spec, sc_spec, 5, 1, 0, DraftTrap::None);
+        const int cell_bad = n_differ(static_cast<const float*>(sc_prod.logits.data()),
+                                      static_cast<const float*>(sc_spec.logits.data()), n_vocab);
+        const int cell_argmax = argmax(static_cast<const float*>(sc_spec.logits.data()), n_vocab);
+        verdict("a second draft cell matches the kernel sequence", cell_bad == 0 && cell_id == cell_argmax,
+                "id " + std::to_string(cell_id) + ", " + std::to_string(cell_bad) + " of " +
+                    std::to_string(n_vocab));
+
+        zero_owned(d_fresh);
+        fill_guard(sc_prod.logits);
+        const int again_id = draft_token(g, w, dw, res_a, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0);
+        const int again_bad = n_differ(static_cast<const float*>(sc_prod.logits.data()), draft_good.data(), n_vocab);
+        verdict("a second draw from a fresh state matches", again_bad == 0 && again_id == draft_id,
+                std::to_string(again_bad) + " of " + std::to_string(n_vocab));
+
+        zero_owned(d_fresh);
+        fill_guard(sc_prod.logits);
+        draft_token(g, w, dw, res_a, dst_fresh, sc_prod, 7, 0, 0, sp, nullptr, 0);
+        const int tok_bad = n_differ(static_cast<const float*>(sc_prod.logits.data()), draft_good.data(), n_vocab);
+        verdict("a different token moves the draft", tok_bad > 0,
+                "differed on " + std::to_string(tok_bad) + " of " + std::to_string(n_vocab));
+
+        zero_owned(d_fresh);
+        fill_guard(sc_prod.logits);
+        draft_token(g, w, dw, res_b, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0);
+        const int res_bad = n_differ(static_cast<const float*>(sc_prod.logits.data()), draft_good.data(), n_vocab);
+        verdict("a different residual moves the draft", res_bad > 0,
+                "differed on " + std::to_string(res_bad) + " of " + std::to_string(n_vocab));
+
+        auto draft_trap = [&](DraftTrap t, const char* name) {
+            zero_owned(d_trap);
+            fill_guard(sc_trap.logits);
+            run_draft_spec(g, w, dw, res_a, dst_trap, sc_trap, draft_tok, 0, 0, t);
+            const double apart = rel_l1(draft_good.data(), static_cast<const float*>(sc_trap.logits.data()), n_vocab);
+            verdict(name, apart > 0.05, pct(apart));
+        };
+        draft_trap(DraftTrap::OneStream, "adding the embedding to one stream is observable");
+        draft_trap(DraftTrap::SkipHidden, "skipping the hidden projection is observable");
+
+        verdict("a draft token outside the vocabulary is refused",
+                throws_with([&] { draft_token(g, w, dw, res_a, dst_fresh, sc_prod, -1, 0, 0, sp, nullptr, 0); },
+                            "outside the vocabulary") &&
+                    throws_with([&] { draft_token(g, w, dw, res_a, dst_fresh, sc_prod, n_vocab, 0, 0, sp, nullptr, 0); },
+                                "outside the vocabulary"),
+                "");
+        Bytes short_res(16);
+        verdict("a short residual is refused",
+                throws_with([&] { draft_token(g, w, dw, short_res, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0); },
+                            "residual is short"),
+                "");
+        DraftWeights missing = dw;
+        missing.embedding.norm = nullptr;
+        verdict("a missing embedding norm is refused",
+                throws_with(
+                    [&] { draft_token(g, w, missing, res_a, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0); },
+                    "fc_embedding norm is missing"),
+                "");
+        DraftWeights bits2 = dw;
+        bits2.hidden.form.code_bits = 2;
+        bits2.hidden.form.group_elems = 64;
+        bits2.hidden.form.has_offset = false;
+        verdict("a 2-bit hidden projection is refused",
+                throws_with([&] { draft_token(g, w, bits2, res_a, dst_fresh, sc_prod, draft_tok, 0, 0, sp, nullptr, 0); },
+                            "no Q8_0 contract"),
+                "");
 
         std::printf("\ntoken: %d failures\n", g_fail);
         if (g_fail) return 1;

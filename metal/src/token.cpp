@@ -1,4 +1,5 @@
 // One token: embed, one block, the output mix, one sample.
+// One draft step: project the next token and the caller's residual, then the same block.
 #include "strata/metal/token.hpp"
 
 #include "strata/metal/bf16_gemv.hpp"
@@ -68,6 +69,55 @@ void gr_half(const TokenGeom& g, const TokenGr& half, const Bytes* inject, Token
     gr_read(gs, *st.R, *half.norm, *half.down, *half.up, inject, kEps, false, sc.gr, sc.mixed, inj);
 }
 
+void need_fc(const char* name, const DraftFc& fc) {
+    if (fc.codes == nullptr) throw MetalError(std::string("draft: ") + name + " codes are missing");
+    if (fc.scales == nullptr) throw MetalError(std::string("draft: ") + name + " scales are missing");
+    if (fc.norm == nullptr) throw MetalError(std::string("draft: ") + name + " norm is missing");
+    if (fc.form.has_offset && fc.offset == nullptr)
+        throw MetalError(std::string("draft: ") + name + " offset is missing");
+    if (fc.form.code_bits != 4 && fc.form.code_bits != 8)
+        throw MetalError(std::string("draft: ") + name + " code_bits has no Q8_0 contract");
+}
+
+void project_q8_0(const Bytes& x, const DraftFc& fc, int64_t n, Bytes& q8, Bytes& y) {
+    quantize_q8_0(x, n, q8);
+    const Bytes* off = fc.form.has_offset ? fc.offset : nullptr;
+    s_gemv_q8_0_split(q8, *fc.codes, *fc.scales, off, y, n, n, fc.form);
+}
+
+// The hidden norm is one row of hc * n_embd. Each stream of that row is then its own projection.
+void mix_draft(const TokenGeom& g, const TokenWeights& w, const DraftWeights& d, const Bytes& residual,
+               TokenState& st, TokenScratch& sc, int token) {
+    const uint64_t nbytes = (uint64_t) g.hc * (uint64_t) g.n_embd * 4u;
+    if (residual.size() < nbytes) throw MetalError("draft: the residual is short");
+    if (st.R == nullptr) throw MetalError("draft: the layer residual is missing");
+    if (st.R->size() < nbytes) throw MetalError("draft: the layer residual is short");
+    if (token < 0 || token >= g.n_vocab) throw MetalError("draft: the token id is outside the vocabulary");
+    need_fc("fc_embedding", d.embedding);
+    need_fc("fc_hidden", d.hidden);
+    if (d.embedding.norm->size() < (uint64_t) g.n_embd * 4u) throw MetalError("draft: fc_embedding norm is short");
+    if (d.hidden.norm->size() < nbytes) throw MetalError("draft: fc_hidden norm is short");
+
+    embedding_gather(*w.emb_codes, *w.emb_scales, w.emb_offsets, g.n_embd, g.emb_code_bits, g.emb_code_bias,
+                     g.emb_group, token, sc.emb, 0);
+    rms_norm_weighted(sc.emb, d.embedding.norm, 1, g.n_embd, kEps);
+    project_q8_0(sc.emb, d.embedding, g.n_embd, sc.draft_q8, sc.draft_e);
+
+    std::memcpy(sc.draft_hidden.data(), residual.data(), (size_t) nbytes);
+    rms_norm_weighted(sc.draft_hidden, d.hidden.norm, 1, g.hc * g.n_embd, kEps);
+
+    auto* R = static_cast<float*>(st.R->data());
+    const auto* hidden = static_cast<const float*>(sc.draft_hidden.data());
+    const auto* e = static_cast<const float*>(sc.draft_e.data());
+    const int64_t n = g.n_embd;
+    for (int64_t c = 0; c < g.hc; ++c) {
+        std::memcpy(sc.draft_row.data(), hidden + c * n, (size_t) n * sizeof(float));
+        project_q8_0(sc.draft_row, d.hidden, n, sc.draft_q8, sc.draft_h);
+        const auto* h = static_cast<const float*>(sc.draft_h.data());
+        for (int64_t i = 0; i < n; ++i) R[c * n + i] = h[i] + e[i];
+    }
+}
+
 }  // namespace
 
 TokenScratch make_token_scratch(const TokenGeom& g) {
@@ -100,6 +150,11 @@ TokenScratch make_token_scratch(const TokenGeom& g) {
         Bytes(q8k_bytes(n)),
         Bytes((uint64_t) (g.n_vocab + guard) * 4u),
         Bytes(4),
+        Bytes((uint64_t) hc * (uint64_t) n * 4u),
+        Bytes((uint64_t) n * 4u),
+        Bytes((uint64_t) n * 4u),
+        Bytes((uint64_t) n * 4u),
+        Bytes(q8_0_bytes(n)),
     };
 }
 
@@ -169,6 +224,18 @@ void lm_head_logits(const TokenGeom& g, const TokenWeights& w, TokenState& st, T
 int generate_token(const TokenGeom& g, const TokenWeights& w, TokenState& st, TokenScratch& sc, int token, int pos,
                    int pos_base, const SamplerParams& sp, const Bytes* history, int history_len) {
     embed_into_residual(g, w, st, sc, token);
+    block_forward(g, w, st, sc, pos, pos_base);
+    lm_head_logits(g, w, st, sc);
+    sample_tokens(sc.logits, 1, g.n_vocab, history, history_len, sp, sc.sampled);
+    return static_cast<const int*>(sc.sampled.data())[0];
+}
+
+int draft_token(const TokenGeom& g, const TokenWeights& w, const DraftWeights& d, const Bytes& residual,
+                TokenState& st, TokenScratch& sc, int token, int pos, int pos_base, const SamplerParams& sp,
+                const Bytes* history, int history_len) {
+    check_geom(g);
+    check_weights(w);
+    mix_draft(g, w, d, residual, st, sc, token);
     block_forward(g, w, st, sc, pos, pos_base);
     lm_head_logits(g, w, st, sc);
     sample_tokens(sc.logits, 1, g.n_vocab, history, history_len, sp, sc.sampled);

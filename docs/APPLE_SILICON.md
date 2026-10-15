@@ -23,7 +23,7 @@ the gated residual, the router, the experts, or the sampler. One synthetic token
 row, the gated residual, that attention block, the router, the routed experts, the shared expert,
 the combine, the output projection, and the sampler. It is one block. Four synthetic
 layers follow the pack schedule, three GDN and one QSA, and that is not the 48-layer model.
-The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. There is no token rate.
+The pack index is read into those kernels, including one embedding row, one shared expert, one routed expert blob, one 2-bit query, and one synthetic greedy token through the stack. That token is not a loaded model. One synthetic draft step pairs a caller residual with the next token and draws one greedy id through the same block. That draft is not a loaded MTP runtime. There is no token rate.
 
 ## One memory pool
 
@@ -416,6 +416,26 @@ shared expert by the first router weight was 8.67% apart on the combine output. 
 logits stayed put. The second token, the sampled id at the next cell, matched on 0 logits and sampled
 15 again. A negative token was refused. An embedding that is not a multiple of 256 was refused.
 
+The same check draws one draft step. The caller's residual is left as it was. The next token is
+gathered, normalized, and projected. The whole residual is normalized as one row, and each stream
+of that row is projected by the same hidden weight. The layer residual is the sum, with the
+embedding projection added on every stream. Both projections are 4-bit S-form with an offset, and
+the activation is Q8_0. The hidden scales start at 0.4 so dropping that projection is visible.
+The block after the sum is the same one the greedy token uses, including that layer's own K and V.
+The shared expert is the 2-bit function. The output projection is Q8_K. Eight experts, top 2.
+One cell.
+
+Measured on the same run. The first cell pairs token 3 with one residual and samples id 26, the
+argmax. The logits matched the same kernel sequence on 0 of 32 values. 16 words past the logits
+stayed put. The caller's residual was unchanged. A second cell, token 5 and a different residual,
+kept the first cell's K and V and sampled id 15, matching on 0 of 32. A second draw of the first
+cell from a fresh state matched on 0 of 32. Token 7 differed on 32 of 32 logits. A different
+residual differed on 32 of 32 logits. Adding the embedding projection to one stream was 95.49%
+apart on the logits. Skipping the hidden projection was 541.46% apart. A token outside the
+vocabulary was refused. A short residual was refused. A missing embedding norm was refused. A
+2-bit hidden projection was refused: code_bits has no Q8_0 contract. One synthetic greedy draft.
+There is no token rate. This is not a loaded model.
+
 `strata-metal-stack` draws one greedy id through four layers. A layer is full attention when its index
 modulo 4 is 3, which is the pack's rule. Layers 0, 1, and 2 are GDN. Layer 3 is the QSA attention
 block. Every layer then does the same feed-forward half as the one-block token. No new shader. The
@@ -526,13 +546,16 @@ rate. This is not a loaded model.
 
 The GDN check is one layer, on synthetic weights. The stack check is four layers, on synthetic
 weights. The pack check reads an index into those kernels and draws one synthetic greedy token
-from the loaded planes. The model does not run. There is no token rate.
+from the loaded planes. The token check also draws one synthetic greedy draft from a caller
+residual and the next token. The model does not run. There is no token rate.
 The QSA decode kernel is its own check. The indexer, the indexer cell scores, the top-k, the paged
 KV append, the partial NEOX rotation, and the QSA gate pass as their own checks, and the decode
 kernel does not call them. `strata-metal-qsa-layer` calls those, plus the weighted norm and the
 decode kernel. `strata-metal-token` calls the embedding row, the gated residual, that attention
 block, the router, the routed experts, the shared expert, the combine, the output projection, and
-the sampler. It is one block. `strata-metal-stack` calls that token path's feed-forward half on
+the sampler. It is one block. It also draws one draft step from a caller residual and the next
+token. Those two projections use a Q8_0 activation. The block after the sum is the same one.
+The caller's residual is not written. `strata-metal-stack` calls that token path's feed-forward half on
 every layer, the GDN layer on the first three, and the QSA block on the last. It is four layers.
 `strata-metal-pack` calls the bf16 product, the Q8_K projection, one embedding row, one shared
 expert, one routed expert, and one 2-bit query on bytes it loaded. It also feeds one stack token
@@ -542,8 +565,7 @@ greedy token. There is no token rate. The expert-half add is still a kernel only
 shared expert function is still its own check, and the stack path calls it.
 Still to write, in this order, each one checked before the next depends on it:
 
-1. The MTP draft layer. Then the Python server in `serve/`, which can stay as it is once it has
-   an engine binary to start.
+1. The Python server in `serve/`, which can stay as it is once it has an engine binary to start.
 
 About 25,000 lines of CUDA implement the rest of those kernels today. The Intel engine is a separate tree
 (`sycl/`) for the same reason this one is: that compiler cannot take the `.cu` files either. The CUDA and HIP
