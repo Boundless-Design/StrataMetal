@@ -125,6 +125,9 @@ public:
     // From qwen4exp.block_count; 0 when the metadata does not say.
     int n_layers() const { return n_layers_; }
 
+    // A metadata value from shard 1, or nullptr. Arrays keep every entry up to the reader's sample cap.
+    const strata::MetaValue* meta(const std::string& key) const { return files_[0]->get(key); }
+
     // A tensor by its full name, or nullptr when no present shard lists it.
     const LayerTensor* find_global(const std::string& name) const {
         auto cached = cache_.find(name);

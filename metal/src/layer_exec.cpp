@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace strata::metal {
@@ -179,6 +180,33 @@ GdnExec GdnExec::load(const ModelTensors& model, int layer, const strata::core::
                    .scratch = make_gdn_layer_scratch(geom)};
 }
 
+namespace {
+uint64_t gr_bytes(const GrScratch& s) {
+    return s.xn.size() + s.xq.size() + s.proj.size() + s.lq.size() + s.gate.size();
+}
+
+// A cell or a rope row that has reached its count is outside the table. Neither index is reduced.
+void require_qsa_pos(const QsaExec& e, int pos, int pos_base) {
+    if (pos < 0 || pos >= e.max_cells)
+        throw MetalError("qsa cache: position " + std::to_string(pos) + " is outside the " +
+                         std::to_string(e.max_cells) + "-cell cache");
+    if (pos_base < 0) throw MetalError("qsa cache: pos_base is negative");
+    const int rotary = pos_base + pos;
+    if (rotary < pos || rotary >= e.rope_rows)
+        throw MetalError("qsa cache: rope position " + std::to_string(rotary < pos ? pos_base : rotary) +
+                         " is outside the table of " + std::to_string(e.rope_rows) + " rows");
+}
+}  // namespace
+
+uint64_t GdnExec::gpu_bytes() const {
+    const GdnLayerScratch& s = scratch;
+    return qkv.size() + gate.size() + ssm.size() + conv_w.size() + alpha_w.size() + beta_w.size() + ssm_a.size() +
+           dt_w.size() + ssm_norm.size() + hc_down.size() + hc_up.size() + hc_inj.size() + hc_norm.size() +
+           state.size() + conv.size() + mixed.size() + inject.size() + block.size() + gr_bytes(gr) + s.x_q8k.size() +
+           s.x_bf16.size() + s.qkv.size() + s.conv_out.size() + s.q.size() + s.k.size() + s.v.size() + s.alpha.size() +
+           s.beta.size() + s.gate.size() + s.o.size() + s.z.size() + s.y.size() + s.y_q8k.size();
+}
+
 void GdnExec::set_qkv(const Bytes* override_or_null) { qkv_override = override_or_null; }
 
 void GdnExec::run(const Bytes& residual, Bytes& y, bool reset_state) {
@@ -262,6 +290,7 @@ QsaExec QsaExec::load(const ModelTensors& model, int layer, const strata::core::
                    .hc = hc,
                    .hc_lr = (int) g.hc_lr,
                    .max_cells = max_cells,
+                   .rope_rows = rope_rows,
                    .q = std::move(q),
                    .k = std::move(k),
                    .v = std::move(v),
@@ -296,6 +325,17 @@ QsaExec QsaExec::load(const ModelTensors& model, int layer, const strata::core::
 
 void QsaExec::set_v(const Bytes* override_or_null) { v_override = override_or_null; }
 
+uint64_t QsaExec::gpu_bytes() const {
+    const QsaLayerScratch& s = scratch;
+    return q.size() + k.size() + v.size() + o.size() + q_norm.size() + k_norm.size() + idx_q_norm.size() +
+           idx_k_norm.size() + idx_q.size() + idx_k.size() + hc_down.size() + hc_up.size() + hc_inj.size() +
+           hc_norm.size() + cos_tab.size() + sin_tab.size() + page_table.size() + k_pool.size() + v_pool.size() +
+           idx_tail.size() + idx_dead.size() + idx_pooled.size() + idx_bpos.size() + mixed.size() + inject.size() +
+           block.size() + gr_bytes(gr) + s.x_q8k.size() + s.x_bf16.size() + s.idx_raw.size() + s.kcur.size() +
+           s.vcur.size() + s.q_full.size() + s.qcur.size() + s.q_idx.size() + s.cell_scores.size() + s.ids.size() +
+           s.step.size() + s.pos.size() + s.attn_scratch.size() + s.attn.size() + s.gated.size() + s.gated_q8k.size();
+}
+
 void QsaExec::begin(const Bytes& residual, bool reset_cache) {
     if (reset_cache) {
         zero_bytes(k_pool);
@@ -310,17 +350,19 @@ void QsaExec::begin(const Bytes& residual, bool reset_cache) {
 }
 
 void QsaExec::block_at(int pos, int pos_base, Bytes& out) {
+    require_qsa_pos(*this, pos, pos_base);
     fill_f32(out, 7.f);
     const QsaIqWeights w = qsa_weights(*this);
     QsaLayerState st = qsa_state(*this);
     qsa_layer_iq(geom, w, st, scratch, pos, pos_base, mixed, out);
 }
 
-void QsaExec::attend_write(const Bytes& residual, Bytes& y, bool reset_cache) {
+void QsaExec::attend_write(const Bytes& residual, Bytes& y, int pos, bool reset_cache) {
+    require_qsa_pos(*this, pos, 0);
     begin(residual, reset_cache);
     fill_f32(block, 7.f);
     fill_f32(y, 7.f);
-    block_at(0, 0, block);
+    block_at(pos, 0, block);
     gr_write(shapes, residual, block, inject, y);
 }
 
@@ -407,6 +449,14 @@ FfnExec FfnExec::load(const ModelTensors& model, int layer, const strata::core::
                    .parts = Bytes((uint64_t) k * (uint64_t) n_embd * 4u),
                    .ids = Bytes((uint64_t) (k + guard) * 4u),
                    .route_w = Bytes((uint64_t) (k + guard) * 4u)};
+}
+
+uint64_t FfnExec::gpu_bytes() const {
+    return hc_down.size() + hc_up.size() + hc_inj.size() + hc_norm.size() + router.size() + ginp.size() +
+           sgate.size() + sup.size() + sdown.size() + gr_bytes(gr) + expert_y.size() + shared_y.size() +
+           combined.size() + mixed.size() + inject.size() + x_bf16.size() + route.size() + exq.size() +
+           egate_y.size() + eup_y.size() + ehq.size() + sh_xq.size() + sh_gate_y.size() + sh_up_y.size() +
+           sh_hq.size() + sh_down_y.size() + sh_scalar.size() + parts.size() + ids.size() + route_w.size();
 }
 
 void FfnExec::run(const Bytes& residual, Bytes& out, bool add_shared, FfnTrace* trace) {

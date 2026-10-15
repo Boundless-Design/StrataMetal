@@ -45,6 +45,7 @@
 # schedule, and the pack index loaded into those kernels. None of them runs the model.
 # strata-metal-pack also walks layers 2 onward from the GGUF (STRATA_MODEL_GGUF, STRATA_WALK_LAST).
 # strata-metal-layer-tensors checks the by-name tensor lookup that walk uses; it is host code only.
+# strata-metal-run is the forward pass: token ids in, one full logit row per position.
 cmake_minimum_required(VERSION 3.24)
 project(strata_metal VERSION 0.1.39 LANGUAGES CXX OBJCXX)
 if(NOT APPLE)
@@ -95,6 +96,7 @@ add_library(strata_metal_runtime STATIC
   src/rope.mm
   src/qsa_layer.cpp
   src/layer_exec.cpp
+  src/forward.cpp
   src/token.cpp
   src/stack.cpp
   src/pack.cpp)
@@ -237,6 +239,10 @@ add_executable(strata-metal-pack src/pack_parity.cpp)
 target_link_libraries(strata-metal-pack PRIVATE strata_metal_runtime)
 strata_metal_scheme(strata-metal-pack)
 set_property(TARGET strata-metal-pack PROPERTY XCODE_SCHEME_ARGUMENTS "--selftest")
+
+add_executable(strata-metal-run src/run_main.cpp)
+target_link_libraries(strata-metal-run PRIVATE strata_metal_runtime)
+strata_metal_scheme(strata-metal-run)
 
 # The by-name tensor lookup the layer walk uses. Host code only: no Metal, no runtime.
 add_executable(strata-metal-layer-tensors src/layer_tensors_parity.cpp)

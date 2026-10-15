@@ -53,16 +53,20 @@ struct GdnExec {
     void set_qkv(const Bytes* override_or_null);
     // `y` is filled with 7 first, then the residual write. A guard float past hc * n_embd stays 7.
     void run(const Bytes& residual, Bytes& y, bool reset_state);
+    // Every GPU buffer this step owns, including its scratch. Not the routed expert pools.
+    uint64_t gpu_bytes() const;
 };
 
-// The attention half of a QSA layer. `max_cells` is how far `block_at` may be called. `rope_rows` is
-// the rope table, one row per absolute position the table must hold.
+// The attention half of a QSA layer. `max_cells` is how far the cell index may go. `rope_rows` is
+// the rope table, one row per absolute position. A position that reaches either limit throws. It is
+// not wrapped.
 struct QsaExec {
     int q_ty = -1, k_ty = -1, v_ty = -1, o_ty = -1;
     int n_embd = 0;
     int hc = 0;
     int hc_lr = 0;
     int max_cells = 0;
+    int rope_rows = 0;
     const Bytes* v_override = nullptr;
     Bytes q, k, v, o;
     Bytes q_norm, k_norm, idx_q_norm, idx_k_norm, idx_q, idx_k;
@@ -83,9 +87,13 @@ struct QsaExec {
     // A later `block_at` reuses this mixed vector and does not read the residual again.
     void begin(const Bytes& residual, bool reset_cache);
     // One cell. `out` is filled with 7 first. Rope reads `pos_base + pos`. The indexer cell is `pos`.
+    // Throws when `pos` is outside the cache or the absolute position is outside the rope table.
     void block_at(int pos, int pos_base, Bytes& out);
-    // `begin`, position 0 into `block`, then the residual write into `y`. The walk's attention write.
-    void attend_write(const Bytes& residual, Bytes& y, bool reset_cache);
+    // `begin`, cell `pos` (pos_base 0) into `block`, then the residual write into `y`. The walk calls
+    // this at position 0. The forward pass calls it at the real position. Same limits as `block_at`.
+    void attend_write(const Bytes& residual, Bytes& y, int pos, bool reset_cache);
+    // Every GPU buffer this step owns, including the KV pages, the rope table, and scratch.
+    uint64_t gpu_bytes() const;
 };
 
 // What one feed-forward pass produced, for the host check. The kernels do not read it back.
@@ -127,6 +135,8 @@ struct FfnExec {
     static FfnExec load(const ModelTensors& model, int layer, const strata::core::ModelGeometry& geom, bool with_shared);
     // `out` is the residual stream, filled with 7 first. `trace` may be null.
     void run(const Bytes& residual, Bytes& out, bool add_shared, FfnTrace* trace);
+    // Dense buffers only. The ten routed experts are read from the mapping and are not in this count.
+    uint64_t gpu_bytes() const;
 };
 
 // The output mixer: hyper-connection read with no inject weight. Both buffers are filled with 7 first,

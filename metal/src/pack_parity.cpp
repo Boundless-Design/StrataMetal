@@ -8362,7 +8362,7 @@ void walk_attn_write(const ModelTensors& m, int L, const strata::core::ModelGeom
             Bytes R((uint64_t) hc_dim * 4u), zero_r((uint64_t) hc_dim * 4u);
             std::memcpy(R.data(), in.data(), (size_t) hc_dim * 4u);
             std::memset(zero_r.data(), 0, (size_t) zero_r.size());
-            auto step = [&](const Bytes& residual, Bytes& y) { qsa.attend_write(residual, y, true); };
+            auto step = [&](const Bytes& residual, Bytes& y) { qsa.attend_write(residual, y, 0, true); };
             step(R, out);
             out_res.assign(static_cast<const float*>(out.data()), static_cast<const float*>(out.data()) + hc_dim);
             std::vector<float> gpu_mixed((size_t) n_embd), gpu_inj((size_t) hc), gpu_block((size_t) n_embd);
