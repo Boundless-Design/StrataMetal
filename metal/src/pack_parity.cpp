@@ -9177,8 +9177,8 @@ void walk_ffn(const PackTable& table, const ModelTensors& m, int L, const strata
 //
 // Layer 1 still runs through run_layer1_gdn and run_layer1_ffn, which feed it. Each layer here is: the attention
 // half (a GDN step, or the QSA products, block and write), then the routed ten alone, then routed + shared, whose
-// output is the next layer's input. STRATA_WALK_LAST sets the last layer walked (default 47). The walk stops
-// early at the first layer whose attention half did not write.
+// output is the next layer's input. The default walks every layer the model has. STRATA_WALK_LAST stops
+// it early. The walk also stops at the first layer whose attention half did not write.
 void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g) {
     std::string why;
     const std::unique_ptr<ModelTensors> m = ModelTensors::open_default(&why);
@@ -9186,9 +9186,9 @@ void run_layer_walk(const PackTable& table, const strata::core::ModelGeometry& g
         std::printf("\nlayer walk skipped: %s (set STRATA_MODEL_GGUF)\n", why.c_str());
         return;
     }
-    int last = 47;
-    if (const char* env = std::getenv("STRATA_WALK_LAST"); env && env[0]) last = std::atoi(env);
     const int n_layers = m->n_layers() > 0 ? m->n_layers() : (int) g.n_layers;
+    int last = n_layers - 1;
+    if (const char* env = std::getenv("STRATA_WALK_LAST"); env && env[0]) last = std::atoi(env);
     if (last > n_layers - 1) last = n_layers - 1;
     std::printf("\nlayer walk: layers 2 to %d of %d from %s\n", last, n_layers, m->path().c_str());
     std::vector<float> residual = layer1_ffn_residual;
