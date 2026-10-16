@@ -354,3 +354,17 @@ Treatments issued 10313 and 10325 read-aheads (51.6 per window) and read 206.3 a
 B's fill is warm relative to C's 3.7 GB cold fill, and below the 15–17 GB fills. Compressor peaks were 277334, 163315, 994488, 163397, and 149675 pages. The peak differs, and the cold control is the high one.
 
 Fix 5 stays deferred. It was 0.610 ms, 1.77%, on the warm split, under fix 3's bound. It is not started. Fix 1 is not started.
+
+## Fix 3 gated, `STRATA_METAL_PREFETCH_EARLY`
+
+Fix 3 (`54168c5`) is correct but neutral. Read-ahead volume rose ~50% and the extra SSD traffic offset the drop in late experts.
+
+That is the alternating sequence above. Treatments issued 51.6 read-aheads per window against 34.6 on the controls. Late read-aheads fell from 2126, 2377, and 2416 to 1329 and 1341. Misses fell from 19.3 to 18.1 per window. Host rose from 8.56, 8.73, and 8.62 ms to 9.59 and 9.73 ms. Neither treatment beat both neighbors by more than the 1.00 tok/s control spread. No further speed runs.
+
+`84c9cd7` puts that queue behind `STRATA_METAL_PREFETCH_EARLY`. The default is 0. With the variable unset, the calls that run are `ahead(l+1)` at `pre_k_`, then `ahead(l+2)` only when `STRATA_METAL_PREFETCH2` is greater than 0. `predL2_` is allocated only when that depth is greater than 0 or the new flag is set, so the layer `l+2` predictor GEMV is absent from the default graph. That is the schedule of the parent of `54168c5`: fix 4 (`81b66ba`) plus the default-off timers (`dbb9dd4`). `STRATA_METAL_PREFETCH2` stays 0.
+
+`STRATA_METAL_PREFETCH_EARLY=1` restores the `54168c5` queue. Layer `l+2` is issued at this cut, before `ahead(l+1)`, at `pre_k_`. When `STRATA_METAL_PREFETCH2` is also set, that early queue uses the `PREFETCH2` depth and the later `ahead(l+2)` does not run a second time.
+
+The default path was not re-scored. The unset schedule is the one that already matched LOGPOS at fix 4. The `54168c5` path already matched LOGPOS and stays available behind the flag. The saved control binary is the pre-fix-4 build, so this note does not claim a Mach-O compare.
+
+Fix 5 stays deferred. It is not started.
