@@ -220,3 +220,43 @@ The controls are A, C, and E: 30.33, 30.55, and 30.65 tok/s. None was killed. No
 Depth 10 is 30.12 tok/s, below A and below C. Depth 4 is 30.71 tok/s, 0.16 above C and 0.06 above E. Neither clears 0.32. No depth is faster. The LOGPOS check was not run.
 
 The cold first control's compressor peaked at 467639 pages. The next four runs, depths 10, 0, 4, and 0, peaked at 97278, 107035, 113754, and 111864 pages. The peak does not separate by depth.
+
+## Fix 4, ahead() bound, arena 12 GB
+
+Fix 4 is `81b66ba`. It stays. `STRATA_METAL_TIME_AHEAD` defaults to 0. Set to 1, `ahead()` adds its own wall time and prints one line. `host_ms_` is the same counter as before and still includes that work. One 200-token decode, arena 12 GB, the same command as the controls. `STRATA_METAL_PREFETCH2` was unset. `pgrep -fl strata` was empty before it. It exited 0. Every sample was pressure level 1. Swap used stayed 1590102589 bytes (`vm.swapusage` 1516.44M). Swapouts stayed 1785829.
+
+Before the run: compressor 54408 pages, free plus inactive 1349861 pages, pressure level 1. Nine samples, all level 1. Compressor peak 888577 pages. Fill 2.7 s at 4.39 GB/s. After the fill the process holds 18.2 GB (4.2 GB resident), planned 21.7 GB.
+
+The stream line: host 8.68 ms per window, of it waiting 7.73 ms. The new line: `expert stream ahead-time 144.847 ms total over 200 decode windows (0.724 ms per window)`. The decode line: 200 tokens in 8502.0 ms, 23.52 tok/s. There are 200 decode windows and 200 decode tokens, so a per-window figure is a per-token figure.
+
+| Quantity | Value |
+| --- | ---: |
+| `ahead()` total | 144.847 ms |
+| `ahead()` per token | 0.724 ms |
+| `host_ms_` per token | 8.68 ms |
+| `wait_ms_` per token | 7.73 ms |
+| Decode per token | 42.51 ms |
+
+144.847 / 8502.0 = 1.70% of this run's per-token time. That is 1% or more, so the alternating sequence below ran. The 23.52 tok/s figure is this timing run (4.2 GB resident after a cold fill). It is the denominator of the 1% test.
+
+## Alternating fix 4, arena 12 GB
+
+The treatment binary is fix 4 plus the default-off timer. `STRATA_METAL_TIME_AHEAD` was unset, so the new counter did not run. The control is the saved unmodified binary. Nothing else ran between these five processes. Compressor pages before each run were under 150000, so none of them waited. A run is killed if pressure level 2 shows up on 3 samples in a row, sampled every 2 seconds, or if swap used grows by more than 256 MiB. None of those fired. `pgrep -fl strata` was empty before each one. All five exited 0. Every sample was pressure level 1. Swap used stayed 1590102589 bytes from before A through after E. Swapouts stayed 1785829. Each `output  :` line matches the step 0 reference.
+
+Held after the fill is 18.2 GB and the planned footprint is 21.7 GB on every run. Arena 12.00 GB, 8616 slots. The before-run columns are compressor pages, free plus inactive pages, and the pressure level.
+
+| Run | Binary | Before, comp / free+inactive / level | Fill | Resident after fill | Compressor peak, pages | Level counts | Swap before → after | Decode tok/s |
+| --- | --- | --- | --- | ---: | ---: | --- | --- | ---: |
+| A | control | 107538 / 1441297 / 1 | 2.8 s, 4.19 GB/s | 3.4 GB | 986519 | 8 at level 1 | 1590102589 → 1590102589 | 30.49 |
+| B | fix 4 | 112052 / 1535152 / 1 | 1.7 s, 7.22 GB/s | 17.5 GB | 126498 | 7 at level 1 | 1590102589 → 1590102589 | 30.78 |
+| C | control | 124596 / 1545949 / 1 | 1.8 s, 6.68 GB/s | 15.8 GB | 131478 | 7 at level 1 | 1590102589 → 1590102589 | 30.34 |
+| D | fix 4 | 124323 / 1552379 / 1 | 1.7 s, 7.00 GB/s | 17.3 GB | 136375 | 7 at level 1 | 1590102589 → 1590102589 | 30.94 |
+| E | control | 133360 / 1555100 / 1 | 1.7 s, 7.03 GB/s | 17.4 GB | 146681 | 7 at level 1 | 1590102589 → 1590102589 | 30.84 |
+
+Decode times: A 6560.5 ms, B 6497.1 ms, C 6592.9 ms, D 6463.6 ms, E 6486.0 ms.
+
+The controls are A, C, and E: 30.49, 30.34, and 30.84 tok/s. None was killed. None is more than 10% under 30.36 (the floor is 27.324). Their spread is 30.84 − 30.34 = 0.50 tok/s. A treatment counts as faster only when it beats both neighbors by more than that spread.
+
+B is 30.78 tok/s, 0.29 above A and 0.44 above C. D is 30.94 tok/s, 0.60 above C and 0.10 above E. Neither clears 0.50 against both neighbors. Fix 4 is not faster on this sequence. It stays. The most the release-before-`ahead()` change can take off a token is the measured 0.724 ms.
+
+A's compressor peaked at 986519 pages on the cold fill (3.4 GB resident). B, C, D, and E peaked at 126498, 131478, 136375, and 146681 pages. The peak differs, and the first control is the high one.
