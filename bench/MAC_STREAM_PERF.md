@@ -198,3 +198,25 @@ if (st_pred_ && st_->ahead2() > 0) predL2_ = A(4 * (size_t) 48 * MAXT * 512);
 `A` is `cx_->alloc` (line 448), a device buffer, not an arena slot. The byte count is `4 * 48 * 8 * 512 = 786432`. The formula does not contain the depth, so depth 4 and depth 10 allocate the same 786432 bytes. The extra router GEMV (lines 772–775) writes into that buffer. 786432 bytes is under 2 GB, so a depth-10 run would have stayed at arena 12 GB. It was not launched, because the depth-0 control did not reproduce the step 0 fill.
 
 On a steady T=2 window the cap in `ahead` is `2 * K` distinct experts when the two rows do not overlap: 8 at depth 4, 20 at depth 10. Each one occupies an existing 1382400-byte slot. That is 11059200 bytes of slot payload in play at depth 4 and 27648000 bytes at depth 10, inside the arena that was already filled, not on top of it.
+
+## Alternating depth, arena 12 GB
+
+Measurement only, on the unmodified binary. The step 0 fill rate and the after-fill resident size are not stop lines. A run is killed if pressure level 2 shows up on 3 samples in a row, sampled every 2 seconds, or if swap used grows by more than 256 MiB (268435456 bytes). Nothing ran between these five processes. `pgrep -fl strata` was empty before each one. All five exited 0. Every sample was pressure level 1. Swap used stayed 1615268413 bytes (`vm.swapusage` 1540.44M) from before A through after E. Swapouts stayed 1785829. Each `output  :` line matches the step 0 reference.
+
+The before-run columns are compressor pages, free plus inactive pages, and the pressure level. Held after the fill is 18.2 GB and the planned footprint is 21.7 GB on every run. Arena 12.00 GB, 8616 slots.
+
+| Run | Depth | Before, comp / free+inactive / level | Fill | Resident after fill | Compressor peak, pages | Level counts | Swap before → after | Decode tok/s |
+| --- | ---: | --- | --- | ---: | ---: | --- | --- | ---: |
+| A | 0 | 73507 / 1473455 / 1 | 2.1 s, 5.65 GB/s | 12.3 GB | 467639 | 8 at level 1 | 1615268413 → 1615268413 | 30.33 |
+| B | 10 | 74697 / 1563936 / 1 | 1.7 s, 7.13 GB/s | 17.4 GB | 97278 | 7 at level 1 | 1615268413 → 1615268413 | 30.12 |
+| C | 0 | 96267 / 1563501 / 1 | 1.6 s, 7.31 GB/s | 17.4 GB | 107035 | 7 at level 1 | 1615268413 → 1615268413 | 30.55 |
+| D | 4 | 100082 / 1586718 / 1 | 1.7 s, 6.89 GB/s | 17.1 GB | 113754 | 7 at level 1 | 1615268413 → 1615268413 | 30.71 |
+| E | 0 | 107981 / 1580724 / 1 | 1.7 s, 7.18 GB/s | 17.4 GB | 111864 | 7 at level 1 | 1615268413 → 1615268413 | 30.65 |
+
+Decode times: A 6594.8 ms, B 6640.2 ms, C 6545.9 ms, D 6512.8 ms, E 6524.8 ms.
+
+The controls are A, C, and E: 30.33, 30.55, and 30.65 tok/s. None was killed. None is more than 10% under 30.36 (the floor is 27.324). Their spread is 30.65 − 30.33 = 0.32 tok/s. A depth counts as faster only when it beats both neighbors by more than that spread.
+
+Depth 10 is 30.12 tok/s, below A and below C. Depth 4 is 30.71 tok/s, 0.16 above C and 0.06 above E. Neither clears 0.32. No depth is faster. The LOGPOS check was not run.
+
+The cold first control's compressor peaked at 467639 pages. The next four runs, depths 10, 0, 4, and 0, peaked at 97278, 107035, 113754, and 111864 pages. The peak does not separate by depth.
