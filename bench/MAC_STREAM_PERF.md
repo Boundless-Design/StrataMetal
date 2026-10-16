@@ -162,3 +162,39 @@ Both kills were two consecutive level-2 samples. Swap did not grow on either. Af
 | Second | 2 | 40, then 36 | 981723, then 722794 | 1006106 |
 
 `STRATA_METAL_PREFETCH2=4` was not started. There is no decode rate, no ledger, and no token line for this step. The setting is not adopted. The serve-path rows match the unmodified binary, and the speed comparison against 24.92 tok/s was not measured. A third 12 GB process was not launched.
+
+## Cause check — depth 0 on the cooled machine
+
+Measurement only. No source change. The question is whether the two depth-10 speed kills were the prefetch or the machine.
+
+Before any process, `pgrep -fl strata` found nothing, so nothing was killed. Page size 16384. `vm_stat`: free 967507, active 486085, inactive 475006, wired down 234448, occupied by the compressor 66806. That compressor is 66806 × 16384 = 1094549504 bytes (1.095 GB), under 2 GB. Free plus inactive is 1442513 pages, 23634132992 bytes (23.634 GB), over 20 GB. `memory_pressure` printed a system-wide free percentage of 85%. `kern.memorystatus_vm_pressure_level` was 1 and `kern.memorystatus_level` was 85. `vm.swapusage` used 1548.44M. The five largest `top -l 1 -o mem -n 5` entries were WindowServer 1314M, grok 525M, node 480M, Stats 354M, and TGOnDeviceInference 274M. The gate allowed a launch.
+
+One control, `STRATA_METAL_PREFETCH2=0`, `STRATA_METAL_ARENA_GB=12`, the step 0 speed command. It exited 0. Pressure level stayed 1. Swap used stayed 1615268413 bytes (the gate's reading of the 1540.44M print at process start). Swapouts stayed 1785829. jetsam 37–86. Compressor pages base 66628, peak 712349 (11671126016 bytes, 11.671 GB), end 106239. Compressions rose by 924773.
+
+The after-fill line: arena 12.00 GB, 8616 slots, filled in 2.3 s at 5.12 GB/s, available 18.8 GB, "the process holds 18.2 GB (10.3 GB resident), planned 21.7 GB". `time -l` peak footprint for the whole process was 18249125352 bytes, max RSS 15540731904. Decode 200 tokens in 6587.0 ms, 30.36 tok/s. The `output  :` line matches the step 0 reference (sha256 `d6d12f1383826252ac6500020a2aef6a918fba6b4700d1a18e72ab9c3eeadd11`). Expert stream over 200 windows: hits 0.9509, misses 19.3 per window, host 8.81 ms, waiting 8.13 ms. T=2: 199 windows, 32.70 ms each, GPU timestamp 31.50 ms.
+
+That run is past the stop line (fill was not under 5 GB/s, resident was not under 10 GB) and short of step 0 (fill about 7 GB/s, resident 15 GB or more, decode about 24.9 tok/s). Depth 4 was not started, and depth 10 was not repeated. The step 1 kills remain the depth-10 rows below.
+
+| Depth | Arena | Fill | Resident after fill | Held / planned after fill | Decode tok/s | Pressure peak |
+| --- | ---: | --- | ---: | --- | ---: | --- |
+| 0, this control | 12 GB | 2.3 s, 5.12 GB/s | 10.3 GB | holds 18.2 GB, planned 21.7 GB | 30.36 | level 1, jetsam 37, compressor 712349 pages |
+| 10, step 1 first kill | 12 GB | 2.9 s, 4.04 GB/s | 2.9 GB | holds 18.2 GB, planned 21.7 GB | none, killed before prefill | level 2 on two samples, jetsam 43 then 37 |
+| 10, step 1 second kill | 12 GB | 3.0 s, 3.97 GB/s | 3.1 GB | holds 18.2 GB, planned 21.7 GB | none, killed before prefill | level 2 on two samples, jetsam 40 then 36 |
+| 4 | not run |  |  |  |  |  |
+
+### What depth 4 and depth 10 allocate
+
+`STRATA_METAL_PREFETCH2` is read once, at `metal/src/engine/stream.cpp` line 158: `pre_k2_ = env_int("STRATA_METAL_PREFETCH2", 0)`. The default stays 0. At a decode cut, lines 708–710 call `ahead(l + 1, T, pred, pre_k_)` and, when `pre_k2_ > 0`, `ahead(l + 2, T, pred2, pre_k2_)`.
+
+`ahead` (lines 572–612) caps `K` at 32 (line 573). For each of the `T` rows it keeps that row's top `K` expert ids, then deduplicates them into `pw[8 * 32]` (line 574), at most 256 ids. Each id that is not already in the arena takes one existing slot from `victim` and `submit` (lines 601–603). `submit` (lines 332–342) points that slot at the expert and queues a `pread` into `host_[slot]`. It does not allocate the slot. The slot payload on this pack is one expert: `lay_` stores `g->bytes / NE`, `u->bytes / NE`, and `d->bytes / NE` (line 72), and the contiguous reader uses `gs + us + ds` (line 275). The experts file header has one size, 460800 + 460800 + 460800 = 1382400 bytes. `PAGE` is 16384 (line 25), so a slot is 85 pages. The `Slot` struct (stream.h line 77) is the metadata.
+
+The only buffer created because prefetch depth is non-zero is `predL2_`. `window.cpp` line 52 sets `MAXT = 8`. Lines 545–546:
+
+```
+if (st_pred_) predL_ = A(4 * (size_t) 48 * MAXT * 512);
+if (st_pred_ && st_->ahead2() > 0) predL2_ = A(4 * (size_t) 48 * MAXT * 512);
+```
+
+`A` is `cx_->alloc` (line 448), a device buffer, not an arena slot. The byte count is `4 * 48 * 8 * 512 = 786432`. The formula does not contain the depth, so depth 4 and depth 10 allocate the same 786432 bytes. The extra router GEMV (lines 772–775) writes into that buffer. 786432 bytes is under 2 GB, so a depth-10 run would have stayed at arena 12 GB. It was not launched, because the depth-0 control did not reproduce the step 0 fill.
+
+On a steady T=2 window the cap in `ahead` is `2 * K` distinct experts when the two rows do not overlap: 8 at depth 4, 20 at depth 10. Each one occupies an existing 1382400-byte slot. That is 11059200 bytes of slot payload in play at depth 4 and 27648000 bytes at depth 10, inside the arena that was already filled, not on top of it.
