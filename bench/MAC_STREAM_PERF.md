@@ -221,9 +221,9 @@ Depth 10 is 30.12 tok/s, below A and below C. Depth 4 is 30.71 tok/s, 0.16 above
 
 The cold first control's compressor peaked at 467639 pages. The next four runs, depths 10, 0, 4, and 0, peaked at 97278, 107035, 113754, and 111864 pages. The peak does not separate by depth.
 
-## Fix 4, ahead() bound, arena 12 GB
+## Fix 4, ahead() bound, arena 12 GB, cold
 
-Fix 4 is `81b66ba`. It stays. `STRATA_METAL_TIME_AHEAD` defaults to 0. Set to 1, `ahead()` adds its own wall time and prints one line. `host_ms_` is the same counter as before and still includes that work. One 200-token decode, arena 12 GB, the same command as the controls. `STRATA_METAL_PREFETCH2` was unset. `pgrep -fl strata` was empty before it. It exited 0. Every sample was pressure level 1. Swap used stayed 1590102589 bytes (`vm.swapusage` 1516.44M). Swapouts stayed 1785829.
+Fix 4 is `81b66ba`. It stays. `STRATA_METAL_TIME_AHEAD` defaults to 0. Set to 1, `ahead()` adds its own wall time and prints one line. `host_ms_` is the same counter as before and still includes that work. One 200-token decode, arena 12 GB, the same command as the controls. `STRATA_METAL_PREFETCH2` was unset. `pgrep -fl strata` was empty before it. It exited 0. Every sample was pressure level 1. Swap used stayed 1590102589 bytes (`vm.swapusage` 1516.44M). Swapouts stayed 1785829. This run is cold. No warm-up was discarded. It overstates `wait_ms_`. It is not the bound used for the later fixes.
 
 Before the run: compressor 54408 pages, free plus inactive 1349861 pages, pressure level 1. Nine samples, all level 1. Compressor peak 888577 pages. Fill 2.7 s at 4.39 GB/s. After the fill the process holds 18.2 GB (4.2 GB resident), planned 21.7 GB.
 
@@ -247,16 +247,72 @@ Held after the fill is 18.2 GB and the planned footprint is 21.7 GB on every run
 
 | Run | Binary | Before, comp / free+inactive / level | Fill | Resident after fill | Compressor peak, pages | Level counts | Swap before → after | Decode tok/s |
 | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: |
-| A | control | 107538 / 1441297 / 1 | 2.8 s, 4.19 GB/s | 3.4 GB | 986519 | 8 at level 1 | 1590102589 → 1590102589 | 30.49 |
-| B | fix 4 | 112052 / 1535152 / 1 | 1.7 s, 7.22 GB/s | 17.5 GB | 126498 | 7 at level 1 | 1590102589 → 1590102589 | 30.78 |
-| C | control | 124596 / 1545949 / 1 | 1.8 s, 6.68 GB/s | 15.8 GB | 131478 | 7 at level 1 | 1590102589 → 1590102589 | 30.34 |
-| D | fix 4 | 124323 / 1552379 / 1 | 1.7 s, 7.00 GB/s | 17.3 GB | 136375 | 7 at level 1 | 1590102589 → 1590102589 | 30.94 |
-| E | control | 133360 / 1555100 / 1 | 1.7 s, 7.03 GB/s | 17.4 GB | 146681 | 7 at level 1 | 1590102589 → 1590102589 | 30.84 |
+| A | control | 107538 / 1441297 / 1 | 2.8 s, 4.19 GB/s | 3.4 GB, cold | 986519 | 8 at level 1 | 1590102589 → 1590102589 | 30.49 |
+| B | fix 4 | 112052 / 1535152 / 1 | 1.7 s, 7.22 GB/s | 17.5 GB, warm | 126498 | 7 at level 1 | 1590102589 → 1590102589 | 30.78 |
+| C | control | 124596 / 1545949 / 1 | 1.8 s, 6.68 GB/s | 15.8 GB, warm | 131478 | 7 at level 1 | 1590102589 → 1590102589 | 30.34 |
+| D | fix 4 | 124323 / 1552379 / 1 | 1.7 s, 7.00 GB/s | 17.3 GB, warm | 136375 | 7 at level 1 | 1590102589 → 1590102589 | 30.94 |
+| E | control | 133360 / 1555100 / 1 | 1.7 s, 7.03 GB/s | 17.4 GB, warm | 146681 | 7 at level 1 | 1590102589 → 1590102589 | 30.84 |
 
 Decode times: A 6560.5 ms, B 6497.1 ms, C 6592.9 ms, D 6463.6 ms, E 6486.0 ms.
 
 The controls are A, C, and E: 30.49, 30.34, and 30.84 tok/s. None was killed. None is more than 10% under 30.36 (the floor is 27.324). Their spread is 30.84 − 30.34 = 0.50 tok/s. A treatment counts as faster only when it beats both neighbors by more than that spread.
 
-B is 30.78 tok/s, 0.29 above A and 0.44 above C. D is 30.94 tok/s, 0.60 above C and 0.10 above E. Neither clears 0.50 against both neighbors. Fix 4 is not faster on this sequence. It stays. The most the release-before-`ahead()` change can take off a token is the measured 0.724 ms.
+B is 30.78 tok/s, 0.29 above A and 0.44 above C. D is 30.94 tok/s, 0.60 above C and 0.10 above E. Fix 4: correct, likely about +1% (both treatments above the control mean, 30.86 vs 30.56), below the 0.50 noise floor, kept. No more runs on it.
 
-A's compressor peaked at 986519 pages on the cold fill (3.4 GB resident). B, C, D, and E peaked at 126498, 131478, 136375, and 146681 pages. The peak differs, and the first control is the high one.
+A's compressor peaked at 986519 pages on the cold fill (3.4 GB resident). B, C, D, and E peaked at 126498, 131478, 136375, and 146681 pages. A is cold. B, C, D, and E are warm. The peak differs, and the first control is the high one.
+
+## Warm split, arena 12 GB
+
+Timing runs from here on discard one plain 200-token decode with `STRATA_METAL_TIME_AHEAD` unset, then measure. Each run's table says cold or warm. The cold ahead() table above had no discarded warm-up.
+
+The discarded warm-up exited 0. Before it: compressor 95410 pages, free plus inactive 1421853 pages, pressure level 1. Eight samples, all level 1. Compressor peak 973330 pages. Fill 2.9 s at 4.09 GB/s. After the fill the process holds 18.2 GB (2.8 GB resident). That fill is cold, so the decode is discarded. Its decode line was 200 tokens in 6484.6 ms, 30.84 tok/s. Swap used stayed 1564936765 bytes (`vm.swapusage` 1492.44M). Swapouts stayed 1785829.
+
+The timed run is the next process, `STRATA_METAL_TIME_AHEAD=1`, the same command, arena 12 GB. `STRATA_METAL_PREFETCH2` was unset. It exited 0. `pgrep -fl strata` was empty before the pair. Every sample was pressure level 1. Swap used stayed 1564936765 bytes. Swapouts stayed 1785829.
+
+Before the timed run: compressor 124886 pages, free plus inactive 1541235 pages, pressure level 1. Seven samples, all level 1. Compressor peak 135971 pages. Fill 1.9 s at 6.34 GB/s. After the fill the process holds 18.2 GB (14.0 GB resident), planned 21.7 GB. Arena 12.00 GB, 8616 slots, read-ahead top 10. This run is warm. The warm speed runs above sat near 15–17 GB resident and about 7 GB/s. This fill is above the cold fills and below those.
+
+Decode: 200 tokens in 6899.4 ms, 28.99 tok/s. Per token, 6899.4 / 200 = 34.497 ms. This is a timing run, not a speed verdict. 28.99 is above the floor of 27.324.
+
+The stock stream line: 200 windows, 174585 distinct lookups (872.9 per window), hits 0.9508, read-ahead hits 0.0271 (2265 late), misses 0.0221 (19.3 per window), read-aheads 6914 (34.6 per window, 9900 dropped), 185.5 MB per window (26841 reads), host 8.84 ms per window, of it waiting 7.94 ms.
+
+The ahead-time line: `expert stream ahead-time 133.945 ms total over 200 decode windows (0.670 ms per window); late-only wait 136.111 ms; misses 3861 hits 165994 read-ahead hits 4730 late 2265`. 3861 + 165994 + 4730 = 174585.
+
+The encode line: `stream encode-before-commit 121.923 ms total over 200 decode windows (0.610 ms per window)`.
+
+Windows: T=1, 1 decode, 74.76 ms (GPU 71.02 ms). T=2, 199 decode, 34.26 ms (GPU 33.08 ms).
+
+GPU per token is `win_gpu_`, the sum of `run_graph_seg`'s return (`GPUEndTime − GPUStartTime`). (1 × 71.02 + 199 × 33.08) / 200 = 33.270 ms.
+
+After fix 4 the GPU waits only until `release_seg()`, which runs after `smap` is published and before `ahead()`. The pre-release stall (the lookup, `wait_ms_`, and the publish) sits inside that GPU timestamp, because the GPU is blocked on the event. `ahead()` also sits inside `[GPUStart, GPUEnd]`: it runs while the next encoder is in flight, and an overshoot that delays the next release is still inside the timestamp. `host_ms_` not overlapped is 0. Remainder = decode wall per token − GPU per token − 0 = 34.497 − 33.270 = 1.227 ms.
+
+`host_ms_ − ahead()` = 8.84 − 0.670 = 8.170 ms. That stall is already inside the GPU timestamp (`wait_ms_` 7.94 ms, plus about 0.23 ms of lookup and publish). It is not subtracted again. GPU per token minus that stall is 33.270 − 8.170 = 25.100 ms, kernels and the encoder boundary together.
+
+Window wall is (74.76 + 199 × 34.26) / 200 = 34.463 ms. Decode wall minus window wall is 0.034 ms outside the window. On T=2, window minus GPU is 34.26 − 33.08 = 1.18 ms of CPU outside the GPU span inside the window. The encode counter is 0.610 ms of that. The rest of the 1.18 ms is embeddings, the C++ dispatch build, and the tail after `GPUEndTime`.
+
+| Quantity | Per token | Where it comes from | Cold or warm |
+| --- | ---: | --- | --- |
+| Decode wall | 34.497 ms | decode line, 6899.4 / 200 | warm |
+| `host_ms_` | 8.84 ms | stock stream line | warm |
+| `wait_ms_` | 7.94 ms | stock stream line | warm |
+| `ahead()` | 0.670 ms | ahead-time, 133.945 / 200 | warm |
+| GPU | 33.270 ms | `win_gpu_` | warm |
+| `host_ms_` not overlapped | 0 ms | pre-release stall and `ahead()` are both inside `win_gpu_` | warm |
+| Remainder | 1.227 ms | wall − GPU − 0 | warm |
+
+Raw decode counts: misses 3861, hits 165994, read-ahead hits 4730, late 2265. Hit rate 0.9508. Read-ahead hit rate 0.0271. Miss rate 0.0221.
+
+### Bounds on this warm token
+
+One percent of 34.497 ms is 0.345 ms.
+
+Fix 3 targets late-only `done_cv_` waits: decode layers that submitted no miss, so every waited slot was already in flight. The counter is `late_only_ms_`, 136.111 / 200 = 0.681 ms, 1.97% of the wall. A miss and a late on the same layer share one condvar wait. That mixed wait stays in `wait_ms_` and is not in `late_only_ms_`, so the bound leaves out any extra on mixed layers beyond the miss. `wait_ms_` is 7.94 ms and is not this bound.
+
+Fix 5 targets the pre-commit encode inside `run_graph_seg` on decode windows (`Tn < 8`). The counter is encode-before-commit, 121.923 / 200 = 0.610 ms, 1.77% of the wall. The 1.227 ms remainder also includes embeddings, dispatch construction, and CPU between windows. It is not fix 5's bound.
+
+Fix 1 has no separable counter on this run. The mixed pool above is 25.100 ms. There is no fix-1 millisecond bound from this split.
+
+Fix 4 is already kept. Warm `ahead()` is 0.670 ms, 1.94% of this token (133.945 / 6899.4). The alternating sequence already ran. No more runs on it.
+
+### Rank
+
+Fix 3 is 0.681 ms, 1.97%. Fix 5 is 0.610 ms, 1.77%. Neither is under 1%. Fix 3 is the higher bound, so it is the next change. Fix 5 is deferred because it is lower, not because it is under 1%. Fix 1 is not started.
