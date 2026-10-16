@@ -136,3 +136,29 @@ Pressure. Level stayed 1 on all three. Swap used stayed 1640434237. Swapouts sta
 | base-s3 | +346229 | +174866 | 2865004544 (2.865 GB) | 33–80 |
 
 Compressor bases were 178954, 187227, and 187928 pages. At exit the page count was within a few thousand of that base.
+
+## Step 1 — `STRATA_METAL_PREFETCH2`, stopped before a speed number
+
+No source change. The variable is the top-k for the layer `l+2` prediction. The code default remains 0. The binary does not print the value. The log line "read-ahead top 10" is still `pre_k_`.
+
+`STRATA_METAL_PREFETCH2=10` was applied to the same two-serve LOGPOS gate as step 0. Both files match the step 0 reference (2,041,179 bytes, sha256 `5a9f6f5320876493934df4063c20baf8095338408e25d9c5fde9dfccc4ed739b`). The fixture score matches step 0: 479 exact, 13 accepted, 0 pick failures, p5 prompt NLL CUDA 1.593251 and Mac 1.590797, relative 0.001540. Both NLL checks pass. Spread was not checked.
+
+Swap used on these runs is 1632045629 bytes (`vm.swapusage` 1556.44M), 8388608 bytes under the step 0 constant. It does not grow. Swapouts stay 1785829.
+
+| Serve | Available | Fill | Level | Compressor pages | jetsam | Footprint | RSS |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: |
+| p10-log-a | 15.8 GB | 2.5 s at 4.78 GB/s | 1 the whole serve | base 106650, peak 886668 | 30–82 | 18105699168 (18.106 GB) | 13119029248 (12.218 GiB) |
+| p10-log-b | 17.6 GB | 2.1 s at 5.81 GB/s | one sample at 2, jetsam 33, compressor 792816 | base 219849, peak 814814 | 31–79 | 18105175120 (18.105 GB) | 15846850560 (14.759 GiB) |
+
+The single level-2 sample on `p10-log-b` did not repeat on the next sample, so the serve was not killed. Swap delta on that sample was 0.
+
+The speed gate did not produce a tok/s. Two fresh `PREFETCH2=10` processes were killed after the arena-fill line and before prefill. Both printed arena 12.00 GB, 8616 slots, planned footprint 21.7 GB, and "the process holds 18.2 GB" after the fill. Resident at that line was 2.9 GB on the first attempt and 3.1 GB on the second. The step 0 speed fills reported 15.4–17.4 GB resident at the same line, and those fills ran at 6.82–7.25 GB/s. These two ran at 4.04 GB/s (2.9 s, 16.8 GB available) and 3.97 GB/s (3.0 s, 16.6 GB available).
+
+Both kills were two consecutive level-2 samples. Swap did not grow on either. After each kill the next sample was level 1 and jetsam was back at 79–80.
+
+| Attempt | Level-2 samples | jetsam on those samples | Compressor pages on those samples | Peak compressor pages while level was still 1 |
+| --- | --- | --- | ---: | ---: |
+| First | 2 | 43, then 37 | 830353, then 986356 | 609615 |
+| Second | 2 | 40, then 36 | 981723, then 722794 | 1006106 |
+
+`STRATA_METAL_PREFETCH2=4` was not started. There is no decode rate, no ledger, and no token line for this step. The setting is not adopted. The serve-path rows match the unmodified binary, and the speed comparison against 24.92 tok/s was not measured. A third 12 GB process was not launched.
