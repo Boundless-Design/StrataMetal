@@ -316,3 +316,41 @@ Fix 4 is already kept. Warm `ahead()` is 0.670 ms, 1.94% of this token (133.945 
 ### Rank
 
 Fix 3 is 0.681 ms, 1.97%. Fix 5 is 0.610 ms, 1.77%. Neither is under 1%. Fix 3 is the higher bound, so it is the next change. Fix 5 is deferred because it is lower, not because it is under 1%. Fix 1 is not started.
+
+## Fix 3, bit-identity, arena 12 GB
+
+Fix 3 is `54168c5`. After the segment release, the host queues the layer `l+2` prediction at this cut, at the same top-k as layer `l+1` (`pre_k_`, 10 on this machine). That is one cut before `ahead(l+1)` at the next layer would have started those experts. The layer `l+1` queue stays, and it only submits names that are not already in flight. `STRATA_METAL_PREFETCH2` stays 0. A positive value still overrides the `l+2` depth. The bound going into the speed sequence is the warm-split `late_only_ms_`: 0.681 ms per token, 1.97% of that 34.497 ms token.
+
+Two LOGPOS serves, `f3-log-a` and `f3-log-b`, match `base-log-a`: 2,041,179 bytes, sha256 `5a9f6f5320876493934df4063c20baf8095338408e25d9c5fde9dfccc4ed739b`. The fixture score on `f3-log-a` is criterion 1 picks PASS, criterion 2 p5 prompt NLL PASS, relative 0.001540. A 200-token greedy generation matches the step 0 `output  :` line. That greedy run is not a speed row. It decoded 200 tokens in 7141.2 ms, 28.01 tok/s, after a 13.2 GB resident fill at 6.03 GB/s.
+
+`f3-log-a` is cold: fill 2.8 s at 4.32 GB/s, 3.9 GB resident, compressor peak 841229 pages, 10 samples at level 1. `f3-log-b` is warm: fill 1.7 s at 7.08 GB/s, 17.1 GB resident, compressor peak 270196 pages, 9 samples at level 1. Both exited 0. Swap used stayed 1564936765 bytes. Swapouts stayed 1785829.
+
+## Alternating fix 3, arena 12 GB
+
+The treatment binary is `54168c5`. `STRATA_METAL_TIME_AHEAD` was unset, so the timers did not run. The control is the saved unmodified binary. Nothing else used the GPU between these runs.
+
+The five runs did not start back to back. Before f3C the compressor was 156306 pages, then 152474 after the 60 s wait, so that start was skipped. f3C started later, at 123837 pages. Before f3E the compressor was 160598 pages, then 154437 after the 60 s wait, so that start was skipped. f3E started later, at 149675 pages. Every run that did start was under 150000 pages.
+
+A run is killed if pressure level 2 shows up on 3 samples in a row, sampled every 2 seconds, or if swap used grows by more than 256 MiB. None of those fired. All five exited 0. Every sample was pressure level 1. Swap used stayed 1564936765 bytes. Swapouts stayed 1785829. Each `output  :` line matches the step 0 reference.
+
+Held after the fill is 18.2 GB and the planned footprint is 21.7 GB on every run. Arena 12.00 GB, 8616 slots. The before-run columns are compressor pages, free plus inactive pages, and the pressure level.
+
+| Run | Binary | Before, comp / free+inactive / level | Fill | Resident after fill | Compressor peak, pages | Level counts | Swap before → after | Decode tok/s |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- | ---: |
+| A | control | 145489 / 1505490 / 1 | 1.7 s, 6.85 GB/s | 15.1 GB, warm | 277334 | 7 at level 1 | 1564936765 → 1564936765 | 29.76 |
+| B | fix 3 | 149961 / 1521961 / 1 | 2.0 s, 5.85 GB/s | 13.1 GB, warm | 163315 | 7 at level 1 | 1564936765 → 1564936765 | 30.54 |
+| C | control | 123837 / 1421990 / 1 | 2.9 s, 4.13 GB/s | 3.7 GB, cold | 994488 | 8 at level 1 | 1564936765 → 1564936765 | 30.25 |
+| D | fix 3 | 146700 / 1506789 / 1 | 1.6 s, 7.24 GB/s | 17.5 GB, warm | 163397 | 7 at level 1 | 1564936765 → 1564936765 | 30.48 |
+| E | control | 149675 / 1512561 / 1 | 1.7 s, 6.82 GB/s | 15.9 GB, warm | 149675 | 7 at level 1 | 1564936765 → 1564936765 | 30.76 |
+
+Decode times: A 6721.3 ms, B 6549.5 ms, C 6611.6 ms, D 6561.5 ms, E 6502.1 ms.
+
+The controls are A, C, and E: 29.76, 30.25, and 30.76 tok/s. None was killed. None is more than 10% under 30.36 (the floor is 27.324). Their spread is 30.76 − 29.76 = 1.00 tok/s. A treatment counts as faster only when it beats both neighbors by more than that spread.
+
+B is 30.54 tok/s, 0.78 above A and 0.29 above C. D is 30.48 tok/s, 0.23 above C and 0.28 below E. Neither clears 1.00 against both neighbors. Fix 3 is not faster on this sequence.
+
+Treatments issued 10313 and 10325 read-aheads (51.6 per window) and read 206.3 and 205.7 MB per window. Controls issued 6917, 6910, and 6912 read-aheads (34.6 per window) and read 185.9, 185.3, and 185.7 MB per window. Late read-aheads were 1329 and 1341 on the treatments, and 2126, 2377, and 2416 on the controls. Misses were 18.1 per window on the treatments and 19.3 on the controls. Host was 9.59 and 9.73 ms on the treatments, against 8.56, 8.73, and 8.62 on the controls. Waiting was 8.21 and 8.34 ms on the treatments, against 7.87, 8.04, and 7.94 on the controls.
+
+B's fill is warm relative to C's 3.7 GB cold fill, and below the 15–17 GB fills. Compressor peaks were 277334, 163315, 994488, 163397, and 149675 pages. The peak differs, and the cold control is the high one.
+
+Fix 5 stays deferred. It was 0.610 ms, 1.77%, on the warm split, under fix 3's bound. It is not started. Fix 1 is not started.
